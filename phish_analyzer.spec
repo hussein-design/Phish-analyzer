@@ -15,11 +15,19 @@ Output: dist/PhishAnalyzerDesktop/
 """
 
 from pathlib import Path
+import os, sys
 
 project_root = Path(SPECPATH)
 
 _icon_path = project_root / "assets" / "icons" / "app.ico"
 icon_file = str(_icon_path) if _icon_path.exists() else None
+
+# Locate the publicsuffixlist package data file at spec-evaluation time so we
+# can bundle it.  publicsuffixlist loads it via __file__-relative path, which
+# breaks inside a frozen bundle unless we place the .dat next to the module.
+import importlib.util as _ilu
+_psl_spec = _ilu.find_spec("publicsuffixlist")
+_psl_pkg_dir = str(Path(_psl_spec.origin).parent) if _psl_spec else None
 
 a = Analysis(
     ["launcher.py"],
@@ -31,6 +39,9 @@ a = Analysis(
         # Alembic migration scripts — run at startup to init/upgrade the DB
         (str(project_root / "migrations"), "migrations"),
         (str(project_root / "alembic.ini"), "."),
+        # publicsuffixlist data file — eml_parser loads this via __file__-relative
+        # open(); without it the parser crashes with FileNotFoundError on first use.
+        *([(_psl_pkg_dir, "publicsuffixlist")] if _psl_pkg_dir else []),
     ],
     hiddenimports=[
         # ── uvicorn ──────────────────────────────────────────────────────────
@@ -107,6 +118,9 @@ a = Analysis(
         "eml_parser.regexes",
         "eml_parser.routing",
         "bs4",
+        # publicsuffixlist — eml_parser imports this at runtime; the .dat data
+        # file is bundled via the datas entry above.
+        "publicsuffixlist",
 
         # ── python-docx (DOCX report generation) ─────────────────────────────
         "docx",

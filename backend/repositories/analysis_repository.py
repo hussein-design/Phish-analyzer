@@ -6,6 +6,8 @@ layer only knows how to build queries and persist the ORM graph handed to it.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,6 +44,20 @@ class AnalysisRepository:
     async def delete(self, analysis: EmailAnalysis) -> None:
         await self.session.delete(analysis)
         await self.session.commit()
+
+    async def delete_all(self) -> int:
+        """Delete every analysis row (and their stored .eml files) and return
+        the count removed."""
+        all_items = (await self.session.execute(select(EmailAnalysis))).scalars().all()
+        count = len(all_items)
+        stored_paths = [item.stored_path for item in all_items if item.stored_path]
+        for item in all_items:
+            await self.session.delete(item)
+        await self.session.commit()
+        # Clean up uploaded .eml files after the DB commit succeeds
+        for path_str in stored_paths:
+            Path(path_str).unlink(missing_ok=True)
+        return count
 
     async def list_paginated(
         self,

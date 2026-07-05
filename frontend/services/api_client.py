@@ -108,6 +108,11 @@ class ApiClient:
         resp = self.session.delete(self._url(f"/analyses/{analysis_id}"), timeout=self.timeout)
         resp.raise_for_status()
 
+    def delete_all_emails(self) -> dict:
+        resp = self.session.delete(self._url("/analyses"), timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
     def download_report(self, analysis_id: int, dest_path: str) -> str:
         resp = self.session.get(
             self._url(f"/analyses/{analysis_id}/report.docx"), timeout=self.timeout

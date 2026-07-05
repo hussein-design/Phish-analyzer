@@ -164,6 +164,13 @@ async def get_email(
     return _to_detail(analysis)
 
 
+@router.delete("", status_code=200)
+async def clear_all_analyses(session: AsyncSession = Depends(get_session)) -> dict:
+    """Delete every analysis in the database and their stored .eml files."""
+    count = await AnalysisRepository(session).delete_all()
+    return {"deleted": count}
+
+
 @router.delete("/{analysis_id}", status_code=204)
 async def delete_email(analysis_id: int, session: AsyncSession = Depends(get_session)) -> None:
     repo = AnalysisRepository(session)

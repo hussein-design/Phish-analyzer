@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from pathlib import PurePosixPath
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -24,6 +26,35 @@ from backend.services.enrichment import abuseipdb_provider, virustotal_provider
 from shared.paths import analysis_upload_dir
 
 logger = logging.getLogger(__name__)
+
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024   # 25 MB — enforced again here as a server-side guard
+_MAX_BODY_TEXT_CHARS = 200_000          # ~200 KB of plain text stored in the DB
+_SAFE_FILENAME_RE = re.compile(r"[^\w\-. ]")  # strip everything except word chars, dash, dot, space
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Strip path components and dangerous characters from an uploaded filename.
+
+    Prevents path traversal (e.g. '../../etc/passwd.eml') and ensures the
+    name is safe to use directly as a filesystem component.
+    """
+    # Take only the final component — strips any directory traversal prefix
+    name = PurePosixPath(filename).name or filename
+    # Replace backslashes (Windows paths uploaded from another machine)
+    name = name.replace("\\", "_").replace("/", "_")
+    # Remove any remaining non-safe characters
+    name = _SAFE_FILENAME_RE.sub("_", name)
+    # Collapse runs of underscores/spaces
+    name = re.sub(r"[_ ]{2,}", "_", name).strip("_. ")
+    # Ensure it ends with .eml and isn't empty
+    if not name or name == ".eml":
+        name = "upload.eml"
+    elif not name.lower().endswith(".eml"):
+        name = name + ".eml"
+    # Cap length to avoid filesystem limits
+    if len(name) > 200:
+        name = name[:196] + ".eml"
+    return name
 
 # Caps concurrent in-flight analyses to protect the single SQLite writer and
 # avoid hammering rate-limited external APIs.
@@ -46,7 +77,11 @@ class AnalysisService:
         self._abuseipdb_key_env = abuseipdb_key_env
 
     async def submit_upload(self, filename: str, raw_bytes: bytes) -> EmailAnalysis:
+        # Validate using the ORIGINAL client-supplied filename so extension
+        # checks cannot be bypassed by the sanitiser appending .eml.
+        # Sanitise only after the content-level checks pass.
         validation_service.validate_eml_upload(filename, raw_bytes)
+        filename = _sanitize_filename(filename)
 
         async with self.session_factory() as session:
             analysis = await AnalysisRepository(session).create_pending(
@@ -81,8 +116,9 @@ class AnalysisService:
                 headers = parsed.get("header", {}) or {}
                 header_info = eml.analyze_headers(parsed)
                 global_hashes = eml.extract_global_hashes(parsed)
-                urls = eml.extract_urls_from_text(body_text)
+                urls = eml.extract_urls_from_body(parsed.get("body", {}), body_text)
                 message_id = eml.get_message_id(parsed, headers)
+                subject = eml.get_subject(parsed, headers)
 
                 async with self.session_factory() as session:
                     settings = await SettingsRepository(session).get()
@@ -117,7 +153,7 @@ class AnalysisService:
                 attachment_rows = [
                     {
                         "filename": att.get("filename"),
-                        "content_type": att.get("content-type") or att.get("content_type"),
+                        "content_type": eml.get_attachment_content_type(att),
                         "sha256": eml.hash_attachment_content(att),
                         "is_executable_like": False,
                         "is_double_extension": False,
@@ -143,14 +179,12 @@ class AnalysisService:
                     urgency_keywords=urgency_keywords,
                 )
 
-                subject = headers.get("subject")
-
                 async with self.session_factory() as session:
                     repo = AnalysisRepository(session)
                     analysis = await repo.get_by_id(analysis_id)
 
                     analysis.message_id = message_id
-                    analysis.subject = str(subject) if subject else None
+                    analysis.subject = subject
                     analysis.from_addr = header_info["from_addr"]
                     analysis.from_domain = header_info["from_domain"]
                     analysis.reply_to = header_info["reply_to"]
@@ -168,7 +202,9 @@ class AnalysisService:
                     analysis.abuse_country = abuse_result.get("country_code")
                     analysis.abuse_isp = abuse_result.get("isp")
                     analysis.global_hashes = global_hashes
-                    analysis.body_text = body_text
+                    # Truncate body text to prevent unbounded SQLite row growth.
+                    # 200 000 chars (~200 KB) is more than enough for scoring/preview.
+                    analysis.body_text = body_text[:_MAX_BODY_TEXT_CHARS] if body_text else None
                     analysis.score = score_info["score"]
                     analysis.verdict = score_info["verdict"]
                     analysis.status = "DONE"

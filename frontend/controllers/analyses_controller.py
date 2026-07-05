@@ -12,7 +12,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QFileDialog
 
 from frontend.controllers.base_controller import BaseController
-from frontend.dialogs.confirm_delete_dialog import confirm_delete
+from frontend.dialogs.confirm_delete_dialog import confirm_delete, confirm_clear_history
 from shared.schemas import AnalysesListResponse, EmailSummary
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ class AnalysesController(BaseController):
         table_widget.moreDataRequested.connect(self._load_next_page)
         table_widget.deleteRequested.connect(self._on_delete_requested)
         table_widget.downloadRequested.connect(self._on_download_requested)
+        table_widget.clearHistoryRequested.connect(self._on_clear_history_requested)
 
     def load_initial(self) -> None:
         self._reload_from_start()
@@ -126,4 +127,20 @@ class AnalysesController(BaseController):
             on_success=lambda path: self.notification_center.show_toast(
                 f"Saved to {path}", level="success"
             ),
+        )
+
+    def _on_clear_history_requested(self) -> None:
+        if not confirm_clear_history(self.table_widget):
+            return
+        self.run_async(
+            self.api_client.delete_all_emails,
+            on_success=self._on_history_cleared,
+        )
+
+    def _on_history_cleared(self, result: dict) -> None:
+        count = result.get("deleted", 0)
+        self.table_widget.model.set_page([], 0)
+        self.notification_center.show_toast(
+            f"History cleared ({count} analysis{'es' if count != 1 else ''} deleted)",
+            level="success",
         )

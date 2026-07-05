@@ -14,6 +14,7 @@ SQLAlchemy==2.0.51
 aiosqlite==0.22.1
 alembic==1.18.5
 eml-parser==3.0.2
+publicsuffixlist==1.0.2.20260703
 beautifulsoup4==4.15.0
 python-docx==1.2.0
 vt-py==0.22.0

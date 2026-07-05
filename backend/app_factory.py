@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.core.config import get_settings
 from backend.core.exceptions import register_exception_handlers
@@ -15,6 +17,31 @@ from backend.routes import settings as settings_routes
 from backend.services.analysis_service import AnalysisService
 
 logger = logging.getLogger(__name__)
+
+
+class LocalhostOnlyMiddleware(BaseHTTPMiddleware):
+    """Reject every request that did not originate from 127.0.0.1 / ::1.
+
+    The backend is intentionally an in-process local service.  This middleware
+    is a defence-in-depth measure: even if the port is somehow reachable from
+    another host (e.g. via a misconfigured VPN or container bridge), all
+    non-loopback requests are refused with 403 before they reach any route
+    handler or touch the database.
+    """
+
+    _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+    async def dispatch(self, request: Request, call_next):
+        client_host = request.client.host if request.client else ""
+        if client_host not in self._LOOPBACK:
+            logger.warning(
+                "Rejected non-localhost request from %s %s", client_host, request.url.path
+            )
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "Access denied: this API is localhost-only."},
+            )
+        return await call_next(request)
 
 
 def create_app() -> FastAPI:
@@ -49,7 +76,16 @@ def create_app() -> FastAPI:
         title="Phish Analyzer Desktop API",
         version="1.0.0",
         lifespan=lifespan,
+        # Disable the interactive docs UI and raw OpenAPI schema endpoint in
+        # the packaged app.  The /openapi.json endpoint is still available for
+        # internal tooling (e.g. curl-based testing) but the Swagger/ReDoc UIs
+        # that render it are removed to reduce the exposed attack surface.
+        docs_url=None,
+        redoc_url=None,
     )
+
+    # Localhost-only guard — must be added before any route handlers
+    app.add_middleware(LocalhostOnlyMiddleware)
 
     register_exception_handlers(app)
 

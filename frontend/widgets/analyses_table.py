@@ -41,6 +41,7 @@ class AnalysesTableWidget(QWidget):
     searchChanged = Signal(str)
     verdictFilterChanged = Signal(object)
     moreDataRequested = Signal()
+    clearHistoryRequested = Signal()
 
     def __init__(self, theme_manager: ThemeManager, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -68,12 +69,17 @@ class AnalysesTableWidget(QWidget):
         self._download_button = QPushButton("Download report")
         self._download_button.clicked.connect(self._emit_download)
 
+        self._clear_button = QPushButton("Clear history")
+        self._clear_button.setToolTip("Permanently delete all analyses")
+        self._clear_button.clicked.connect(self.clearHistoryRequested)
+
         toolbar = QHBoxLayout()
         toolbar.addWidget(self._search_box, 1)
         toolbar.addWidget(self._verdict_combo)
         toolbar.addWidget(self._refresh_button)
         toolbar.addWidget(self._delete_button)
         toolbar.addWidget(self._download_button)
+        toolbar.addWidget(self._clear_button)
 
         self.table = QTableView()
         self.table.setModel(self.proxy)

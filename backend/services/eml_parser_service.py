@@ -36,9 +36,16 @@ def normalize_body(body_raw) -> list:
 
 
 def extract_text_from_body(body_raw) -> str:
-    """Prefer text/plain, then text/html, then older plain/html keys."""
+    """Extract readable text from the email body.
+
+    eml_parser returns body as a list of MIME part dicts.  We prefer
+    text/plain (no stripping needed).  If only text/html is present we strip
+    tags with BeautifulSoup.  Falls back to legacy dict-style keys for older
+    eml_parser builds.
+    """
     parts = normalize_body(body_raw)
 
+    # Pass 1: prefer text/plain
     for part in parts:
         if not isinstance(part, dict):
             continue
@@ -47,10 +54,11 @@ def extract_text_from_body(body_raw) -> str:
         if not content:
             continue
         if isinstance(content, list):
-            content = " ".join(content)
+            content = " ".join(str(c) for c in content)
         if "text/plain" in ct:
-            return content
+            return str(content)
 
+    # Pass 2: fall back to text/html, strip tags
     for part in parts:
         if not isinstance(part, dict):
             continue
@@ -59,29 +67,60 @@ def extract_text_from_body(body_raw) -> str:
         if not content:
             continue
         if isinstance(content, list):
-            content = " ".join(content)
+            content = " ".join(str(c) for c in content)
         if "text/html" in ct:
             soup = BeautifulSoup(content, "html.parser")
             return soup.get_text(separator=" ")
 
+    # Pass 3: legacy dict-style body keys (older eml_parser builds)
     if isinstance(body_raw, dict):
         if body_raw.get("plain"):
             text = body_raw["plain"]
             if isinstance(text, list):
-                text = " ".join(text)
-            return text
+                text = " ".join(str(t) for t in text)
+            return str(text)
         if body_raw.get("html"):
             html = body_raw["html"]
             if isinstance(html, list):
-                html = " ".join(html)
+                html = " ".join(str(h) for h in html)
             soup = BeautifulSoup(html, "html.parser")
             return soup.get_text(separator=" ")
 
     return ""
 
 
-def extract_urls_from_text(text: str) -> list[str]:
-    return sorted(set(URL_REGEX.findall(text)))
+def extract_urls_from_body(body_raw, body_text: str) -> list[str]:
+    """Extract all URLs from the email body using two sources:
+
+    1. eml_parser's pre-parsed ``uri`` list on each body part — catches URLs
+       that the regex misses because they are split across folded lines or
+       encoded inside HTML attributes.
+    2. Regex over the plain-text representation as a safety net for any URL
+       that eml_parser's own parser didn't recognise.
+
+    Returns a deduplicated, sorted list.
+    """
+    seen: set[str] = set()
+    urls: list[str] = []
+
+    parts = normalize_body(body_raw)
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        # eml_parser stores pre-extracted URLs in the 'uri' key as a list
+        for uri in part.get("uri", []) or []:
+            uri_str = str(uri).strip()
+            if uri_str.startswith(("http://", "https://")) and uri_str not in seen:
+                seen.add(uri_str)
+                urls.append(uri_str)
+
+    # Also run regex over the full body text for any URLs eml_parser missed
+    for match in URL_REGEX.findall(body_text):
+        if match not in seen:
+            seen.add(match)
+            urls.append(match)
+
+    return sorted(urls)
 
 
 def hash_attachment_content(att: dict) -> str | None:
@@ -96,6 +135,31 @@ def hash_attachment_content(att: dict) -> str | None:
         for key in ("md5", "sha1"):
             if key in hashes:
                 return hashes[key]
+    return None
+
+
+def get_attachment_content_type(att: dict) -> str | None:
+    """Extract content-type from an eml_parser attachment dict.
+
+    eml_parser does NOT set a top-level ``content-type`` or ``content_type``
+    key on attachment dicts — it stores MIME headers under
+    ``att['content_header']['content-type']`` as a list.  This helper
+    normalises that so the rest of the code gets a plain string or None.
+    """
+    # Try top-level keys first (future eml_parser versions / other parsers)
+    ct = att.get("content-type") or att.get("content_type")
+    if ct:
+        return str(ct).split(";")[0].strip()
+
+    # eml_parser actual location: content_header dict
+    ch = att.get("content_header") or {}
+    ct_list = ch.get("content-type") or ch.get("content_type")
+    if isinstance(ct_list, list) and ct_list:
+        # Value is like ["message/rfc822"] or ["application/pdf; name=foo.pdf"]
+        return ct_list[0].split(";")[0].strip()
+    if isinstance(ct_list, str):
+        return ct_list.split(";")[0].strip()
+
     return None
 
 
@@ -269,16 +333,52 @@ def extract_auth_from_raw(parsed: dict) -> tuple[dict, list[str]]:
 
 
 def get_message_id(parsed: dict, headers: dict) -> str | None:
-    msg_id = headers.get("message-id")
-    if msg_id:
-        return msg_id
+    """Return the Message-ID header value.
+
+    eml_parser stores the raw header dict under parsed['header']['header']
+    (inner dict), with values as lists.  The outer parsed['header'] dict
+    only has a small set of decoded keys (subject, from, to, date, received).
+    We read the inner dict first, then fall back to Python's email.Message.
+    """
+    inner = headers.get("header", {}) or {}
+    msg_id = inner.get("message-id")
+    if isinstance(msg_id, list) and msg_id:
+        return msg_id[0].strip()
+    if isinstance(msg_id, str) and msg_id:
+        return msg_id.strip()
 
     raw_email = parsed.get("_raw_email")
     if not raw_email:
         return None
-
     msg = email.message_from_bytes(raw_email)
     return msg.get("Message-ID")
+
+
+def get_subject(parsed: dict, headers: dict) -> str | None:
+    """Return the decoded Subject header value.
+
+    eml_parser's outer header dict has a 'subject' key that is already
+    decoded (handles RFC2047 encoded-words).  Use that first; fall back to
+    the inner raw header dict (list value), then to Python's email.Message.
+    """
+    # Outer dict has 'subject' as a decoded string (preferred)
+    subj = headers.get("subject")
+    if subj and isinstance(subj, str):
+        return subj.strip()
+
+    # Inner dict stores raw list values
+    inner = headers.get("header", {}) or {}
+    subj_raw = inner.get("subject")
+    if isinstance(subj_raw, list) and subj_raw:
+        return subj_raw[0].strip()
+    if isinstance(subj_raw, str) and subj_raw:
+        return subj_raw.strip()
+
+    raw_email = parsed.get("_raw_email")
+    if not raw_email:
+        return None
+    msg = email.message_from_bytes(raw_email)
+    return msg.get("Subject")
 
 
 def _first_header_value(msg, inner: dict, name: str) -> str | None:
