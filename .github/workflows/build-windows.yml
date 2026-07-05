@@ -1,0 +1,47 @@
+name: Build Windows executable
+
+# No local Windows machine is required to produce the .exe -- this runs the
+# PyInstaller build on a hosted windows-latest runner and uploads the result
+# as a downloadable artifact.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "shared/**"
+      - "migrations/**"
+      - "assets/**"
+      - "launcher.py"
+      - "requirements.txt"
+      - "phish_analyzer.spec"
+      - ".github/workflows/build-windows.yml"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to 3.12: PySide6/PyInstaller wheel availability lags behind
+      # the newest CPython releases -- see README "Packaging" section.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: pyinstaller phish_analyzer.spec --noconfirm
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhishAnalyzerDesktop-windows
+          path: dist/PhishAnalyzerDesktop/
+          if-no-files-found: error

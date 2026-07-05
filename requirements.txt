@@ -1,0 +1,23 @@
+# Backend
+fastapi
+uvicorn[standard]
+pydantic-settings
+sqlalchemy>=2.0
+aiosqlite
+alembic
+eml-parser
+beautifulsoup4
+python-docx
+vt-py
+httpx
+python-multipart
+platformdirs
+
+# Frontend / packaging
+# NOTE: pin an exact PySide6 version once the packaging venv is fixed to
+# Python 3.11/3.12 (see README) -- version availability differs a lot by
+# interpreter version, so an unbounded range is used here for dev machines.
+PySide6>=6.6
+pyinstaller>=6.3
+requests
+pydantic>=2
