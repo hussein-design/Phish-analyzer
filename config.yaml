@@ -1,0 +1,35 @@
+api:
+  virustotal_key: "d99172f11af84c21ec693e7e0d484138ff857aad1d73cb3c293b5ce3bc7dbafc"
+  abuseipdb_key: "8a8795743010d6962c9a5c849da03bfec6df8464410ddefc8ff8f55739ebfac8cf12043d1e66a2ae"
+
+scoring:
+  brand_mismatch: 2
+  spf_fail: 2
+  dkim_fail: 2
+  dmarc_fail: 2
+  header_issue: 1
+  url_bad_keyword: 2
+  url_ip_host: 3
+  attachment_executable: 3
+  vt_malicious_threshold: 3
+  vt_malicious_points: 4
+  abuseipdb_high_score: 50
+  abuseipdb_points: 3
+
+brand_domains:
+  microsoft:
+    - microsoft.com
+    - live.com
+    - office.com
+  paypal:
+    - paypal.com
+  "sam's club":
+    - samsclub.com
+
+url_suspicious_keywords:
+  - login
+  - verify
+  - update
+  - password
+  - secure
+  - invoice
