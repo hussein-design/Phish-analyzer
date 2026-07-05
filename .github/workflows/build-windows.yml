@@ -1,12 +1,20 @@
-name: Build Windows executable
+name: Build and Release
 
-# No local Windows machine is required to produce the .exe -- this runs the
-# PyInstaller build on a hosted windows-latest runner and uploads the result
-# as a downloadable artifact.
+# Triggers:
+#   push to main          → builds and uploads an artifact (for internal testing)
+#   push a version tag    → builds, packages with Inno Setup, creates a GitHub Release
+#                           Tag format: v1.2.3  (semantic versioning)
+#   workflow_dispatch     → manual trigger from the GitHub Actions UI (runs full release flow)
+#
+# To publish a release:
+#   git tag v1.0.0
+#   git push origin v1.0.0
 
 on:
   push:
     branches: [main]
+    tags:
+      - "v*.*.*"
     paths:
       - "backend/**"
       - "frontend/**"
@@ -16,32 +24,164 @@ on:
       - "launcher.py"
       - "requirements.txt"
       - "phish_analyzer.spec"
+      - "installer.iss"
+      - "generate_icon.py"
       - ".github/workflows/build-windows.yml"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create a GitHub Release after building?"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 jobs:
   build:
     runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      # Pinned to 3.12: PySide6/PyInstaller wheel availability lags behind
-      # the newest CPython releases -- see README "Packaging" section.
-      - uses: actions/setup-python@v5
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ──────────────────────────────────────────────────────
+      # Pin to 3.12: PySide6 / PyInstaller wheel availability lags behind the
+      # newest CPython releases. 3.11 / 3.12 are the safest choices right now.
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
+      # ── 3. Install Python dependencies ───────────────────────────────────────
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ── 4. Generate app icon ─────────────────────────────────────────────────
+      # Pillow is installed via requirements.txt; this produces a proper
+      # multi-size .ico with the @ shield graphic.
+      - name: Generate app icon
+        run: python generate_icon.py
+
+      # ── 5. Determine version string ──────────────────────────────────────────
+      # On a tag push this is "1.2.3" (strip the leading 'v').
+      # On a branch push this is "0.0.0-dev.<short-sha>".
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -match '^refs/tags/v(.+)$') {
+            $ver = $Matches[1]
+          } else {
+            $sha = $env:GITHUB_SHA.Substring(0,7)
+            $ver = "0.0.0-dev.$sha"
+          }
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          echo "Resolved version: $ver"
+
+      # ── 6. Build with PyInstaller ─────────────────────────────────────────────
       - name: Build with PyInstaller
         run: pyinstaller phish_analyzer.spec --noconfirm
+        env:
+          PYTHONOPTIMIZE: "1"
 
-      - name: Upload build artifact
+      # ── 7. Smoke-test the build ───────────────────────────────────────────────
+      # Start the app headlessly for a few seconds to make sure the backend
+      # starts and the /health endpoint responds. Any import error or missing
+      # hidden import shows up here rather than on a user's machine.
+      - name: Smoke-test the build
+        shell: pwsh
+        run: |
+          $exe = "dist\PhishAnalyzerDesktop\PhishAnalyzerDesktop.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "Build output not found at $exe"
+            exit 1
+          }
+          # Run the backend server in headless mode and check /health
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 15
+          $healthy = $false
+          for ($i = 0; $i -lt 10; $i++) {
+            try {
+              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:8756/health" -UseBasicParsing -TimeoutSec 2
+              if ($resp.StatusCode -eq 200) { $healthy = $true; break }
+            } catch {}
+            Start-Sleep -Seconds 2
+          }
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          if (-not $healthy) {
+            Write-Error "Smoke test FAILED: backend did not respond on /health within 35s"
+            exit 1
+          }
+          Write-Host "Smoke test passed."
+
+      # ── 8. Install Inno Setup ────────────────────────────────────────────────
+      # windows-latest runners ship with Inno Setup 6 at the standard path.
+      # The choco install is a fallback in case the pre-installed version is absent.
+      - name: Ensure Inno Setup 6 is available
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          } else {
+            Write-Host "Inno Setup already present at $iscc"
+          }
+
+      # ── 9. Package with Inno Setup ───────────────────────────────────────────
+      - name: Build installer with Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $version = "${{ steps.version.outputs.VERSION }}"
+          & $iscc /DAPP_VERSION="$version" installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installer = Get-ChildItem dist\PhishAnalyzerSetup-*.exe | Select-Object -First 1
+          Write-Host "Installer built: $($installer.Name)  ($([math]::Round($installer.Length/1MB,1)) MB)"
+
+      # ── 10. Upload installer as a workflow artifact ───────────────────────────
+      # Always available from the Actions run, regardless of whether a Release
+      # is also created. Useful for testing non-tag builds.
+      - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PhishAnalyzerDesktop-windows
-          path: dist/PhishAnalyzerDesktop/
+          name: PhishAnalyzerSetup-${{ steps.version.outputs.VERSION }}
+          path: dist/PhishAnalyzerSetup-*.exe
           if-no-files-found: error
+
+      # ── 11. Create GitHub Release (tag pushes and manual trigger only) ────────
+      - name: Create GitHub Release
+        if: >
+          startsWith(github.ref, 'refs/tags/v') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.version.outputs.VERSION) }}
+          name: "Phish Analyzer Desktop ${{ steps.version.outputs.VERSION }}"
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, 'dev') }}
+          generate_release_notes: true
+          body: |
+            ## Phish Analyzer Desktop ${{ steps.version.outputs.VERSION }}
+
+            ### Installation
+            1. Download **PhishAnalyzerSetup-${{ steps.version.outputs.VERSION }}.exe** below
+            2. Run the installer (no administrator rights needed for a per-user install)
+            3. Launch from the Start Menu or Desktop shortcut
+
+            ### First run
+            The app works out of the box without API keys — just drag and drop a `.eml` file.
+            For richer threat intelligence (VirusTotal URL scanning, AbuseIPDB sender IP reputation),
+            open **Settings** from the toolbar and enter your API keys. Both services offer a
+            free tier with no credit card required.
+
+            > **System requirement:** Windows 10 or later (64-bit)
+          files: dist/PhishAnalyzerSetup-*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

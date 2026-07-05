@@ -118,25 +118,104 @@ def extract_domain(addr: str | None) -> str | None:
 
 
 def extract_sender_ip(headers: dict) -> str | None:
-    received = headers.get("received")
-    entries: list = []
-    if isinstance(received, list):
-        entries = received
-    elif isinstance(received, (str, dict)):
-        entries = [received]
+    """Return the originating sender IP from the parsed eml_parser headers dict.
 
-    for entry in reversed(entries):
-        line = str(entry)
-        match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", line)
-        if match:
-            return match.group(0)
+    eml_parser builds a structured ``received_ip`` list (all IPs seen across
+    Received chains) and a ``received`` list of structured dicts, each with a
+    ``from`` key that holds the IP(s) for that hop.  We prefer the last entry
+    in ``received`` that carries a real IPv4 address in its ``from`` field,
+    which corresponds to the first external hop that handed the message to the
+    receiving infrastructure — i.e. the actual sender IP.
+
+    Falls back to the last IPv4 in ``received_ip`` if the structured path
+    yields nothing, and finally tries a regex over the raw ``received`` strings
+    for maximum compatibility with unusual eml_parser builds.
+    """
+    # --- Strategy 1: structured received list from eml_parser ---
+    received_list = headers.get("received")
+    if isinstance(received_list, list):
+        # Iterate from the last (outermost) hop backwards; take the first
+        # entry whose "from" field contains a dotted-decimal IPv4.
+        ipv4_re = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+        for entry in reversed(received_list):
+            if not isinstance(entry, dict):
+                continue
+            from_fields = entry.get("from", [])
+            if isinstance(from_fields, str):
+                from_fields = [from_fields]
+            for field in from_fields:
+                if ipv4_re.match(str(field).strip()):
+                    return str(field).strip()
+
+    # --- Strategy 2: received_ip list pre-built by eml_parser ---
+    received_ips = headers.get("received_ip")
+    if isinstance(received_ips, list):
+        ipv4_re = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+        for ip in reversed(received_ips):
+            if ipv4_re.match(str(ip).strip()):
+                return str(ip).strip()
+
+    # --- Strategy 3: regex over raw Received strings (last resort) ---
+    if isinstance(received_list, list):
+        for entry in reversed(received_list):
+            line = entry.get("src", "") if isinstance(entry, dict) else str(entry)
+            match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", line)
+            if match:
+                return match.group(0)
+
     return None
 
 
+def _parse_auth_verdict(header_value: str) -> dict:
+    """Extract SPF/DKIM/DMARC verdicts from a single Authentication-Results-style header value.
+
+    Returns a dict with keys 'spf', 'dkim', 'dmarc', each either a verdict
+    string ('pass', 'fail', 'softfail', 'neutral', 'none', 'permerror',
+    'temperror') or None if the header doesn't mention that protocol.
+    """
+    verdicts: dict[str, str | None] = {"spf": None, "dkim": None, "dmarc": None}
+    lower = header_value.lower()
+
+    for proto in ("spf", "dkim", "dmarc"):
+        # Match  proto=<result>  where result is a single token
+        m = re.search(rf"\b{proto}=(pass|fail|softfail|neutral|none|permerror|temperror)\b", lower)
+        if m:
+            verdicts[proto] = m.group(1)
+
+    return verdicts
+
+
+def _arc_index(header_value: str) -> int:
+    """Return the i= sequence number from an ARC-Authentication-Results value, or -1."""
+    m = re.match(r"\s*i\s*=\s*(\d+)", header_value.strip())
+    return int(m.group(1)) if m else -1
+
+
 def extract_auth_from_raw(parsed: dict) -> tuple[dict, list[str]]:
-    """Parse SPF/DKIM/DMARC from raw headers using Python's email library."""
+    """Parse SPF/DKIM/DMARC from the email's authentication result headers.
+
+    Priority / selection logic
+    --------------------------
+    1. ``Authentication-Results`` — written by the **final receiving MTA** that
+       the target mailbox trusts.  When multiple instances are present (rare but
+       possible after re-delivery) we collect all of them and merge: the first
+       non-None verdict for each protocol wins.
+
+    2. ``ARC-Authentication-Results`` — written by intermediate MTAs; each copy
+       carries an ``i=N`` sequence number.  We select **only the entry with the
+       highest i=** (the most recent arc hop) and use its verdicts as a
+       second-priority source, filling in any protocol that step 1 left as None.
+
+    3. ``Authentication-Results-Original`` — a preserved copy from before
+       re-wrapping; used only to fill remaining unknowns.
+
+    4. ``Received-SPF`` — plain-text SPF result, consulted last for SPF only.
+
+    The returned ``result`` dict uses ``"unknown"`` for any protocol that could
+    not be determined (no header, or header present but protocol not mentioned).
+    """
     raw_email = parsed.get("_raw_email")
-    result = {"spf": "unknown", "dkim": "unknown", "dmarc": "unknown"}
+    result: dict[str, str] = {"spf": "unknown", "dkim": "unknown", "dmarc": "unknown"}
     sources: list[str] = []
 
     if not raw_email:
@@ -144,39 +223,47 @@ def extract_auth_from_raw(parsed: dict) -> tuple[dict, list[str]]:
 
     msg = email.message_from_bytes(raw_email)
 
-    header_names = [
-        "Authentication-Results",
-        "ARC-Authentication-Results",
-        "Authentication-Results-Original",
-        "Received-SPF",
-    ]
+    # ---------- 1. Authentication-Results (final MTA) ----------
+    auth_results = msg.get_all("Authentication-Results") or []
+    for v in auth_results:
+        sources.append(f"Authentication-Results: {v}")
+        verdicts = _parse_auth_verdict(v)
+        for proto in ("spf", "dkim", "dmarc"):
+            if result[proto] == "unknown" and verdicts[proto] is not None:
+                result[proto] = verdicts[proto]
 
-    for name in header_names:
-        values = msg.get_all(name) or []
-        for v in values:
-            sources.append(f"{name}: {v}")
+    # ---------- 2. ARC-Authentication-Results (highest i= only) ----------
+    arc_values = msg.get_all("ARC-Authentication-Results") or []
+    for v in arc_values:
+        sources.append(f"ARC-Authentication-Results: {v}")
+
+    if arc_values:
+        # Pick the entry with the highest i= sequence number
+        best_arc = max(arc_values, key=_arc_index)
+        arc_verdicts = _parse_auth_verdict(best_arc)
+        for proto in ("spf", "dkim", "dmarc"):
+            if result[proto] == "unknown" and arc_verdicts[proto] is not None:
+                result[proto] = arc_verdicts[proto]
+
+    # ---------- 3. Authentication-Results-Original ----------
+    orig_values = msg.get_all("Authentication-Results-Original") or []
+    for v in orig_values:
+        sources.append(f"Authentication-Results-Original: {v}")
+        verdicts = _parse_auth_verdict(v)
+        for proto in ("spf", "dkim", "dmarc"):
+            if result[proto] == "unknown" and verdicts[proto] is not None:
+                result[proto] = verdicts[proto]
+
+    # ---------- 4. Received-SPF (SPF only, last resort) ----------
+    spf_values = msg.get_all("Received-SPF") or []
+    for v in spf_values:
+        sources.append(f"Received-SPF: {v}")
+        if result["spf"] == "unknown":
             lower = v.lower()
-
-            if "spf=pass" in lower and result["spf"] == "unknown":
-                result["spf"] = "pass"
-            elif any(x in lower for x in ["spf=fail", "spf=softfail"]) and result["spf"] == "unknown":
-                result["spf"] = "fail"
-
-            if name.lower() == "received-spf":
-                if "pass" in lower and result["spf"] == "unknown":
-                    result["spf"] = "pass"
-                elif any(x in lower for x in ["fail", "softfail"]) and result["spf"] == "unknown":
-                    result["spf"] = "fail"
-
-            if "dkim=pass" in lower and result["dkim"] == "unknown":
-                result["dkim"] = "pass"
-            elif "dkim=fail" in lower and result["dkim"] == "unknown":
-                result["dkim"] = "fail"
-
-            if "dmarc=pass" in lower and result["dmarc"] == "unknown":
-                result["dmarc"] = "pass"
-            elif "dmarc=fail" in lower and result["dmarc"] == "unknown":
-                result["dmarc"] = "fail"
+            # Received-SPF value starts with the verdict word
+            m = re.match(r"\s*(pass|fail|softfail|neutral|none|permerror|temperror)\b", lower)
+            if m:
+                result["spf"] = m.group(1)
 
     return result, sources
 
@@ -194,15 +281,38 @@ def get_message_id(parsed: dict, headers: dict) -> str | None:
     return msg.get("Message-ID")
 
 
+def _first_header_value(msg, inner: dict, name: str) -> str | None:
+    """Return the first value of a header, checking Python's email.Message first,
+    then the eml_parser inner header dict (which stores values as lists or strings).
+
+    ``name`` should be in canonical capitalisation (e.g. 'Reply-To').
+    """
+    # Python email.Message (handles folded/encoded headers properly)
+    val = msg.get(name) if msg is not None else None
+    if val is not None:
+        return val.strip()
+
+    # eml_parser inner header dict uses lowercase keys; values may be lists
+    key = name.lower()
+    raw = inner.get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return raw[0].strip() if raw else None
+    return str(raw).strip()
+
+
 def analyze_headers(parsed: dict) -> dict:
     """From/Reply-To/Return-Path, sender IP, SPF/DKIM/DMARC, header issues."""
     headers = parsed.get("header", {}) or {}
+    # eml_parser nests the full raw-header dict one level deeper
+    inner_headers = headers.get("header", {}) or {}
     raw_email = parsed.get("_raw_email")
     msg = email.message_from_bytes(raw_email) if raw_email else None
 
-    from_addr = msg.get("From") if msg else headers.get("from")
-    reply_to = msg.get("Reply-To") if msg else headers.get("reply-to")
-    return_path = msg.get("Return-Path") if msg else headers.get("return-path")
+    from_addr = _first_header_value(msg, inner_headers, "From")
+    reply_to = _first_header_value(msg, inner_headers, "Reply-To")
+    return_path = _first_header_value(msg, inner_headers, "Return-Path")
 
     from_domain = extract_domain(from_addr)
     reply_domain = extract_domain(reply_to)

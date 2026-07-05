@@ -1,6 +1,10 @@
 api:
-  virustotal_key: "d99172f11af84c21ec693e7e0d484138ff857aad1d73cb3c293b5ce3bc7dbafc"
-  abuseipdb_key: "8a8795743010d6962c9a5c849da03bfec6df8464410ddefc8ff8f55739ebfac8cf12043d1e66a2ae"
+  # IMPORTANT: the keys that were here have been rotated and removed.
+  # This file is only used by the legacy CLI (main.py) — the desktop app
+  # stores keys in the Settings dialog (saved to the local SQLite DB).
+  # If you use main.py, paste your own keys here. Never commit real keys.
+  virustotal_key: ""
+  abuseipdb_key: ""
 
 scoring:
   brand_mismatch: 2

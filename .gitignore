@@ -1,11 +1,45 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
 .venv/
 venv/
+env/
+
+# Secrets — NEVER commit these
 .env
 *.sqlite3
+
+# PyInstaller build artefacts
 build/
 dist/
+
+# Inno Setup compiled output (produced inside dist/ already, but belt-and-suspenders)
+Output/
 *.spec.bak
-.pytest_cache/
-*.egg-info/
+
+# Logs
+*.log
+logs/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# assets/icons/ IS committed (app.ico is source-controlled so CI doesn't need
+# to regenerate it from scratch on every run — generate_icon.py overwrites it
+# at build time if Pillow is available for a higher-quality version)
+!assets/icons/
+!assets/icons/app.ico

@@ -1,23 +1,36 @@
-# Backend
-fastapi
-uvicorn[standard]
-pydantic-settings
-sqlalchemy>=2.0
-aiosqlite
-alembic
-eml-parser
-beautifulsoup4
-python-docx
-vt-py
-httpx
-python-multipart
-platformdirs
+# Phish Analyzer Desktop — pinned dependencies for reproducible builds.
+#
+# Pin policy: exact versions (==) for packages whose ABI or public API we
+# depend on directly; minimum versions (>=) only for build/packaging tooling.
+# To upgrade: change the version here, run `pip install -r requirements.txt`,
+# smoke-test with `python launcher.py`, then rebuild with PyInstaller.
 
-# Frontend / packaging
-# NOTE: pin an exact PySide6 version once the packaging venv is fixed to
-# Python 3.11/3.12 (see README) -- version availability differs a lot by
-# interpreter version, so an unbounded range is used here for dev machines.
-PySide6>=6.6
-pyinstaller>=6.3
-requests
-pydantic>=2
+# ── Backend ──────────────────────────────────────────────────────────────────
+fastapi==0.139.0
+uvicorn[standard]==0.50.0
+pydantic==2.13.4
+pydantic-settings==2.14.2
+SQLAlchemy==2.0.51
+aiosqlite==0.22.1
+alembic==1.18.5
+eml-parser==3.0.2
+beautifulsoup4==4.15.0
+python-docx==1.2.0
+vt-py==0.22.0
+httpx==0.28.1
+python-multipart==0.0.32
+platformdirs==4.10.0
+requests==2.34.2
+h11==0.16.0
+anyio==4.14.1
+starlette==1.3.1
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
+# PySide6 wheel availability lags behind new CPython releases.
+# Build the packaged .exe from a Python 3.11 or 3.12 venv (see README).
+PySide6==6.11.1
+
+# ── Packaging (CI only — not needed at runtime) ───────────────────────────────
+pyinstaller==6.21.0
+# Pillow is used only by generate_icon.py at build time to draw a proper icon.
+Pillow>=10.0.0
