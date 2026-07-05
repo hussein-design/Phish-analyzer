@@ -38,6 +38,9 @@ on:
           - "true"
           - "false"
 
+permissions:
+  contents: write   # required to create releases and upload release assets
+
 jobs:
   build:
     runs-on: windows-latest
