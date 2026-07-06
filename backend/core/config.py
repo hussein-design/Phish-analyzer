@@ -12,11 +12,16 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from shared.paths import db_path
+from shared.paths import db_path, dotenv_path
 
 
 class AppSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # Must be an absolute path (see shared.paths.dotenv_path docstring) --
+    # a bare ".env" resolves against the process cwd, not the project root,
+    # and silently finds nothing if launched from anywhere else.
+    model_config = SettingsConfigDict(
+        env_file=str(dotenv_path()), env_file_encoding="utf-8", extra="ignore"
+    )
 
     app_host: str = "127.0.0.1"
     app_port: int = 8756

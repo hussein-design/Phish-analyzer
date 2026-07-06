@@ -77,5 +77,25 @@ def assets_dir() -> Path:
     return project_root() / "assets"
 
 
+def dotenv_path() -> Path:
+    """Absolute path to the .env file -- must NOT be a bare relative path.
+
+    pydantic-settings resolves a relative env_file against the process's
+    current working directory at the moment AppSettings() is constructed,
+    not the project root. Launching the app from any other directory (a
+    shortcut, a different shell, a frozen exe run via `cd elsewhere && ...`)
+    would then silently find no .env and any keys pasted into it would be
+    ignored with no error.
+
+    In a frozen build there's no source tree to anchor to, so this points
+    next to the executable instead -- e.g. a user can drop a .env beside
+    PhishAnalyzerDesktop.exe (NOT inside the onedir _internal/ resources,
+    which are bundled and not meant to be hand-edited).
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / ".env"
+    return project_root() / ".env"
+
+
 def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
