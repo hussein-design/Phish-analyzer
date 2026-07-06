@@ -58,7 +58,11 @@ def create_app() -> FastAPI:
         app.state.engine = engine
         app.state.session_factory = session_factory
 
-        await seed_settings_if_empty(session_factory)
+        await seed_settings_if_empty(
+            session_factory,
+            vt_api_key=app_settings.vt_api_key,
+            abuseipdb_api_key=app_settings.abuseipdb_api_key,
+        )
 
         app.state.analysis_service = AnalysisService(
             session_factory=session_factory,
