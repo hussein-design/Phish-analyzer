@@ -1,8 +1,12 @@
 api:
-  # IMPORTANT: the keys that were here have been rotated and removed.
-  # This file is only used by the legacy CLI (main.py) — the desktop app
-  # stores keys in the Settings dialog (saved to the local SQLite DB).
-  # If you use main.py, paste your own keys here. Never commit real keys.
+  # ─────────────────────────────────────────────────────────────────────────
+  # LEGACY CLI ONLY (main.py).  The desktop app NEVER reads this file.
+  # Desktop app API keys are stored exclusively in the Settings dialog
+  # (persisted to the local SQLite DB at %LOCALAPPDATA%\PhishAnalyzer\...).
+  #
+  # WARNING: Any keys you put here will end up in git history if committed.
+  # Do not commit real keys.  Rotate any key that was ever stored here.
+  # ─────────────────────────────────────────────────────────────────────────
   virustotal_key: ""
   abuseipdb_key: ""
 

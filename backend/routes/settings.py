@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from backend.models.app_settings import AppSettingsRecord
 from backend.repositories.settings_repository import SettingsRepository
@@ -9,6 +12,7 @@ from backend.routes.deps import get_session
 from shared.schemas import ApiKeysUpdate, ScoringWeights, SettingsRead, SettingsUpdate
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _to_read(record: AppSettingsRecord) -> SettingsRead:
@@ -62,8 +66,25 @@ async def update_keys_endpoint(
     record = await repo.get()
 
     if payload.virustotal_key is not None:
-        record.virustotal_key = payload.virustotal_key or None
+        new_vt = payload.virustotal_key or None
+        logger.info(
+            "Updating virustotal_key: clearing=%s, setting_new=%s",
+            new_vt is None,
+            new_vt is not None,
+        )
+        record.virustotal_key = new_vt
+        # Explicitly mark the column dirty so SQLAlchemy includes it in the
+        # UPDATE even if its attribute change tracking is bypassed.
+        flag_modified(record, "virustotal_key")
+
     if payload.abuseipdb_key is not None:
-        record.abuseipdb_key = payload.abuseipdb_key or None
+        new_abuse = payload.abuseipdb_key or None
+        logger.info(
+            "Updating abuseipdb_key: clearing=%s, setting_new=%s",
+            new_abuse is None,
+            new_abuse is not None,
+        )
+        record.abuseipdb_key = new_abuse
+        flag_modified(record, "abuseipdb_key")
 
     await repo.save(record)
