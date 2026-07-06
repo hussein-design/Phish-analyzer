@@ -1,16 +1,19 @@
 """Settings dialog controller.
 
-The settings PUT and the keys PUT used to fire as two separate run_async
-calls, which meant two concurrent worker threads both writing to SQLite at
-the same time.  SQLite serialises writers, but the second write would often
-silently fail or overwrite the first.  The fix is to use a single chained
-call: save the scoring/list settings first, then — only after that succeeds —
-save the keys.  This guarantees sequential writes with no concurrency.
+Saves everything — scoring weights, keyword lists, AND API keys — in a
+single PUT /settings request.  This eliminates the two-step chained save
+that was the root cause of API keys silently not persisting (the second
+request in the chain was sometimes never fired or was swallowed).
 """
 from __future__ import annotations
 
+import logging
+
 from frontend.controllers.base_controller import BaseController
 from frontend.dialogs.settings_dialog import SettingsDialog
+from frontend.services.api_client import ApiError
+
+logger = logging.getLogger(__name__)
 
 
 class SettingsController(BaseController):
@@ -19,7 +22,13 @@ class SettingsController(BaseController):
         self.main_window = main_window
 
     def open_settings_dialog(self) -> None:
-        self.run_async(self.api_client.get_settings, on_success=self._show_dialog)
+        self.run_async(
+            self.api_client.get_settings,
+            on_success=self._show_dialog,
+            on_error=lambda err: self.notification_center.show_toast(
+                f"Could not load settings: {err}", level="error"
+            ),
+        )
 
     def _show_dialog(self, settings: dict) -> None:
         dialog = SettingsDialog(settings, parent=self.main_window)
@@ -27,49 +36,43 @@ class SettingsController(BaseController):
             self._save_settings(dialog)
 
     def _save_settings(self, dialog: SettingsDialog) -> None:
-        payload = {
+        # Build one combined payload that includes everything — scoring weights,
+        # lists, AND any API keys the user typed.  The backend's PUT /settings
+        # handler writes all of this in a single atomic DB commit.
+        payload: dict = {
             "scoring": dialog.scoring_payload(),
             "url_suspicious_keywords": dialog.keywords_payload(),
             "suspicious_tlds": dialog.tlds_payload(),
             "url_shorteners": dialog.shorteners_payload(),
             "urgency_keywords": dialog.urgency_payload(),
         }
-        keys_payload = dialog.keys_payload()
 
-        if keys_payload:
-            # Keys were entered — save scoring settings first, then keys on success.
-            # Using on_success chaining ensures the two SQLite writes are strictly
-            # sequential (never concurrent), which prevents the race condition that
-            # caused keys to silently not persist.
-            def _after_settings_saved(_response: dict) -> None:
-                self.run_async(
-                    self.api_client.update_keys,
-                    keys_payload,
-                    on_success=lambda _r: self.notification_center.show_toast(
-                        "Settings and API keys saved", level="success"
-                    ),
-                    on_error=lambda err: self.notification_center.show_toast(
-                        f"Settings saved but API keys failed: {err}", level="error"
-                    ),
-                )
+        # Only add key fields when the user actually typed something.
+        # Omitting them (leaving them absent from the dict) means "leave
+        # unchanged".  The backend treats None as "leave unchanged".
+        keys = dialog.keys_payload()
+        if "virustotal_key" in keys:
+            payload["virustotal_key"] = keys["virustotal_key"]
+            logger.info("Settings save: virustotal_key included in payload (len=%d)", len(keys["virustotal_key"]))
+        if "abuseipdb_key" in keys:
+            payload["abuseipdb_key"] = keys["abuseipdb_key"]
+            logger.info("Settings save: abuseipdb_key included in payload (len=%d)", len(keys["abuseipdb_key"]))
 
-            self.run_async(
-                self.api_client.update_settings,
-                payload,
-                on_success=_after_settings_saved,
-                on_error=lambda err: self.notification_center.show_toast(
-                    f"Failed to save settings: {err}", level="error"
-                ),
-            )
-        else:
-            # No keys entered — single write, no chaining needed.
-            self.run_async(
-                self.api_client.update_settings,
-                payload,
-                on_success=lambda _r: self.notification_center.show_toast(
-                    "Settings saved", level="success"
-                ),
-                on_error=lambda err: self.notification_center.show_toast(
-                    f"Failed to save settings: {err}", level="error"
-                ),
-            )
+        has_keys = bool(keys)
+        logger.info("Settings save: payload keys present=%s, has_api_keys=%s", list(payload.keys()), has_keys)
+
+        self.run_async(
+            self.api_client.update_settings,
+            payload,
+            on_success=lambda _r: self.notification_center.show_toast(
+                "Settings and API keys saved" if has_keys else "Settings saved",
+                level="success",
+            ),
+            on_error=self._on_save_error,
+        )
+
+    def _on_save_error(self, err: ApiError) -> None:
+        logger.error("Failed to save settings: %s", err)
+        self.notification_center.show_toast(
+            f"Failed to save settings: {err}", level="error"
+        )

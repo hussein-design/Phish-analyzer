@@ -25,15 +25,21 @@ class SettingsRepository:
         return record
 
     async def save(self, record: AppSettingsRecord) -> AppSettingsRecord:
-        # SQLAlchemy tracks changes to mapped columns, but JSON columns that
-        # are mutated in-place (or replaced with a new dict/list object) are
-        # NOT detected as dirty by the default MutableDict/MutableList
-        # tracking because we use plain JSON columns, not
-        # sqlalchemy.ext.mutable.  Calling flag_modified() for every JSON
-        # column (and for the String key columns, for which the instrumented
-        # attribute tracking can be skipped under certain session states) tells
-        # SQLAlchemy to always include every column in the UPDATE, regardless
-        # of whether it thinks they changed.
+        """Persist the non-key settings columns (scoring, lists, brand domains).
+
+        Deliberately does NOT touch virustotal_key or abuseipdb_key so that a
+        concurrent or sequential settings save can never silently overwrite a
+        key that was just written by update_keys_endpoint.  Use save_keys()
+        for that purpose.
+
+        SQLAlchemy tracks changes to mapped columns, but JSON columns that are
+        mutated in-place (or replaced with a new dict/list object) are NOT
+        detected as dirty by the default MutableDict/MutableList tracking
+        because we use plain JSON columns, not sqlalchemy.ext.mutable. Calling
+        flag_modified() for every JSON column tells SQLAlchemy to always
+        include those columns in the UPDATE, regardless of whether it thinks
+        they changed.
+        """
         for col in (
             "scoring_weights",
             "brand_domains",
@@ -41,16 +47,10 @@ class SettingsRepository:
             "suspicious_tlds",
             "url_shorteners",
             "urgency_keywords",
-            "virustotal_key",
-            "abuseipdb_key",
         ):
             flag_modified(record, col)
 
-        logger.debug(
-            "Saving app_settings: vt_key_set=%s, abuse_key_set=%s",
-            bool(record.virustotal_key),
-            bool(record.abuseipdb_key),
-        )
+        logger.debug("Saving app_settings (non-key columns only)")
 
         self.session.add(record)
         try:
@@ -63,6 +63,100 @@ class SettingsRepository:
 
         logger.info(
             "app_settings saved: vt_key_configured=%s, abuse_key_configured=%s",
+            bool(record.virustotal_key),
+            bool(record.abuseipdb_key),
+        )
+        return record
+
+    async def save_all(
+        self,
+        record: AppSettingsRecord,
+        *,
+        set_vt: bool = False,
+        set_abuse: bool = False,
+    ) -> AppSettingsRecord:
+        """Persist all columns in a single atomic commit.
+
+        Always writes the 6 non-key JSON columns.  Also writes the key columns
+        when set_vt / set_abuse are True respectively.
+
+        This is the preferred method when saving settings and keys together,
+        because it avoids the two-request chain that was the root cause of keys
+        being silently dropped.
+        """
+        cols = [
+            "scoring_weights",
+            "brand_domains",
+            "url_suspicious_keywords",
+            "suspicious_tlds",
+            "url_shorteners",
+            "urgency_keywords",
+        ]
+        if set_vt:
+            cols.append("virustotal_key")
+            logger.info("save_all: including virustotal_key (configured=%s)", bool(record.virustotal_key))
+        if set_abuse:
+            cols.append("abuseipdb_key")
+            logger.info("save_all: including abuseipdb_key (configured=%s)", bool(record.abuseipdb_key))
+
+        for col in cols:
+            flag_modified(record, col)
+
+        self.session.add(record)
+        try:
+            await self.session.commit()
+        except Exception:
+            logger.exception("Failed to commit save_all")
+            await self.session.rollback()
+            raise
+        await self.session.refresh(record)
+
+        logger.info(
+            "save_all committed: vt_key_configured=%s, abuse_key_configured=%s",
+            bool(record.virustotal_key),
+            bool(record.abuseipdb_key),
+        )
+        return record
+
+    async def save_keys(
+        self,
+        record: AppSettingsRecord,
+        *,
+        set_vt: bool = False,
+        set_abuse: bool = False,
+    ) -> AppSettingsRecord:
+        """Persist only the API key columns.
+
+        Callers must pass set_vt=True and/or set_abuse=True to indicate which
+        key columns were intentionally modified.  This prevents accidental
+        writes when neither key was touched.
+        """
+        if not set_vt and not set_abuse:
+            logger.debug("save_keys() called with nothing to save — skipping")
+            return record
+
+        if set_vt:
+            flag_modified(record, "virustotal_key")
+            logger.info(
+                "Saving virustotal_key: configured=%s", bool(record.virustotal_key)
+            )
+        if set_abuse:
+            flag_modified(record, "abuseipdb_key")
+            logger.info(
+                "Saving abuseipdb_key: configured=%s", bool(record.abuseipdb_key)
+            )
+
+        self.session.add(record)
+        try:
+            await self.session.commit()
+        except Exception:
+            logger.exception("Failed to commit API key save")
+            await self.session.rollback()
+            raise
+        await self.session.refresh(record)
+
+        logger.info(
+            "API keys saved: vt_key_configured=%s, abuse_key_configured=%s",
             bool(record.virustotal_key),
             bool(record.abuseipdb_key),
         )

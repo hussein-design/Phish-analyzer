@@ -170,6 +170,10 @@ class SettingsUpdate(BaseModel):
     suspicious_tlds: list[str] | None = None
     url_shorteners: list[str] | None = None
     urgency_keywords: list[str] | None = None
+    # Optional API keys — only included when the user actually typed something.
+    # None means "leave unchanged"; empty string means "clear the key".
+    virustotal_key: str | None = None
+    abuseipdb_key: str | None = None
 
 
 class ApiKeysUpdate(BaseModel):

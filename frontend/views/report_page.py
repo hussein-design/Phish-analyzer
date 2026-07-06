@@ -25,6 +25,7 @@ class ReportPage(QWidget):
     backRequested = Signal()
     downloadRequested = Signal(int)
     deleteRequested = Signal(int)
+    reEnrichRequested = Signal(int)
 
     def __init__(self, theme_manager: ThemeManager, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -42,6 +43,13 @@ class ReportPage(QWidget):
         download_button = QPushButton("Export DOCX")
         download_button.clicked.connect(self._emit_download)
 
+        self._re_enrich_button = QPushButton("🔄 Re-run Enrichment")
+        self._re_enrich_button.setToolTip(
+            "Re-run VirusTotal and AbuseIPDB lookups using the API keys\n"
+            "currently saved in Settings."
+        )
+        self._re_enrich_button.clicked.connect(self._emit_re_enrich)
+
         delete_button = QPushButton("Delete")
         delete_button.clicked.connect(self._emit_delete)
 
@@ -50,6 +58,7 @@ class ReportPage(QWidget):
         header_row.addStretch(1)
         header_row.addWidget(self._verdict_badge)
         header_row.addWidget(self._score_label)
+        header_row.addWidget(self._re_enrich_button)
         header_row.addWidget(download_button)
         header_row.addWidget(delete_button)
 
@@ -112,6 +121,17 @@ class ReportPage(QWidget):
         if self._analysis_id is not None:
             self.deleteRequested.emit(self._analysis_id)
 
+    def _emit_re_enrich(self) -> None:
+        if self._analysis_id is not None:
+            self._re_enrich_button.setEnabled(False)
+            self._re_enrich_button.setText("⏳ Running…")
+            self.reEnrichRequested.emit(self._analysis_id)
+
+    def set_re_enrich_idle(self) -> None:
+        """Re-enable the button after enrichment completes (success or error)."""
+        self._re_enrich_button.setEnabled(True)
+        self._re_enrich_button.setText("🔄 Re-run Enrichment")
+
     def display(self, detail: EmailDetail) -> None:
         self._analysis_id = detail.id
         self._title_label.setText(f"{detail.filename} — {detail.subject or '(no subject)'}")
@@ -167,79 +187,58 @@ class ReportPage(QWidget):
 
         # ── VirusTotal ────────────────────────────────────────────────────
         vt_status = detail.vt_enrichment_status
+        vt_hits = [
+            u for u in detail.urls
+            if (u.vt_malicious or 0) > 0 or (u.vt_suspicious or 0) > 0
+        ]
+
         if vt_status == "no_key":
-            enrichment_lines.append(
-                "⚠ VirusTotal: No API key configured — go to Settings to add one."
-            )
+            enrichment_lines.append("⚠ VirusTotal: No API key configured — go to Settings to add one.")
         elif vt_status == "rate_limit":
             err = detail.vt_enrichment_error or "quota exceeded"
             enrichment_lines.append(f"⚠ VirusTotal: Daily quota / rate limit reached ({err})")
         elif vt_status == "error":
             err = detail.vt_enrichment_error or "unknown error"
-            enrichment_lines.append(f"✗ VirusTotal: API error — {err}")
-        elif vt_status in ("ok", "no_data", None):
-            # Show per-URL results if any engines flagged anything
-            vt_hits = [
-                u for u in detail.urls
-                if (u.vt_malicious or 0) > 0 or (u.vt_suspicious or 0) > 0
-            ]
-            if vt_hits:
-                for u in vt_hits:
-                    enrichment_lines.append(
-                        f"VT: {u.url}\n"
-                        f"    malicious={u.vt_malicious}, "
-                        f"suspicious={u.vt_suspicious}, "
-                        f"harmless={u.vt_harmless}"
-                    )
-            elif detail.urls and vt_status == "ok":
+            enrichment_lines.append(f"✗ VirusTotal: Enrichment failed — {err}")
+        elif vt_hits:
+            for u in vt_hits:
                 enrichment_lines.append(
-                    "✓ VirusTotal: All URLs checked — no malicious detections."
+                    f"⚠ VT: {u.url}\n"
+                    f"    malicious={u.vt_malicious}, "
+                    f"suspicious={u.vt_suspicious}, "
+                    f"harmless={u.vt_harmless}"
                 )
-            elif detail.urls and vt_status == "no_data":
-                enrichment_lines.append(
-                    "ℹ VirusTotal: Checked but no results returned (URLs may be unrated)."
-                )
-            elif not detail.urls:
-                enrichment_lines.append("ℹ VirusTotal: No URLs in this email to scan.")
-            else:
-                # vt_status is None — analysis was run before this feature
-                enrichment_lines.append(
-                    "ℹ VirusTotal: Status unknown (analysis predates this feature)."
-                )
+        elif detail.urls and vt_status == "ok":
+            enrichment_lines.append("✓ VirusTotal: All URLs checked — no malicious detections.")
+        elif detail.urls and vt_status == "no_data":
+            enrichment_lines.append("ℹ VirusTotal: URLs submitted — no results returned (may be unrated).")
+        elif not detail.urls:
+            enrichment_lines.append("ℹ VirusTotal: No URLs found in this email.")
+        # vt_status is None (old analysis) — show nothing, avoids confusing text
 
         # ── AbuseIPDB ─────────────────────────────────────────────────────
         abuse_status = detail.abuse_enrichment_status
         sender_ip = detail.header_info.sender_ip
+
         if abuse_status == "no_key":
-            enrichment_lines.append(
-                "⚠ AbuseIPDB: No API key configured — go to Settings to add one."
-            )
+            enrichment_lines.append("⚠ AbuseIPDB: No API key configured — go to Settings to add one.")
         elif abuse_status == "rate_limit":
             err = detail.abuse_enrichment_error or "quota exceeded"
             enrichment_lines.append(f"⚠ AbuseIPDB: Daily quota / rate limit reached ({err})")
         elif abuse_status == "error":
             err = detail.abuse_enrichment_error or "unknown error"
-            enrichment_lines.append(f"✗ AbuseIPDB: API error — {err}")
-        elif abuse_status == "no_data":
-            enrichment_lines.append(
-                "ℹ AbuseIPDB: No sender IP found in email headers — nothing to check."
-            )
+            enrichment_lines.append(f"✗ AbuseIPDB: Enrichment failed — {err}")
         elif detail.abuse_result:
             ab = detail.abuse_result
             enrichment_lines.append(
                 f"AbuseIPDB: {sender_ip}\n"
-                f"    score={ab.abuse_score}, reports={ab.total_reports}, "
+                f"    score={ab.abuse_score}%, reports={ab.total_reports}, "
                 f"country={ab.country_code}, ISP={ab.isp}"
             )
-        elif abuse_status in ("ok", None) and not detail.abuse_result:
-            if sender_ip:
-                enrichment_lines.append(
-                    f"✓ AbuseIPDB: {sender_ip} — no abuse reports found."
-                )
-            elif abuse_status is None:
-                enrichment_lines.append(
-                    "ℹ AbuseIPDB: Status unknown (analysis predates this feature)."
-                )
+        elif abuse_status == "no_data" or not sender_ip:
+            enrichment_lines.append("ℹ AbuseIPDB: No sender IP found in headers — check not performed.")
+        elif abuse_status in ("ok", None) and sender_ip:
+            enrichment_lines.append(f"✓ AbuseIPDB: {sender_ip} — no abuse reports on record.")
 
         self._enrichment_label.setText(
             "\n".join(enrichment_lines) if enrichment_lines else "No enrichment data available."

@@ -1,13 +1,15 @@
-"""VirusTotal URL enrichment.
+"""VirusTotal URL enrichment — native async via vt-py's async API.
 
-Returns a structured result dict with:
+vt-py 0.18+ ships vt.Client as an aiohttp-based async client.  The old code
+called it synchronously inside run_in_executor(), which caused
+"This event loop is already running" because aiohttp tries to attach to the
+running loop at Client construction time.  The fix is to use the async methods
+(get_object_async, scan_url_async) and async context manager directly.
+
+Returns a structured result dict:
   status  — "no_key" | "ok" | "no_data" | "rate_limit" | "error"
-  error   — human-readable error string (only set when status is not ok/no_data/no_key)
+  error   — human-readable string (only set on non-ok statuses)
   results — {url: {"malicious": int, "harmless": int, "suspicious": int}}
-
-vt-py has no async client, so each lookup runs in a thread-pool executor behind
-a semaphore sized for the free-tier rate limit; per-URL lookups overlap via
-asyncio.gather instead of serialising.
 """
 
 from __future__ import annotations
@@ -19,35 +21,44 @@ import vt
 
 logger = logging.getLogger(__name__)
 
+# VT free tier allows 4 requests/minute; cap concurrent lookups accordingly.
 _RATE_LIMIT = asyncio.Semaphore(4)
 
-# VT free tier: 4 req/min.  HTTP 429 response body contains "Quota exceeded".
 _QUOTA_MESSAGES = ("quota exceeded", "rate limit", "too many requests")
 
 
 def _is_quota_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(q in msg for q in _QUOTA_MESSAGES)
+    return any(q in str(exc).lower() for q in _QUOTA_MESSAGES)
 
 
-def _lookup_sync(client: vt.Client, url: str) -> dict:
-    """Lookup one URL.  Returns per-URL stats dict or raises."""
-    try:
-        url_id = vt.url_id(url)
-        url_obj = client.get_object("/urls/{}", url_id)
-        stats = url_obj.last_analysis_stats or {}
-    except vt.error.APIError as exc:
-        code = getattr(exc, "code", "") or ""
-        if "NotFoundError" in str(type(exc)) or code == "NotFoundError":
-            # URL not in VT database — submit and wait
-            try:
-                analysis = client.scan_url(url, wait_for_completion=True)
-                stats = analysis.get("stats") or getattr(analysis, "stats", None) or {}
-            except Exception:
-                stats = {}
-        else:
-            raise
-    return {
+async def _lookup_one_async(client: vt.Client, url: str) -> tuple[str, dict]:
+    """Look up a single URL using the async vt-py API.
+
+    If the URL is not yet in VT's database, submit it for scanning and wait
+    for the result (up to the client's timeout).
+    """
+    async with _RATE_LIMIT:
+        try:
+            url_id = vt.url_id(url)
+            url_obj = await client.get_object_async("/urls/{}", url_id)
+            stats = url_obj.last_analysis_stats or {}
+        except vt.error.APIError as exc:
+            code = getattr(exc, "code", "") or ""
+            if "NotFoundError" in str(type(exc)) or code == "NotFoundError":
+                # URL not in VT — submit and wait for the analysis to finish.
+                try:
+                    analysis = await client.scan_url_async(url, wait_for_completion=True)
+                    stats = (
+                        analysis.get("stats")
+                        or getattr(analysis, "stats", None)
+                        or {}
+                    )
+                except Exception:
+                    stats = {}
+            else:
+                raise
+
+    return url, {
         "malicious":  int(stats.get("malicious", 0)),
         "harmless":   int(stats.get("harmless", 0)),
         "suspicious": int(stats.get("suspicious", 0)),
@@ -55,7 +66,7 @@ def _lookup_sync(client: vt.Client, url: str) -> dict:
 
 
 async def enrich_urls(urls: list[str], api_key: str | None) -> dict:
-    """Return structured enrichment result.
+    """Return structured enrichment result for a list of URLs.
 
     Return value shape::
 
@@ -71,26 +82,20 @@ async def enrich_urls(urls: list[str], api_key: str | None) -> dict:
     if not urls:
         return {"status": "no_data", "error": None, "results": {}}
 
-    loop = asyncio.get_running_loop()
-
-    async def lookup_one(client: vt.Client, url: str) -> tuple[str, dict]:
-        async with _RATE_LIMIT:
-            stats = await loop.run_in_executor(None, _lookup_sync, client, url)
-            return url, stats
-
     try:
-        with vt.Client(api_key) as client:
+        async with vt.Client(api_key) as client:
             pairs = await asyncio.gather(
-                *(lookup_one(client, u) for u in urls), return_exceptions=True
+                *(_lookup_one_async(client, u) for u in urls),
+                return_exceptions=True,
             )
     except vt.error.APIError as exc:
         if _is_quota_error(exc):
             logger.warning("VirusTotal rate limit / quota exceeded: %s", exc)
             return {"status": "rate_limit", "error": str(exc), "results": {}}
-        logger.exception("VirusTotal client failed to initialize")
+        logger.exception("VirusTotal client initialisation failed")
         return {"status": "error", "error": str(exc), "results": {}}
     except Exception as exc:
-        logger.exception("VirusTotal client failed to initialize")
+        logger.exception("VirusTotal client initialisation failed")
         return {"status": "error", "error": str(exc), "results": {}}
 
     results: dict[str, dict] = {}
@@ -99,9 +104,9 @@ async def enrich_urls(urls: list[str], api_key: str | None) -> dict:
     for pair in pairs:
         if isinstance(pair, Exception):
             if _is_quota_error(pair):
-                logger.warning("VirusTotal rate limit during lookup: %s", pair)
+                logger.warning("VirusTotal rate limit during URL lookup: %s", pair)
                 return {"status": "rate_limit", "error": str(pair), "results": results}
-            logger.warning("VirusTotal lookup failed for a URL: %s", pair)
+            logger.warning("VirusTotal lookup failed for one URL: %s", pair)
             last_error = str(pair)
             continue
         url, stats = pair

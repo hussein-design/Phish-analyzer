@@ -121,6 +121,15 @@ class ApiClient:
         Path(dest_path).write_bytes(resp.content)
         return dest_path
 
+    def re_enrich(self, analysis_id: int) -> dict:
+        """POST /analyses/{id}/re-enrich — re-runs VT+AbuseIPDB with current keys."""
+        resp = self.session.post(
+            self._url(f"/analyses/{analysis_id}/re-enrich"),
+            timeout=120.0,  # VT scans can be slow; give it 2 minutes
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def get_settings(self) -> dict:
         resp = self.session.get(self._url("/settings"), timeout=self.timeout)
         resp.raise_for_status()

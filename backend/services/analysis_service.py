@@ -272,6 +272,92 @@ class AnalysisService:
                 logger.exception("Analysis pipeline failed for id=%s", analysis_id)
                 await self._mark_status(analysis_id, "FAILED", error_message=str(exc))
 
+    async def re_enrich(self, analysis_id: int) -> EmailAnalysis | None:
+        """Re-run VT + AbuseIPDB enrichment on an already-completed analysis.
+
+        Reads the stored URLs and sender IP from the analysis row, fetches
+        fresh enrichment data using the current API keys from the DB, updates
+        the analysis row in-place, and returns the updated record.
+
+        Returns None if the analysis does not exist.
+        Raises RuntimeError if the analysis is still PENDING / RUNNING.
+        """
+        async with self.session_factory() as session:
+            analysis = await AnalysisRepository(session).get_by_id(analysis_id)
+            if analysis is None:
+                return None
+            if analysis.status in ("PENDING", "RUNNING"):
+                raise RuntimeError(
+                    f"Analysis {analysis_id} is still {analysis.status}; cannot re-enrich yet."
+                )
+
+            settings = await SettingsRepository(session).get()
+            vt_key    = settings.virustotal_key or self._vt_api_key_env
+            abuse_key = settings.abuseipdb_key  or self._abuseipdb_key_env
+
+        # Collect the URLs and sender IP that were stored in the original run.
+        urls = [u.url for u in analysis.urls]
+        sender_ip = analysis.sender_ip
+
+        # Run both providers concurrently — they are independent.
+        vt_enrichment, abuse_enrichment = await asyncio.gather(
+            virustotal_provider.enrich_urls(urls, vt_key),
+            abuseipdb_provider.enrich_ip(sender_ip, abuse_key),
+        )
+
+        vt_status  = vt_enrichment["status"]
+        vt_error   = vt_enrichment.get("error")
+        vt_results = vt_enrichment.get("results", {})
+
+        abuse_status = abuse_enrichment["status"]
+        abuse_error  = abuse_enrichment.get("error")
+        abuse_data   = abuse_enrichment.get("data") or {}
+
+        if vt_status == "no_key":
+            logger.info("Re-enrich: VirusTotal skipped — no API key configured")
+        elif vt_status == "rate_limit":
+            logger.warning("Re-enrich: VirusTotal rate limit: %s", vt_error)
+        elif vt_status == "error":
+            logger.error("Re-enrich: VirusTotal error: %s", vt_error)
+        else:
+            logger.info("Re-enrich: VT status=%s, urls=%d", vt_status, len(vt_results))
+
+        if abuse_status == "no_key":
+            logger.info("Re-enrich: AbuseIPDB skipped — no API key configured")
+        elif abuse_status == "error":
+            logger.error("Re-enrich: AbuseIPDB error: %s", abuse_error)
+
+        async with self.session_factory() as session:
+            repo = AnalysisRepository(session)
+            analysis = await repo.get_by_id(analysis_id)
+            if analysis is None:
+                return None
+
+            # Update per-provider enrichment status fields.
+            analysis.vt_enrichment_status   = vt_status
+            analysis.vt_enrichment_error    = vt_error
+            analysis.abuse_enrichment_status = abuse_status
+            analysis.abuse_enrichment_error  = abuse_error
+
+            # Update per-URL VT results.
+            for url_row in analysis.urls:
+                stats = vt_results.get(url_row.url, {})
+                url_row.vt_malicious  = stats.get("malicious",  0)
+                url_row.vt_harmless   = stats.get("harmless",   0)
+                url_row.vt_suspicious = stats.get("suspicious", 0)
+
+            # Update AbuseIPDB fields.
+            if abuse_data:
+                analysis.abuse_score         = abuse_data.get("abuse_score")
+                analysis.abuse_total_reports = abuse_data.get("total_reports")
+                analysis.abuse_country       = abuse_data.get("country_code")
+                analysis.abuse_isp           = abuse_data.get("isp")
+
+            analysis = await repo.save(analysis)
+
+        logger.info("Re-enrich complete for analysis_id=%d", analysis_id)
+        return analysis
+
     async def _mark_status(
         self, analysis_id: int, status: str, error_message: str | None = None
     ) -> None:

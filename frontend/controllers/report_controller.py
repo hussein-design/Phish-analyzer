@@ -4,6 +4,7 @@ from PySide6.QtWidgets import QFileDialog
 
 from frontend.controllers.base_controller import BaseController
 from frontend.dialogs.confirm_delete_dialog import confirm_delete
+from frontend.services.api_client import ApiError
 from shared.schemas import EmailDetail
 
 
@@ -14,6 +15,7 @@ class ReportController(BaseController):
 
         report_page.downloadRequested.connect(self._on_download_requested)
         report_page.deleteRequested.connect(self._on_delete_requested)
+        report_page.reEnrichRequested.connect(self._on_re_enrich_requested)
 
     def show_analysis(self, analysis_id: int) -> None:
         self.run_async(self.api_client.get_email, analysis_id, on_success=self._on_loaded)
@@ -55,3 +57,25 @@ class ReportController(BaseController):
     def _on_deleted(self) -> None:
         self.notification_center.show_toast("Analysis deleted", level="success")
         self.report_page.backRequested.emit()
+
+    def _on_re_enrich_requested(self, analysis_id: int) -> None:
+        self.run_async(
+            self.api_client.re_enrich,
+            analysis_id,
+            on_success=self._on_re_enrich_done,
+            on_error=self._on_re_enrich_error,
+        )
+
+    def _on_re_enrich_done(self, data: dict) -> None:
+        self.report_page.set_re_enrich_idle()
+        detail = EmailDetail.model_validate(data)
+        self.report_page.display(detail)
+        self.notification_center.show_toast(
+            "Enrichment complete — report updated.", level="success"
+        )
+
+    def _on_re_enrich_error(self, err: ApiError) -> None:
+        self.report_page.set_re_enrich_idle()
+        self.notification_center.show_toast(
+            f"Re-enrichment failed: {err}", level="error"
+        )

@@ -189,6 +189,35 @@ async def delete_email(analysis_id: int, session: AsyncSession = Depends(get_ses
         Path(stored_path).unlink(missing_ok=True)
 
 
+@router.post("/{analysis_id}/re-enrich", response_model=EmailDetail)
+async def re_enrich_analysis(
+    analysis_id: int,
+    service: AnalysisService = Depends(get_analysis_service),
+    session: AsyncSession = Depends(get_session),
+) -> EmailDetail:
+    """Re-run VirusTotal + AbuseIPDB enrichment on an existing analysis using
+    the API keys currently stored in the settings DB.
+
+    Useful when a key wasn't configured at the time of the original analysis,
+    or when you want a fresh scan after adding / updating a key.
+    """
+    try:
+        analysis = await service.re_enrich(analysis_id)
+    except RuntimeError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    if analysis is None:
+        raise AnalysisNotFoundError(f"Analysis {analysis_id} not found")
+
+    # Reload through the route's own session so lazy-loaded relationships
+    # (urls, attachments, reasons) are fully populated for the response.
+    analysis = await AnalysisRepository(session).get_by_id(analysis_id)
+    if analysis is None:
+        raise AnalysisNotFoundError(f"Analysis {analysis_id} not found after re-enrich")
+    return _to_detail(analysis)
+
+
 @router.get("/{analysis_id}/report.docx")
 async def download_report(
     analysis_id: int, session: AsyncSession = Depends(get_session)
