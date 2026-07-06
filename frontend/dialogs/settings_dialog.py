@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QGroupBox,
+    QLabel,
     QLineEdit,
     QScrollArea,
     QSpinBox,
@@ -55,24 +56,62 @@ class SettingsDialog(QDialog):
         keys_group = QGroupBox("API Keys")
         keys_form = QFormLayout(keys_group)
 
+        # ── VirusTotal ────────────────────────────────────────────────────
+        vt_configured = settings.get("virustotal_key_configured", False)
+        vt_status_label = QLabel(
+            "✓ Configured  (leave blank to keep, or type a new key to replace)"
+            if vt_configured
+            else "✗ Not configured"
+        )
+        vt_status_label.setStyleSheet(
+            "color: #37864a; font-size: 11px;" if vt_configured
+            else "color: #c05000; font-size: 11px;"
+        )
+
         self.vt_key_edit = QLineEdit()
         self.vt_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.vt_key_edit.setPlaceholderText(
-            "•••• (configured, leave blank to keep)"
-            if settings.get("virustotal_key_configured")
-            else "Not configured"
+            "Leave blank to keep existing key"
+            if vt_configured
+            else "Paste your VirusTotal API key here"
+        )
+
+        vt_widget = QWidget()
+        vt_layout = QVBoxLayout(vt_widget)
+        vt_layout.setContentsMargins(0, 0, 0, 0)
+        vt_layout.setSpacing(2)
+        vt_layout.addWidget(vt_status_label)
+        vt_layout.addWidget(self.vt_key_edit)
+
+        # ── AbuseIPDB ─────────────────────────────────────────────────────
+        abuse_configured = settings.get("abuseipdb_key_configured", False)
+        abuse_status_label = QLabel(
+            "✓ Configured  (leave blank to keep, or type a new key to replace)"
+            if abuse_configured
+            else "✗ Not configured"
+        )
+        abuse_status_label.setStyleSheet(
+            "color: #37864a; font-size: 11px;" if abuse_configured
+            else "color: #c05000; font-size: 11px;"
         )
 
         self.abuse_key_edit = QLineEdit()
         self.abuse_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.abuse_key_edit.setPlaceholderText(
-            "•••• (configured, leave blank to keep)"
-            if settings.get("abuseipdb_key_configured")
-            else "Not configured"
+            "Leave blank to keep existing key"
+            if abuse_configured
+            else "Paste your AbuseIPDB API key here"
         )
 
-        keys_form.addRow("VirusTotal API key", self.vt_key_edit)
-        keys_form.addRow("AbuseIPDB API key", self.abuse_key_edit)
+        abuse_widget = QWidget()
+        abuse_layout = QVBoxLayout(abuse_widget)
+        abuse_layout.setContentsMargins(0, 0, 0, 0)
+        abuse_layout.setSpacing(2)
+        abuse_layout.addWidget(abuse_status_label)
+        abuse_layout.addWidget(self.abuse_key_edit)
+
+        keys_form.addRow("VirusTotal API key", vt_widget)
+        keys_form.addRow("AbuseIPDB API key", abuse_widget)
 
         scoring_group = QGroupBox("Scoring weights")
         scoring_form = QFormLayout(scoring_group)

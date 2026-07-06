@@ -107,6 +107,13 @@ class EmailDetail(EmailSummary):
     urgency_keywords_found: list[str] = []
     body_preview: str | None = None
     updated_at: datetime
+    # Enrichment status per provider — tells the UI exactly why enrichment
+    # data is absent so it can show a clear, actionable message.
+    # Values: "no_key" | "ok" | "no_data" | "rate_limit" | "error" | None
+    vt_enrichment_status: str | None = None
+    vt_enrichment_error: str | None = None
+    abuse_enrichment_status: str | None = None
+    abuse_enrichment_error: str | None = None
 
 
 class UploadAccepted(BaseModel):

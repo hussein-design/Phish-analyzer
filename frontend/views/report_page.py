@@ -164,22 +164,85 @@ class ReportPage(QWidget):
             self._attachments_label.setText("None")
 
         enrichment_lines = []
-        for u in detail.urls:
-            if u.vt_malicious or u.vt_harmless or u.vt_suspicious:
+
+        # ── VirusTotal ────────────────────────────────────────────────────
+        vt_status = detail.vt_enrichment_status
+        if vt_status == "no_key":
+            enrichment_lines.append(
+                "⚠ VirusTotal: No API key configured — go to Settings to add one."
+            )
+        elif vt_status == "rate_limit":
+            err = detail.vt_enrichment_error or "quota exceeded"
+            enrichment_lines.append(f"⚠ VirusTotal: Daily quota / rate limit reached ({err})")
+        elif vt_status == "error":
+            err = detail.vt_enrichment_error or "unknown error"
+            enrichment_lines.append(f"✗ VirusTotal: API error — {err}")
+        elif vt_status in ("ok", "no_data", None):
+            # Show per-URL results if any engines flagged anything
+            vt_hits = [
+                u for u in detail.urls
+                if (u.vt_malicious or 0) > 0 or (u.vt_suspicious or 0) > 0
+            ]
+            if vt_hits:
+                for u in vt_hits:
+                    enrichment_lines.append(
+                        f"VT: {u.url}\n"
+                        f"    malicious={u.vt_malicious}, "
+                        f"suspicious={u.vt_suspicious}, "
+                        f"harmless={u.vt_harmless}"
+                    )
+            elif detail.urls and vt_status == "ok":
                 enrichment_lines.append(
-                    f"{u.url} -> malicious={u.vt_malicious}, harmless={u.vt_harmless}, "
-                    f"suspicious={u.vt_suspicious}"
+                    "✓ VirusTotal: All URLs checked — no malicious detections."
                 )
-        if detail.abuse_result:
+            elif detail.urls and vt_status == "no_data":
+                enrichment_lines.append(
+                    "ℹ VirusTotal: Checked but no results returned (URLs may be unrated)."
+                )
+            elif not detail.urls:
+                enrichment_lines.append("ℹ VirusTotal: No URLs in this email to scan.")
+            else:
+                # vt_status is None — analysis was run before this feature
+                enrichment_lines.append(
+                    "ℹ VirusTotal: Status unknown (analysis predates this feature)."
+                )
+
+        # ── AbuseIPDB ─────────────────────────────────────────────────────
+        abuse_status = detail.abuse_enrichment_status
+        sender_ip = detail.header_info.sender_ip
+        if abuse_status == "no_key":
+            enrichment_lines.append(
+                "⚠ AbuseIPDB: No API key configured — go to Settings to add one."
+            )
+        elif abuse_status == "rate_limit":
+            err = detail.abuse_enrichment_error or "quota exceeded"
+            enrichment_lines.append(f"⚠ AbuseIPDB: Daily quota / rate limit reached ({err})")
+        elif abuse_status == "error":
+            err = detail.abuse_enrichment_error or "unknown error"
+            enrichment_lines.append(f"✗ AbuseIPDB: API error — {err}")
+        elif abuse_status == "no_data":
+            enrichment_lines.append(
+                "ℹ AbuseIPDB: No sender IP found in email headers — nothing to check."
+            )
+        elif detail.abuse_result:
             ab = detail.abuse_result
             enrichment_lines.append(
-                f"Sender IP {h.sender_ip} -> score={ab.abuse_score}, "
-                f"reports={ab.total_reports}, country={ab.country_code}, ISP={ab.isp}"
+                f"AbuseIPDB: {sender_ip}\n"
+                f"    score={ab.abuse_score}, reports={ab.total_reports}, "
+                f"country={ab.country_code}, ISP={ab.isp}"
             )
+        elif abuse_status in ("ok", None) and not detail.abuse_result:
+            if sender_ip:
+                enrichment_lines.append(
+                    f"✓ AbuseIPDB: {sender_ip} — no abuse reports found."
+                )
+            elif abuse_status is None:
+                enrichment_lines.append(
+                    "ℹ AbuseIPDB: Status unknown (analysis predates this feature)."
+                )
+
         self._enrichment_label.setText(
-            "\n".join(enrichment_lines)
-            if enrichment_lines
-            else "No enrichment data (no API keys configured or nothing flagged)"
+            "\n".join(enrichment_lines) if enrichment_lines else "No enrichment data available."
         )
 
         self._urgency_label.setText(

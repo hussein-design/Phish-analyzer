@@ -131,31 +131,62 @@ class AnalysisService:
                     url_shorteners = list(settings.url_shorteners)
                     urgency_keywords = list(settings.urgency_keywords)
 
-                vt_results = await virustotal_provider.enrich_urls(urls, vt_key)
-                abuse_result = await abuseipdb_provider.enrich_ip(
+                # ── Threat intel enrichment ───────────────────────────────
+                # Both providers now return a structured dict:
+                #   {"status": "no_key"|"ok"|"no_data"|"rate_limit"|"error",
+                #    "error": str|None, "results"/"data": ...}
+                # We log the status and store it on the analysis row so the
+                # UI can show a clear explanation instead of just "no data".
+                vt_enrichment = await virustotal_provider.enrich_urls(urls, vt_key)
+                vt_status  = vt_enrichment["status"]
+                vt_error   = vt_enrichment.get("error")
+                vt_results = vt_enrichment.get("results", {})
+
+                if vt_status == "no_key":
+                    logger.info("VirusTotal: skipped — no API key configured")
+                elif vt_status == "rate_limit":
+                    logger.warning("VirusTotal: rate limit / quota exceeded: %s", vt_error)
+                elif vt_status == "error":
+                    logger.error("VirusTotal: enrichment error: %s", vt_error)
+                else:
+                    logger.info("VirusTotal: status=%s, urls_enriched=%d", vt_status, len(vt_results))
+
+                abuse_enrichment = await abuseipdb_provider.enrich_ip(
                     header_info["sender_ip"], abuse_key
                 )
+                abuse_status = abuse_enrichment["status"]
+                abuse_error  = abuse_enrichment.get("error")
+                abuse_data   = abuse_enrichment.get("data") or {}
+
+                if abuse_status == "no_key":
+                    logger.info("AbuseIPDB: skipped — no API key configured")
+                elif abuse_status == "rate_limit":
+                    logger.warning("AbuseIPDB: rate limit / quota exceeded: %s", abuse_error)
+                elif abuse_status == "error":
+                    logger.error("AbuseIPDB: enrichment error: %s", abuse_error)
+                else:
+                    logger.info("AbuseIPDB: status=%s", abuse_status)
 
                 url_rows = [
                     {
                         "url": u,
-                        "vt_malicious": vt_results.get(u, {}).get("malicious", 0),
-                        "vt_harmless": vt_results.get(u, {}).get("harmless", 0),
+                        "vt_malicious":  vt_results.get(u, {}).get("malicious", 0),
+                        "vt_harmless":   vt_results.get(u, {}).get("harmless", 0),
                         "vt_suspicious": vt_results.get(u, {}).get("suspicious", 0),
                         "is_suspicious_keyword": False,
-                        "is_ip_host": False,
-                        "is_shortener": False,
-                        "is_suspicious_tld": False,
-                        "is_punycode": False,
+                        "is_ip_host":            False,
+                        "is_shortener":          False,
+                        "is_suspicious_tld":     False,
+                        "is_punycode":           False,
                     }
                     for u in urls
                 ]
                 attachment_rows = [
                     {
-                        "filename": att.get("filename"),
-                        "content_type": eml.get_attachment_content_type(att),
-                        "sha256": eml.hash_attachment_content(att),
-                        "is_executable_like": False,
+                        "filename":          att.get("filename"),
+                        "content_type":      eml.get_attachment_content_type(att),
+                        "sha256":            eml.hash_attachment_content(att),
+                        "is_executable_like":  False,
                         "is_double_extension": False,
                     }
                     for att in attachments_raw
@@ -168,7 +199,8 @@ class AnalysisService:
                     header_issues=header_info["issues"],
                     urls=url_rows,
                     attachments=attachment_rows,
-                    abuse_result=abuse_result,
+                    # scoring_service still expects the flat abuse dict
+                    abuse_result=abuse_data,
                     sender_ip=header_info["sender_ip"],
                     body_text=body_text,
                     scoring_weights=scoring_weights,
@@ -197,10 +229,18 @@ class AnalysisService:
                     analysis.dmarc = header_info["auth"]["dmarc"]
                     analysis.auth_headers_raw = header_info["auth_headers"]
                     analysis.header_issues = header_info["issues"]
-                    analysis.abuse_score = abuse_result.get("abuse_score")
-                    analysis.abuse_total_reports = abuse_result.get("total_reports")
-                    analysis.abuse_country = abuse_result.get("country_code")
-                    analysis.abuse_isp = abuse_result.get("isp")
+
+                    # Per-provider enrichment status — persisted so the UI
+                    # can show exactly why enrichment data is absent.
+                    analysis.vt_enrichment_status  = vt_status
+                    analysis.vt_enrichment_error   = vt_error
+                    analysis.abuse_enrichment_status = abuse_status
+                    analysis.abuse_enrichment_error  = abuse_error
+
+                    analysis.abuse_score         = abuse_data.get("abuse_score")
+                    analysis.abuse_total_reports = abuse_data.get("total_reports")
+                    analysis.abuse_country       = abuse_data.get("country_code")
+                    analysis.abuse_isp           = abuse_data.get("isp")
                     analysis.global_hashes = global_hashes
                     # Truncate body text to prevent unbounded SQLite row growth.
                     # 200 000 chars (~200 KB) is more than enough for scoring/preview.

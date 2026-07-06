@@ -110,6 +110,10 @@ def _to_detail(a: EmailAnalysis) -> EmailDetail:
         reasons=[r.reason_text for r in a.reasons],
         urgency_keywords_found=a.urgency_keywords_found or [],
         body_preview=(a.body_text[:2000] if a.body_text else None),
+        vt_enrichment_status=a.vt_enrichment_status,
+        vt_enrichment_error=a.vt_enrichment_error,
+        abuse_enrichment_status=a.abuse_enrichment_status,
+        abuse_enrichment_error=a.abuse_enrichment_error,
     )
 
 

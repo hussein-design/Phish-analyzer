@@ -51,6 +51,18 @@ class EmailAnalysis(Base):
     is_suspicious_sender_tld: Mapped[bool] = mapped_column(Boolean, default=False)
     urgency_keywords_found: Mapped[list[str]] = mapped_column(JSON, default=list)
 
+    # Enrichment status per provider.  Possible values:
+    #   "no_key"     — API key not configured in Settings
+    #   "ok"         — enrichment ran and produced data
+    #   "no_data"    — enrichment ran but returned no hits (zero detections / no IP)
+    #   "rate_limit" — provider returned HTTP 429 / quota exhausted
+    #   "error"      — any other API or network error
+    #   None         — analysis predates this field (treat as unknown)
+    vt_enrichment_status: Mapped[str | None] = mapped_column(String(16), default=None)
+    vt_enrichment_error: Mapped[str | None] = mapped_column(Text, default=None)
+    abuse_enrichment_status: Mapped[str | None] = mapped_column(String(16), default=None)
+    abuse_enrichment_error: Mapped[str | None] = mapped_column(Text, default=None)
+
     abuse_score: Mapped[int | None] = mapped_column(Integer, default=None)
     abuse_total_reports: Mapped[int | None] = mapped_column(Integer, default=None)
     abuse_country: Mapped[str | None] = mapped_column(String(8), default=None)
