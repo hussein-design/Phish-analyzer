@@ -11,7 +11,7 @@ class ProgressOverlay(QWidget):
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet("background-color: rgba(0, 0, 0, 120);")
+        self.setStyleSheet("background-color: rgba(15, 23, 42, 0.70);")
         self.setGeometry(parent.rect())
         parent.installEventFilter(self)
 
@@ -19,12 +19,20 @@ class ProgressOverlay(QWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self._label = QLabel("")
-        self._label.setStyleSheet("color: white; font-weight: 600;")
+        self._label.setStyleSheet(
+            "color: #F1F5F9; font-size: 14px; font-weight: 600; "
+            "background: transparent; padding-bottom: 12px;"
+        )
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self._bar = QProgressBar()
         self._bar.setRange(0, 0)
-        self._bar.setFixedWidth(240)
+        self._bar.setFixedWidth(280)
+        self._bar.setFixedHeight(6)
+        self._bar.setStyleSheet(
+            "QProgressBar { background-color: #334155; border: none; border-radius: 3px; }"
+            "QProgressBar::chunk { background-color: #3B82F6; border-radius: 3px; }"
+        )
 
         layout.addWidget(self._label)
         layout.addWidget(self._bar)

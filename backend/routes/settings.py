@@ -24,6 +24,9 @@ def _to_read(record: AppSettingsRecord) -> SettingsRead:
         urgency_keywords=record.urgency_keywords,
         virustotal_key_configured=bool(record.virustotal_key),
         abuseipdb_key_configured=bool(record.abuseipdb_key),
+        shodan_key_configured=bool(getattr(record, "shodan_key", None)),
+        sandbox_provider=getattr(record, "sandbox_provider", None),
+        sandbox_key_configured=bool(getattr(record, "sandbox_api_key", None)),
     )
 
 
@@ -73,13 +76,14 @@ async def update_settings_endpoint(
     # Determine which key columns (if any) need updating.
     set_vt = False
     set_abuse = False
+    set_shodan = False
+    set_sandbox = False
 
     if payload.virustotal_key is not None:
         new_vt = payload.virustotal_key.strip() or None
         logger.info(
             "Settings PUT: updating virustotal_key, clearing=%s, setting_new=%s",
-            new_vt is None,
-            new_vt is not None,
+            new_vt is None, new_vt is not None,
         )
         record.virustotal_key = new_vt
         set_vt = True
@@ -88,15 +92,48 @@ async def update_settings_endpoint(
         new_abuse = payload.abuseipdb_key.strip() or None
         logger.info(
             "Settings PUT: updating abuseipdb_key, clearing=%s, setting_new=%s",
-            new_abuse is None,
-            new_abuse is not None,
+            new_abuse is None, new_abuse is not None,
         )
         record.abuseipdb_key = new_abuse
         set_abuse = True
 
-    # Single atomic write: saves scoring/list columns plus any key columns that
-    # were explicitly included in this request.
-    record = await repo.save_all(record, set_vt=set_vt, set_abuse=set_abuse)
+    if getattr(payload, "shodan_key", None) is not None:
+        record.shodan_key = payload.shodan_key.strip() or None
+        set_shodan = True
+        logger.info("Settings PUT: updating shodan_key")
+
+    if getattr(payload, "sandbox_provider", None) is not None:
+        provider_val = payload.sandbox_provider.strip() or None
+        # MED-03: validate against the known provider list to prevent arbitrary
+        # strings from being persisted and later interpolated into log messages
+        # or API requests.  None (empty string → clear) is always allowed.
+        _KNOWN_PROVIDERS = {"anyrun", "hybrid_analysis"}
+        if provider_val is not None and provider_val not in _KNOWN_PROVIDERS:
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Invalid sandbox_provider '{provider_val}'. "
+                    f"Must be one of: {sorted(_KNOWN_PROVIDERS)}"
+                ),
+            )
+        record.sandbox_provider = provider_val
+        set_sandbox = True
+    if getattr(payload, "sandbox_api_key", None) is not None:
+        record.sandbox_api_key = payload.sandbox_api_key.strip() or None
+        set_sandbox = True
+        logger.info("Settings PUT: updating sandbox settings, provider=%s", record.sandbox_provider)
+
+    # Single atomic write
+    from sqlalchemy.orm.attributes import flag_modified
+    if set_shodan:
+        flag_modified(record, "shodan_key")
+    if set_sandbox:
+        flag_modified(record, "sandbox_provider")
+        flag_modified(record, "sandbox_api_key")
+
+    record = await repo.save_all(record, set_vt=set_vt, set_abuse=set_abuse,
+                                  set_shodan=set_shodan, set_sandbox=set_sandbox)
     return _to_read(record)
 
 

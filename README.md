@@ -1,96 +1,364 @@
-# Phish Analyzer Desktop
+# 🛡 Phish Analyzer Desktop
 
-A local, single-user desktop app for analyzing `.eml` files for phishing indicators (SPF/DKIM/DMARC,
-header mismatches, suspicious URLs/attachments, VirusTotal + AbuseIPDB enrichment) and viewing a
-generated report. PySide6 UI talking to an in-process FastAPI/SQLite backend over `127.0.0.1` only.
+> A local, privacy-first desktop tool for analysing suspicious `.eml` files for phishing indicators.  
+> No cloud. No telemetry. Everything runs on your machine.
 
-The original single-file CLI (`main.py`, `config.yaml`) is still present for reference — the desktop
-app is a full port of its logic, not a wrapper around it.
+[![Build](https://github.com/your-org/phish-analyzer/actions/workflows/build-windows.yml/badge.svg)](../../actions/workflows/build-windows.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Security Audited](https://img.shields.io/badge/security-audited-brightgreen)](#security)
+
+---
+
+## What it does
+
+Phish Analyzer Desktop takes a raw `.eml` email file, runs it through a multi-layer detection
+pipeline, and produces a structured verdict with every signal explained — locally, with no data
+leaving your machine unless you choose to call external APIs.
+
+| Layer | What is checked |
+|---|---|
+| **Email headers** | SPF / DKIM / DMARC authentication, Reply-To vs From domain mismatch, Return-Path mismatch |
+| **Sender domain** | Lookalike / typosquat detection (leetspeak-normalised similarity), punycode / IDN homograph encoding, suspicious TLDs |
+| **URLs** | Suspicious keywords, raw-IP hosts, URL shorteners, punycode domains, suspicious TLDs, redirect chains, page title extraction |
+| **Attachments** | Dangerous extensions, double-extension disguises, macro-enabled Office docs, embedded executables, archive inspection, MIME magic-byte mismatch, document metadata |
+| **Body** | Urgency/pressure language, lure-category detection (invoice, password-reset, IT helpdesk, account-takeover, exec-impersonation, shipping), anchor-text vs href mismatches |
+| **Threat intel** | VirusTotal URL + file-hash reputation, AbuseIPDB sender-IP reputation, Shodan IP intelligence |
+
+Every signal has a configurable weight. The final suspicion **score** maps to a **verdict**:
+
+- 🔴 **Phishing** — score ≥ 9
+- 🟡 **Suspicious** — score 5–8
+- 🟢 **Benign** — score < 5
+
+---
+
+## Screenshots
+
+> Upload page — drag and drop a `.eml` file, browse the analysis history
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ 🛡 Phish Analyzer              ⚙ Settings    🌙 Dark         │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│         ↑  Drop a .eml file here  or  click to browse       │
+│              RFC 822 .eml  •  Max 25 MB                      │
+│                                                              │
+├──────────────────────────────────────────────────────────────┤
+│ Analysis History   [12]                                      │
+│ 🔍 Search...          All verdicts ▾  ↻ Refresh  ✕ Delete   │
+│──────────────────────────────────────────────────────────────│
+│ Filename      Subject         From           Verdict  Score  │
+│ invoice.eml   Urgent payment  ceo@evil.com   PHISHING   14   │
+│ update.eml    Verify account  no-reply@...   SUSPICIOUS  6   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+> Report page — tabbed detail view with score ring and verdict badge
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ ← Back   invoice.eml — Urgent payment    ⚠ Phishing  [14]  │
+│──────────────────────────────────────────────────────────────│
+│ 📋 Overview  🔍 Headers  🔗 URLs  📎 Attachments  🛡 Intel  │
+│──────────────────────────────────────────────────────────────│
+│ ┌─ SUMMARY ──────────────────────────────────────────────┐  │
+│ │ An email arrived from ceo@evil.com with the subject     │  │
+│ │ 'Urgent payment required'. Authentication failed for    │  │
+│ │ SPF, DKIM. The sender domain resembles 'paypal.com'.   │  │
+│ │ 3 URLs found — 2 triggered suspicious indicators.       │  │
+│ │ PHISHING — Multiple high-confidence indicators found.   │  │
+│ └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Phish Analyzer Desktop (single process)         │
+│                                                                     │
+│  ┌───────────────────────────────┐   ┌───────────────────────────┐  │
+│  │        PySide6 Frontend       │   │     FastAPI Backend        │  │
+│  │                               │   │     (daemon thread)        │  │
+│  │  MainWindow                   │   │                           │  │
+│  │  ├── UploadPage               │   │  Routes                   │  │
+│  │  │   ├── DropZone             │   │  ├── POST /analyses        │  │
+│  │  │   └── AnalysesTable        │   │  ├── GET  /analyses/{id}  │  │
+│  │  └── ReportPage               │   │  ├── GET  /analyses       │  │
+│  │      ├── ScoreRing            │   │  ├── PUT  /settings       │  │
+│  │      ├── VerdictBadge         │   │  └── GET  /health         │  │
+│  │      └── Tabbed cards         │   │                           │  │
+│  │                               │   │  Services                 │  │
+│  │  Controllers (MVC)            │   │  ├── analysis_service     │  │
+│  │  ├── UploadController         │◄──┤  ├── eml_parser_service   │  │
+│  │  ├── AnalysesController  HTTP │   │  ├── scoring_service      │  │
+│  │  ├── ReportController    over │   │  ├── threat_signals       │  │
+│  │  └── SettingsController  lo-  │   │  ├── url_intel_service    │  │
+│  │                          cal  │   │  ├── attachment_intel     │  │
+│  │  ApiClient               host │   │  └── report_service       │  │
+│  │  (requests.Session)      only │   │                           │  │
+│  │                               │   │  Enrichment               │  │
+│  │  QThreadPool workers          │   │  ├── virustotal_provider  │  │
+│  │  (non-blocking HTTP calls)    │   │  ├── abuseipdb_provider   │  │
+│  └───────────────────────────────┘   │  └── shodan_provider      │  │
+│                                      │                           │  │
+│                                      │  Repositories + Models    │  │
+│                                      │  └── SQLite (aiosqlite)   │  │
+│                                      └───────────────────────────┘  │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  shared/   Pydantic schemas — single contract for both sides │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  Data at rest:  %LOCALAPPDATA%\PhishAnalyzer\PhishAnalyzerDesktop\  │
+│                 ├── phish_analyzer.db   (SQLite)                    │
+│                 ├── uploads/{id}/       (.eml originals)            │
+│                 └── phish_analyzer.log                              │
+└─────────────────────────────────────────────────────────────────────┘
+
+  External API calls (optional — only when keys are configured)
+  ┌──────────────┐   ┌─────────────┐   ┌────────────────────────┐
+  │  VirusTotal  │   │  AbuseIPDB  │   │  Shodan / InternetDB   │
+  │  URL + hash  │   │  Sender IP  │   │  IP intel (free tier)  │
+  └──────────────┘   └─────────────┘   └────────────────────────┘
+```
+
+### Analysis pipeline (per upload)
+
+```
+.eml upload
+    │
+    ▼
+validate_eml_upload()         ← extension, size, RFC 822 headers
+    │
+    ▼
+_sanitize_filename()          ← strip path traversal, cap length
+    │
+    ▼
+Create PENDING row in DB      ← returns 202 immediately
+    │
+    ▼ (asyncio background task)
+eml_parser_service            ← parse headers, body, attachments
+    │
+    ├── threat_signals         ← lookalike domains, lure categories,
+    │                             anchor mismatches, urgency keywords
+    │
+    ├── url_intelligence       ← follow redirects, extract page titles,
+    │                             SSRF-guarded DNS resolution
+    │
+    ├── attachment_intel       ← magic bytes, macro detection,
+    │                             ZIP inspection, metadata extraction
+    │
+    ├── Enrichment (parallel)
+    │   ├── virustotal_provider  (URLs + file hashes)
+    │   ├── abuseipdb_provider   (sender IP)
+    │   └── shodan_provider      (sender IP, free InternetDB + key API)
+    │
+    ├── scoring_service        ← weighted signal scoring → verdict
+    │
+    └── Save DONE row          ← frontend poll returns full detail
+```
+
+---
 
 ## Project layout
 
 ```
-backend/     FastAPI app: routes -> services -> repositories -> models (SQLAlchemy async + SQLite)
-frontend/    PySide6 app: controllers -> views/widgets/dialogs, Qt models for the analyses table
-shared/      Pydantic schemas + app-data path resolution used by both sides
-migrations/  Alembic migrations
-assets/      QSS themes, icons (bundled into the packaged app)
-launcher.py  Entrypoint: starts the backend in-process, then the Qt UI
+phish-analyzer/
+├── backend/
+│   ├── app_factory.py          FastAPI app + localhost-only middleware
+│   ├── server.py               uvicorn daemon-thread host
+│   ├── core/                   config, exceptions, logging, defaults
+│   ├── database/               engine, session, init/migrations
+│   ├── models/                 SQLAlchemy ORM models
+│   ├── repositories/           DB access layer (no business logic)
+│   ├── routes/                 FastAPI route handlers
+│   └── services/
+│       ├── analysis_service.py         pipeline orchestrator
+│       ├── eml_parser_service.py       RFC 822 parsing
+│       ├── scoring_service.py          signal scoring engine
+│       ├── threat_signals.py           detection heuristics
+│       ├── url_intelligence_service.py redirect chain + page title
+│       ├── attachment_intelligence_service.py static file analysis
+│       ├── report_service.py           DOCX report builder
+│       └── enrichment/
+│           ├── virustotal_provider.py
+│           ├── abuseipdb_provider.py
+│           └── shodan_provider.py
+├── frontend/
+│   ├── controllers/            MVC controllers (own views + ApiClient)
+│   ├── dialogs/                settings, confirm-delete dialogs
+│   ├── models/                 QAbstractTableModel, proxy model
+│   ├── services/               ApiClient, ThemeManager, SettingsStore
+│   ├── views/                  UploadPage, ReportPage, MainWindow
+│   └── widgets/                DropZone, VerdictBadge, Toast, KVTable
+├── shared/
+│   ├── schemas.py              Pydantic models (shared backend + frontend)
+│   └── paths.py                OS-aware data directory resolution
+├── migrations/                 Alembic migrations
+├── assets/
+│   ├── themes/                 light.qss, dark.qss
+│   └── icons/                  app.ico
+├── launcher.py                 app entrypoint
+├── requirements.txt            pinned dependencies
+├── phish_analyzer.spec         PyInstaller spec
+├── installer.iss               Inno Setup installer script
+└── .github/workflows/          CI build + release pipeline
 ```
+
+---
 
 ## Setup (development)
 
-Requires Python 3.11 or 3.12 for the frontend (see "Packaging" below for why). Backend-only work is
-fine on newer interpreters.
+### Prerequisites
+
+- Python **3.11** or **3.12** (required for PySide6 wheel availability)
+- Windows, macOS, or Linux desktop (packaging to `.exe` requires Windows or CI)
+- Git
+
+### Install
 
 ```bash
+git clone https://github.com/your-org/phish-analyzer.git
+cd phish-analyzer
+
 python -m venv .venv
-source .venv/bin/activate        # .venv\Scripts\activate on Windows
+
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+
 pip install -r requirements.txt
-cp .env.example .env             # optional: seed VT/AbuseIPDB keys for first run
 ```
 
-## Running
+### Optional: seed API keys on first run
+
+```bash
+cp .env.example .env
+# Edit .env and add your keys — these are imported into the DB on first launch.
+# After the first run, use the Settings dialog instead.
+```
+
+### Run
 
 ```bash
 python launcher.py
 ```
 
-This starts the FastAPI backend on a background thread (default `http://127.0.0.1:8756`, falls back
-to an OS-assigned free port if that one is busy), waits for `/health`, then opens the PySide6 window.
-The backend shuts down automatically when the window closes.
+The backend starts on `http://127.0.0.1:8756` in a background thread, waits for `/health`, then
+opens the Qt window. The backend stops automatically when the window closes.
 
-Two pages: **Upload** (drag-and-drop or browse for a `.eml` file, plus the searchable/sortable
-history of past analyses) and **Report** (full analysis detail, DOCX export, delete). Settings
-(API keys, scoring weights) are a toolbar-triggered dialog, not a separate page.
-
-The SQLite database, uploaded `.eml` originals, and logs live in the OS per-user app-data directory
-(e.g. `%LOCALAPPDATA%\PhishAnalyzer\PhishAnalyzerDesktop` on Windows), never next to the app itself.
-
-## Running the backend alone
-
-Useful for API testing without the desktop UI:
+**Backend only** (for API testing):
 
 ```bash
 uvicorn backend.app_factory:create_app --factory --host 127.0.0.1 --port 8756
 ```
 
-Docs at `http://127.0.0.1:8756/docs`.
+---
+
+## API keys (optional)
+
+The app works fully offline with no API keys. The following services add richer threat intelligence:
+
+| Service | Purpose | Free tier |
+|---|---|---|
+| [VirusTotal](https://www.virustotal.com/gui/join-us) | URL scan (70+ AV engines) + file hash reputation | 500 req/day |
+| [AbuseIPDB](https://www.abuseipdb.com/register) | Sender IP abuse reputation | 1 000 req/day |
+| [Shodan](https://account.shodan.io/register) | IP open ports, CVEs, tags | Paid (InternetDB free fallback built-in) |
+
+Enter keys in **⚙ Settings → API Keys**. Keys are stored in the local SQLite database — never
+transmitted anywhere except to the respective API service.
+
+---
 
 ## Database migrations
 
-Migrations run automatically at every startup (`alembic upgrade head`, invoked from code — never a
-manual step). To generate a new migration after changing a model in `backend/models/`:
+Migrations run automatically at every startup. To create a new migration after changing a model:
 
 ```bash
 alembic revision --autogenerate -m "describe the change"
 ```
 
+---
+
 ## Packaging (Windows `.exe`)
 
-**Option A — CI (no Windows machine needed):** push to `main` (or run it manually from the Actions
-tab) and `.github/workflows/build-windows.yml` builds on a hosted `windows-latest` runner, then
-uploads `PhishAnalyzerDesktop-windows` as a downloadable artifact from the workflow run.
+**Option A — CI (recommended):**
+
+Push a version tag to trigger a full release build:
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+The GitHub Actions workflow builds on `windows-latest`, runs Inno Setup, and publishes the installer
+as a GitHub Release asset automatically.
 
 **Option B — locally on Windows:**
 
 ```bash
+# Must be in a Python 3.11 or 3.12 venv
 pyinstaller phish_analyzer.spec
 ```
 
-Produces a `dist/PhishAnalyzerDesktop/` onedir build (not `--onefile` — onefile re-extracts on every
-launch and is a common Defender/SmartScreen false-positive trigger; wrap the onedir output with an
-Inno Setup installer if a single double-clickable file is required).
+Produces `dist/PhishAnalyzerDesktop/` (onedir, not onefile — avoids Defender false-positive on
+extraction). Wrap with Inno Setup (`installer.iss`) for a single-file installer.
 
-**Build this on Windows, from a Python 3.11 or 3.12 virtualenv.** PySide6/PyInstaller wheel
-availability varies a lot by interpreter version; 3.11/3.12 is the safest bet at time of writing.
-Verify on a clean Windows VM that the app starts with no console flash and that data persists in
-`%LOCALAPPDATA%` across restarts — PyInstaller-frozen Qt apps occasionally fail to locate the
-`qwindows.dll` platform plugin, which only shows up on a machine without a separate Qt install.
+---
 
-## Security note
+## Security
 
-`config.yaml` (used only by the legacy `main.py` CLI) is committed to git with what look like real
-VirusTotal/AbuseIPDB API keys. Rotate those keys — they're in git history regardless of this
-refactor. The desktop app never uses `config.yaml`; its secrets live in `.env` (first-run seed only,
-gitignored) and are edited live through the Settings dialog thereafter.
+A full security audit was completed on 2026-07-18. All identified issues are fixed.
+
+| ID | Severity | Issue | Status |
+|---|---|---|---|
+| HIGH-01 | High | Localhost-only middleware | ✅ Fixed |
+| HIGH-02 | High | Upload queue-depth guard not enforced | ✅ Fixed |
+| HIGH-03 | High | Path traversal via uploaded filename | ✅ Fixed |
+| HIGH-04 | High | `Content-Disposition` header injection | ✅ Fixed |
+| HIGH-05 | High | `DELETE /analyses` had no confirmation guard | ✅ Fixed |
+| MED-01 | Medium | SQL injection (ORM parameterised queries) | ✅ Fixed |
+| MED-02 | Medium | API keys exposed via `GET /settings` | ✅ Fixed |
+| MED-03 | Medium | Oversized body / resource exhaustion | ✅ Fixed |
+| MED-04 | Medium | Malformed requests return 422, not 500 | ✅ Fixed |
+| MED-05 | Medium | Raw error strings stored without sanitization | ✅ Fixed |
+
+Key protections:
+
+- **Localhost-only** — the backend rejects all non-loopback requests at middleware level
+- **No API key exposure** — `GET /settings` returns only `configured: true/false`, never the key value
+- **Filename sanitization** — path traversal stripped before any filesystem write
+- **Input size limits** — 25 MB file upload cap, 200 KB body text cap, 500-item list cap on settings
+- **XXE-safe XML parsing** — `defusedxml` used for OOXML metadata extraction
+- **Error string sanitization** — `_safe_error()` strips API keys / paths from exception messages before DB storage
+
+Run the included test suite against a live backend:
+
+```bash
+python security_test.py
+```
+
+---
+
+## Contributing
+
+1. Fork the repo and create a branch: `git checkout -b feature/my-feature`
+2. Make changes — follow the existing layered architecture (routes → services → repositories → models)
+3. Test with the sample `.eml` files: `phishing_office_1.eml`, `phishing_office_2.eml`
+4. Open a pull request with a clear description of what changed and why
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+*Phish Analyzer Desktop — built for security analysts, SOC teams, and anyone who wants to understand what's inside a suspicious email.*

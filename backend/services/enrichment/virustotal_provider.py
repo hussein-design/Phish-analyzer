@@ -120,3 +120,77 @@ async def enrich_urls(urls: list[str], api_key: str | None) -> dict:
         "error": None,
         "results": results,
     }
+
+
+
+async def _lookup_hash_async(client: vt.Client, sha256: str) -> tuple[str, dict]:
+    """Look up a single file hash in VirusTotal."""
+    async with _RATE_LIMIT:
+        try:
+            file_obj = await client.get_object_async("/files/{}", sha256)
+            stats = file_obj.last_analysis_stats or {}
+        except vt.error.APIError as exc:
+            code = getattr(exc, "code", "") or ""
+            if "NotFoundError" in str(type(exc)) or code == "NotFoundError":
+                stats = {}
+            else:
+                raise
+    return sha256, {
+        "malicious":  int(stats.get("malicious", 0)),
+        "suspicious": int(stats.get("suspicious", 0)),
+        "harmless":   int(stats.get("harmless", 0)),
+    }
+
+
+async def enrich_hashes(sha256_list: list[str], api_key: str | None) -> dict:
+    """Return VirusTotal reputation for a list of SHA-256 file hashes.
+
+    Return value shape::
+
+        {
+            "status":  "no_key" | "ok" | "no_data" | "rate_limit" | "error",
+            "error":   str | None,
+            "results": {sha256: {"malicious": int, "suspicious": int, "harmless": int}},
+        }
+    """
+    if not api_key:
+        return {"status": "no_key", "error": None, "results": {}}
+
+    # Filter out None / empty hashes
+    hashes = [h for h in sha256_list if h and len(h) == 64]
+    if not hashes:
+        return {"status": "no_data", "error": None, "results": {}}
+
+    try:
+        async with vt.Client(api_key) as client:
+            pairs = await asyncio.gather(
+                *(_lookup_hash_async(client, h) for h in hashes),
+                return_exceptions=True,
+            )
+    except vt.error.APIError as exc:
+        if _is_quota_error(exc):
+            return {"status": "rate_limit", "error": str(exc), "results": {}}
+        return {"status": "error", "error": str(exc), "results": {}}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc), "results": {}}
+
+    results: dict[str, dict] = {}
+    last_error: str | None = None
+
+    for pair in pairs:
+        if isinstance(pair, Exception):
+            if _is_quota_error(pair):
+                return {"status": "rate_limit", "error": str(pair), "results": results}
+            last_error = str(pair)
+            continue
+        sha256, stats = pair
+        results[sha256] = stats
+
+    if not results and last_error:
+        return {"status": "error", "error": last_error, "results": {}}
+
+    return {
+        "status": "ok" if results else "no_data",
+        "error": None,
+        "results": results,
+    }

@@ -15,6 +15,7 @@ COLUMNS = ["Filename", "Subject", "From", "Status", "Verdict", "Score", "Uploade
 
 class AnalysesTableModel(QAbstractTableModel):
     moreDataRequested = Signal()
+    totalCountChanged = Signal(int)   # emitted whenever the server-side total changes
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -72,6 +73,7 @@ class AnalysesTableModel(QAbstractTableModel):
         self._total = total
         self._has_more = len(self._rows) < total
         self.endResetModel()
+        self.totalCountChanged.emit(total)
 
     def append_page(self, items: list[EmailSummary], total: int) -> None:
         self._fetching = False
@@ -84,6 +86,7 @@ class AnalysesTableModel(QAbstractTableModel):
         self._total = total
         self.endInsertRows()
         self._has_more = len(self._rows) < total
+        self.totalCountChanged.emit(total)
 
     def upsert_row(self, item: EmailSummary) -> None:
         for i, row in enumerate(self._rows):
@@ -97,6 +100,7 @@ class AnalysesTableModel(QAbstractTableModel):
         self._rows.insert(0, item)
         self._total += 1
         self.endInsertRows()
+        self.totalCountChanged.emit(self._total)
 
     def remove_row_by_id(self, analysis_id: int) -> None:
         for i, row in enumerate(self._rows):
@@ -105,6 +109,7 @@ class AnalysesTableModel(QAbstractTableModel):
                 del self._rows[i]
                 self._total = max(0, self._total - 1)
                 self.endRemoveRows()
+                self.totalCountChanged.emit(self._total)
                 return
 
     def set_fetching(self, value: bool) -> None:

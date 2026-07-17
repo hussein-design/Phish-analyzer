@@ -1,19 +1,20 @@
-"""Generates a professional DOCX analysis report on demand from a persisted
-EmailAnalysis row.  The report is always built fresh from the DB so it
-reflects any template changes without re-running the analysis.
+"""Generates a professional DOCX analysis report from a persisted
+EmailAnalysis row.  Always built fresh from the DB so template changes
+take effect without re-running the analysis.
 
-Layout
-------
-  Cover / Summary
-  1. Email Metadata
-  2. Sender & Header Analysis
-  3. Email Authentication (SPF / DKIM / DMARC)
-  4. URL Indicators
-  5. Attachment Indicators
-  6. Threat Intelligence Enrichment
-  7. Scoring & Verdict Reasoning
-  8. Body Preview
-  Appendix – Raw Authentication Headers
+Document structure
+------------------
+  Cover page  (title, classification banner, executive summary)
+  Section 1   Email Metadata
+  Section 2   Sender & Header Analysis
+  Section 3   Email Authentication (SPF / DKIM / DMARC)
+  Section 4   URL Indicators
+  Section 5   Attachment Indicators
+  Section 6   Threat Intelligence (VirusTotal + AbuseIPDB + Shodan)
+  Section 7   Social Engineering Signals
+  Section 8   Scoring & Verdict
+  Section 9   Body Preview
+  Appendix    Raw Authentication Headers
 """
 
 from __future__ import annotations
@@ -29,33 +30,34 @@ from docx.shared import Inches, Pt, RGBColor
 
 from backend.models.analysis import EmailAnalysis
 
-# ── Colour palette ────────────────────────────────────────────────────────────
+# ── Palette ───────────────────────────────────────────────────────────────────
 _RED    = RGBColor(0xC0, 0x00, 0x00)
-_AMBER  = RGBColor(0xFF, 0x8C, 0x00)
-_GREEN  = RGBColor(0x37, 0x86, 0x44)
+_AMBER  = RGBColor(0xC9, 0x6A, 0x00)
+_GREEN  = RGBColor(0x1A, 0x7A, 0x3C)
 _NAVY   = RGBColor(0x1F, 0x39, 0x64)
-_GREY   = RGBColor(0x59, 0x56, 0x59)
+_SLATE  = RGBColor(0x44, 0x54, 0x6C)
+_GREY   = RGBColor(0x70, 0x70, 0x70)
 _WHITE  = RGBColor(0xFF, 0xFF, 0xFF)
+_LIGHT  = RGBColor(0xF5, 0xF7, 0xFA)  # zebra row fill (used as hex below)
+
+_HEX_NAVY  = "1F3964"
+_HEX_RED   = "C00000"
+_HEX_AMBER = "FFF3CD"
+_HEX_GREEN = "E6F4EA"
+_HEX_ZEBRA = "F5F7FA"
+_HEX_HEADER_LIGHT = "E8EDF5"
 
 _VERDICT_COLOUR = {
     "phishing":   _RED,
     "suspicious": _AMBER,
     "benign":     _GREEN,
 }
-
 _VERDICT_LABEL = {
-    "phishing":   "PHISHING  ⚠  High risk — treat with extreme caution",
-    "suspicious": "SUSPICIOUS  ·  Requires manual review",
-    "benign":     "LIKELY BENIGN  ·  No significant indicators detected",
-    None:         "UNKNOWN  ·  Analysis incomplete",
+    "phishing":   "PHISHING — HIGH RISK",
+    "suspicious": "SUSPICIOUS — REQUIRES REVIEW",
+    "benign":     "LIKELY BENIGN",
+    None:         "UNKNOWN",
 }
-
-# All known SPF/DKIM/DMARC result values with appropriate colours.
-# "permerror" = permanent error in policy (misconfiguration) → amber
-# "temperror" = transient DNS error during check → amber
-# "none"      = no record published                          → grey
-# "neutral"   = policy explicitly neither pass nor fail      → grey
-# "policy"    = DMARC disposition applied                    → amber
 _AUTH_COLOUR = {
     "pass":      _GREEN,
     "fail":      _RED,
@@ -67,22 +69,19 @@ _AUTH_COLOUR = {
     "none":      _GREY,
     "unknown":   _GREY,
 }
-
-# Human-readable explanation for each auth result shown in the report.
 _AUTH_EXPLANATION = {
-    "pass":      "{proto} passed — the sending server is authorised and the message is authentic.",
-    "fail":      "{proto} failed — the message does not originate from an authorised source. This is a strong phishing indicator.",
-    "softfail":  "{proto} soft-fail — the sending server is not listed as authorised, but the domain owner has not requested rejection. Treat with caution.",
-    "permerror": "{proto} permanent error — there is a misconfiguration in the domain's {proto} policy record that prevented evaluation.",
-    "temperror": "{proto} temporary error — a transient DNS lookup failure prevented evaluation. This may resolve on retry.",
-    "policy":    "{proto} policy — the message was handled according to the domain's published policy.",
-    "neutral":   "{proto} neutral — the domain's policy makes no assertion about this result.",
-    "none":      "{proto} none — no {proto} record is published for this domain.",
-    "unknown":   "{proto} result could not be determined from the available headers.",
+    "pass":      "Passed — the sending server is authorised and the message is authentic.",
+    "fail":      "Failed — the message does not originate from an authorised source. Strong phishing indicator.",
+    "softfail":  "Soft-fail — the server is not listed as authorised, but the domain has not requested rejection.",
+    "permerror": "Permanent error — misconfiguration in the domain policy record prevented evaluation.",
+    "temperror": "Temporary error — transient DNS failure prevented evaluation.",
+    "neutral":   "Neutral — the policy makes no assertion about this result.",
+    "none":      "None — no record is published for this domain.",
+    "unknown":   "Result could not be determined from available headers.",
 }
 
 
-# ── Low-level helpers ─────────────────────────────────────────────────────────
+# ── XML / cell helpers ────────────────────────────────────────────────────────
 
 def _set_cell_bg(cell, hex_colour: str) -> None:
     tc = cell._tc
@@ -94,76 +93,726 @@ def _set_cell_bg(cell, hex_colour: str) -> None:
     tcPr.append(shd)
 
 
-def _bold_run(para, text: str, colour: RGBColor | None = None) -> None:
-    run = para.add_run(text)
-    run.bold = True
+def _set_col_width(table, col_idx: int, width_inches: float) -> None:
+    for row in table.rows:
+        row.cells[col_idx].width = int(width_inches * 914400)
+
+
+def _add_page_break(doc: Document) -> None:
+    doc.add_page_break()
+
+
+# ── Run helpers ───────────────────────────────────────────────────────────────
+
+def _run(para, text: str, bold=False, italic=False,
+         colour: RGBColor | None = None, size_pt: float | None = None) -> None:
+    r = para.add_run(text)
+    r.bold = bold
+    r.italic = italic
     if colour:
-        run.font.color.rgb = colour
+        r.font.color.rgb = colour
+    if size_pt:
+        r.font.size = Pt(size_pt)
 
 
-def _coloured_run(para, text: str, colour: RGBColor) -> None:
-    run = para.add_run(text)
-    run.font.color.rgb = colour
+# ── Section heading ───────────────────────────────────────────────────────────
 
-
-def _note_para(doc: Document, text: str) -> None:
-    """Add a small grey italicised note — used only when genuinely informative."""
-    p = doc.add_paragraph()
-    run = p.add_run(text)
-    run.italic = True
-    run.font.size = Pt(9)
-    run.font.color.rgb = _GREY
-
-
-def _section_heading(doc: Document, title: str, level: int = 1) -> None:
-    h = doc.add_heading(title, level=level)
+def _heading(doc: Document, text: str, level: int = 1) -> None:
+    h = doc.add_heading(text, level=level)
+    h.paragraph_format.space_before = Pt(12)
+    h.paragraph_format.space_after  = Pt(4)
     for run in h.runs:
         run.font.color.rgb = _NAVY
+        run.font.name = "Calibri"
 
 
-def _two_col_table(doc: Document, rows: list[tuple[str, str | None]]) -> None:
-    """Render a label/value table. Missing values show as 'N/A'."""
+# ── Key-value table ───────────────────────────────────────────────────────────
+
+def _kv_table(doc: Document, rows: list[tuple[str, str | None]],
+              label_width: float = 1.8, value_width: float = 4.5) -> None:
+    """Two-column label/value table with a navy header row and zebra fill."""
     tbl = doc.add_table(rows=0, cols=2)
     tbl.style = "Table Grid"
-    tbl.autofit = True
 
+    # Header
     hdr = tbl.add_row()
     for i, txt in enumerate(("Field", "Value")):
         hdr.cells[i].text = txt
-        hdr.cells[i].paragraphs[0].runs[0].bold = True
-        hdr.cells[i].paragraphs[0].runs[0].font.color.rgb = _WHITE
-        _set_cell_bg(hdr.cells[i], "1F3964")
+        r = hdr.cells[i].paragraphs[0].runs[0]
+        r.bold = True
+        r.font.color.rgb = _WHITE
+        r.font.size = Pt(10)
+        _set_cell_bg(hdr.cells[i], _HEX_NAVY)
 
-    for label, value in rows:
+    for idx, (label, value) in enumerate(rows):
         row = tbl.add_row()
         row.cells[0].text = label
         row.cells[0].paragraphs[0].runs[0].bold = True
+        row.cells[0].paragraphs[0].runs[0].font.size = Pt(10)
         if value:
-            row.cells[1].text = str(value)
+            p = row.cells[1].paragraphs[0]
+            r = p.add_run(str(value))
+            r.font.size = Pt(10)
         else:
             p = row.cells[1].paragraphs[0]
-            run = p.add_run("N/A")
-            run.font.color.rgb = _GREY
-            run.italic = True
+            r = p.add_run("N/A")
+            r.italic = True
+            r.font.color.rgb = _GREY
+            r.font.size = Pt(10)
+        if idx % 2 == 0:
+            _set_cell_bg(row.cells[0], _HEX_ZEBRA)
+            _set_cell_bg(row.cells[1], _HEX_ZEBRA)
+
+    _set_col_width(tbl, 0, label_width)
+    _set_col_width(tbl, 1, value_width)
+    doc.add_paragraph()
+
+
+# ── Generic data table ────────────────────────────────────────────────────────
+
+def _data_table(doc: Document, headers: list[str],
+                widths: list[float] | None = None) -> object:
+    """Create a table with a navy header row; return it for callers to add rows."""
+    tbl = doc.add_table(rows=0, cols=len(headers))
+    tbl.style = "Table Grid"
+    hdr = tbl.add_row()
+    for i, txt in enumerate(headers):
+        hdr.cells[i].text = txt
+        r = hdr.cells[i].paragraphs[0].runs[0]
+        r.bold = True
+        r.font.color.rgb = _WHITE
+        r.font.size = Pt(9.5)
+        _set_cell_bg(hdr.cells[i], _HEX_NAVY)
+    if widths:
+        for i, w in enumerate(widths):
+            _set_col_width(tbl, i, w)
+    return tbl
+
+
+def _tbl_add_row(tbl, values: list[str], zebra: bool = False,
+                 highlight_col: int | None = None, highlight_hex: str = _HEX_AMBER) -> None:
+    row = tbl.add_row()
+    for i, val in enumerate(values):
+        p = row.cells[i].paragraphs[0]
+        r = p.add_run(str(val) if val else "—")
+        r.font.size = Pt(9.5)
+        if zebra:
+            _set_cell_bg(row.cells[i], _HEX_ZEBRA)
+    if highlight_col is not None:
+        _set_cell_bg(row.cells[highlight_col], highlight_hex)
+
+
+# ── Note / info paragraph ────────────────────────────────────────────────────
+
+def _note(doc: Document, text: str, colour: RGBColor = _GREY) -> None:
+    p = doc.add_paragraph()
+    r = p.add_run(text)
+    r.italic = True
+    r.font.size = Pt(9)
+    r.font.color.rgb = colour
+
+
+def _bullet(doc: Document, text: str, colour: RGBColor | None = None) -> None:
+    p = doc.add_paragraph(style="List Bullet")
+    r = p.add_run(text)
+    r.font.size = Pt(10)
+    if colour:
+        r.font.color.rgb = colour
+
+
+# ── Cover page ────────────────────────────────────────────────────────────────
+
+def _cover(doc: Document, analysis: EmailAnalysis) -> None:
+    """Render the cover page: title, classification banner, executive summary."""
+    doc.add_paragraph()
+    doc.add_paragraph()
+
+    # Title
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _run(title, "PHISHING EMAIL ANALYSIS REPORT",
+         bold=True, colour=_NAVY, size_pt=22)
+
+    doc.add_paragraph()
+
+    # Verdict banner box
+    verdict_key = analysis.verdict
+    banner_colour = _VERDICT_COLOUR.get(verdict_key, _GREY)
+    banner_label  = _VERDICT_LABEL.get(verdict_key, "UNKNOWN")
+
+    banner = doc.add_paragraph()
+    banner.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    banner.paragraph_format.space_before = Pt(6)
+    banner.paragraph_format.space_after  = Pt(6)
+    _run(banner, f"  {banner_label}  ", bold=True, colour=banner_colour, size_pt=16)
+
+    # Score line
+    score_p = doc.add_paragraph()
+    score_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _run(score_p, "Suspicion Score: ", bold=True, size_pt=12)
+    _run(score_p, str(analysis.score if analysis.score is not None else "N/A"),
+         bold=True, colour=banner_colour, size_pt=12)
+
+    doc.add_paragraph()
+
+    # Meta line
+    created = (
+        analysis.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if analysis.created_at else "N/A"
+    )
+    meta_p = doc.add_paragraph()
+    meta_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _run(meta_p, f"File: {analysis.filename}    |    Analysed: {created}",
+         colour=_SLATE, size_pt=10)
+
+    doc.add_paragraph()
+    doc.add_paragraph()
+
+    # Executive summary
+    _heading(doc, "Executive Summary", level=2)
+
+    summary_text = _build_summary(analysis)
+    p = doc.add_paragraph()
+    p.paragraph_format.left_indent  = Inches(0.3)
+    p.paragraph_format.right_indent = Inches(0.3)
+    r = p.add_run(summary_text)
+    r.font.size = Pt(10.5)
+
+    _add_page_break(doc)
+
+
+def _build_summary(analysis: EmailAnalysis) -> str:
+    """Plain-English executive summary — one paragraph per key finding."""
+    parts: list[str] = []
+
+    sender  = analysis.from_addr or "an unknown sender"
+    subject = analysis.subject   or "(no subject)"
+    verdict = analysis.verdict   or "unknown"
+    score   = analysis.score if analysis.score is not None else 0
+
+    parts.append(
+        f"This report covers the automated analysis of an email received from "
+        f"{sender} with the subject '{subject}'. "
+        f"The analysis produced a suspicion score of {score} and a verdict of "
+        f"{verdict.upper()}."
+    )
+
+    # Auth
+    auth_fail = [p for p, v in [("SPF", analysis.spf), ("DKIM", analysis.dkim),
+                                 ("DMARC", analysis.dmarc)] if v in ("fail", "softfail")]
+    if auth_fail:
+        parts.append(
+            f"Email authentication failed for {', '.join(auth_fail)}, indicating the "
+            "message may not have genuinely originated from the claimed sending domain."
+        )
+
+    # Domain flags
+    domain_flags = []
+    if analysis.is_lookalike_domain:
+        domain_flags.append(f"resembles the legitimate domain '{analysis.lookalike_of}'")
+    if analysis.is_punycode_domain:
+        domain_flags.append("uses punycode / IDN homograph encoding")
+    if analysis.is_suspicious_sender_tld:
+        domain_flags.append("uses a TLD commonly associated with phishing")
+    if domain_flags:
+        parts.append(
+            f"The sender domain '{analysis.from_domain}' raised concerns: "
+            + "; ".join(domain_flags) + "."
+        )
+
+    # URLs
+    url_count = len(analysis.urls)
+    if url_count:
+        bad_urls = [u for u in analysis.urls if u.is_suspicious_keyword or u.is_ip_host
+                    or u.is_shortener or (u.vt_malicious or 0) > 0
+                    or getattr(u, "is_redirect_suspicious", False)]
+        parts.append(
+            f"The email contained {url_count} URL(s). "
+            + (f"{len(bad_urls)} triggered suspicious indicators."
+               if bad_urls else "None triggered suspicious URL indicators.")
+        )
+
+    # Attachments
+    att_count = len(analysis.attachments)
+    if att_count:
+        bad_att = [a for a in analysis.attachments
+                   if a.is_executable_like or a.is_double_extension
+                   or getattr(a, "is_macro_enabled", False)
+                   or getattr(a, "has_embedded_executable", False)
+                   or (getattr(a, "vt_hash_malicious", 0) or 0) > 0]
+        parts.append(
+            f"There were {att_count} attachment(s). "
+            + (f"{len(bad_att)} raised static-analysis flags."
+               if bad_att else "None raised static-analysis flags.")
+        )
+    else:
+        parts.append("No attachments were present in this email.")
+
+    # Verdict sentence
+    verdict_sentences = {
+        "phishing":
+            "Multiple high-confidence phishing indicators were detected. "
+            "This email should be treated as malicious and reported to your security team.",
+        "suspicious":
+            "Some indicators were concerning but not conclusive. "
+            "Exercise caution and do not click links or open attachments without verification.",
+        "benign":
+            "No significant threat indicators were found. "
+            "Standard vigilance is still advised.",
+    }
+    parts.append(verdict_sentences.get(verdict, ""))
+
+    return "\n\n".join(p for p in parts if p)
+
+
+
+# ── Section builders ──────────────────────────────────────────────────────────
+
+def _section_metadata(doc: Document, analysis: EmailAnalysis) -> None:
+    _heading(doc, "1.  Email Metadata")
+    created = (
+        analysis.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if analysis.created_at else None
+    )
+    _kv_table(doc, [
+        ("Filename",    analysis.filename),
+        ("Subject",     analysis.subject or "(no subject)"),
+        ("From",        analysis.from_addr),
+        ("Message-ID",  analysis.message_id),
+        ("Analysed at", created),
+    ])
+
+
+def _section_headers(doc: Document, analysis: EmailAnalysis) -> None:
+    _heading(doc, "2.  Sender & Header Analysis")
+
+    rows = [
+        ("From domain",        analysis.from_domain),
+        ("Reply-To domain",    analysis.reply_domain),
+        ("Return-Path domain", analysis.return_domain),
+        ("Sender IP",          analysis.sender_ip),
+        ("Reply-To address",   analysis.reply_to),
+        ("Return-Path",        analysis.return_path),
+    ]
+    if analysis.is_lookalike_domain:
+        rows.append(("⚠  Lookalike domain",
+                     f"'{analysis.from_domain}' closely resembles '{analysis.lookalike_of}'"))
+    if analysis.is_punycode_domain:
+        rows.append(("⚠  Punycode domain",
+                     f"'{analysis.from_domain}' uses international encoding"))
+    if analysis.is_suspicious_sender_tld:
+        rows.append(("⚠  Suspicious TLD",
+                     f"TLD of '{analysis.from_domain}' is commonly abused in phishing"))
+    _kv_table(doc, rows)
+
+    if analysis.header_issues:
+        p = doc.add_paragraph()
+        _run(p, "Header anomalies detected:", bold=True, size_pt=10)
+        for issue in analysis.header_issues:
+            _bullet(doc, issue, colour=_RED)
+        doc.add_paragraph()
+    else:
+        _note(doc, "No header anomalies detected.", colour=_GREEN)
+        doc.add_paragraph()
+
+
+def _section_auth(doc: Document, analysis: EmailAnalysis) -> None:
+    _heading(doc, "3.  Email Authentication  (SPF / DKIM / DMARC)")
+
+    tbl = _data_table(doc,
+                      ["Protocol", "Result", "Explanation"],
+                      widths=[1.0, 1.0, 4.6])
+    for proto, value in [("SPF", analysis.spf), ("DKIM", analysis.dkim),
+                          ("DMARC", analysis.dmarc)]:
+        val = (value or "unknown").lower()
+        colour_hex = {
+            "pass": "E6F4EA", "fail": "FFE0E0", "softfail": _HEX_AMBER,
+        }.get(val, _HEX_ZEBRA)
+        explanation = _AUTH_EXPLANATION.get(val, "Unknown result.")
+        row = tbl.add_row()
+        row.cells[0].paragraphs[0].add_run(proto).bold = True
+        row.cells[0].paragraphs[0].runs[0].font.size = Pt(10)
+        _run(row.cells[1].paragraphs[0], val.upper(),
+             bold=True, colour=_AUTH_COLOUR.get(val, _GREY), size_pt=10)
+        _run(row.cells[2].paragraphs[0], explanation, size_pt=9.5)
+        for c in row.cells:
+            _set_cell_bg(c, colour_hex)
 
     doc.add_paragraph()
 
 
-def _auth_badge_para(doc: Document, label: str, verdict: str) -> None:
-    """Render  LABEL: VERDICT  with colour, then a plain-English explanation."""
-    p = doc.add_paragraph()
-    p.paragraph_format.left_indent = Inches(0.2)
-    _bold_run(p, f"{label}: ")
-    colour = _AUTH_COLOUR.get(verdict.lower(), _GREY)
-    _coloured_run(p, verdict.upper(), colour)
+def _section_urls(doc: Document, analysis: EmailAnalysis) -> None:
+    _heading(doc, "4.  URL Indicators")
 
-    # Add explanation on the same paragraph after the verdict badge.
-    explanation_template = _AUTH_EXPLANATION.get(verdict.lower(), "")
-    if explanation_template:
-        explanation = explanation_template.replace("{proto}", label)
-        run = p.add_run(f"  —  {explanation}")
-        run.font.size = Pt(9.5)
-        run.font.color.rgb = _GREY
+    if not analysis.urls:
+        doc.add_paragraph("No URLs were extracted from this email.")
+        doc.add_paragraph()
+        return
+
+    vt_ran = analysis.vt_enrichment_status in ("ok", "no_data")
+
+    tbl = _data_table(doc,
+                      ["URL", "Final / Expanded URL", "Redirects", "VT Result", "Flags"],
+                      widths=[2.2, 2.2, 0.7, 0.8, 1.5])
+
+    for idx, u in enumerate(analysis.urls):
+        flags = []
+        if u.is_suspicious_keyword:                         flags.append("suspicious keyword")
+        if u.is_ip_host:                                    flags.append("raw IP host")
+        if u.is_shortener:                                  flags.append("shortener")
+        if u.is_suspicious_tld:                             flags.append("suspicious TLD")
+        if u.is_punycode:                                   flags.append("punycode")
+        if getattr(u, "is_redirect_suspicious", False):     flags.append("⚠ redirect")
+
+        vt_mal = u.vt_malicious or 0
+        vt_sus = u.vt_suspicious or 0
+        if vt_mal > 0:
+            vt_str = f"Malicious ({vt_mal})"
+        elif vt_sus > 0:
+            vt_str = f"Suspicious ({vt_sus})"
+        elif vt_ran:
+            vt_str = "Clean"
+        else:
+            vt_str = "—"
+
+        expanded = getattr(u, "expanded_url", None) or ""
+        redirects = str(getattr(u, "redirect_count", 0) or 0)
+        flag_str = ", ".join(flags) if flags else "—"
+        zebra = idx % 2 == 1
+
+        row = tbl.add_row()
+        for i, val in enumerate([u.url, expanded, redirects, vt_str, flag_str]):
+            p = row.cells[i].paragraphs[0]
+            r = p.add_run(str(val) if val else "—")
+            r.font.size = Pt(9)
+            if zebra:
+                _set_cell_bg(row.cells[i], _HEX_ZEBRA)
+
+        if vt_mal > 0:
+            _set_cell_bg(row.cells[3], "FFE0E0")
+        elif vt_sus > 0:
+            _set_cell_bg(row.cells[3], _HEX_AMBER)
+        if flags:
+            _set_cell_bg(row.cells[4], _HEX_AMBER)
+
+    doc.add_paragraph()
+
+    # Page title column if any
+    titled = [u for u in analysis.urls if getattr(u, "page_title", None)]
+    if titled:
+        p = doc.add_paragraph()
+        _run(p, "Page titles retrieved:", bold=True, size_pt=10)
+        for u in titled:
+            _bullet(doc, f"{u.url}  →  {u.page_title}")
+
+    if not vt_ran:
+        vs = analysis.vt_enrichment_status
+        msg = {
+            "no_key":    "VirusTotal columns show '—' — no API key is configured in Settings.",
+            "rate_limit":"VirusTotal columns show '—' — daily quota was reached during this analysis.",
+            "error":     f"VirusTotal columns show '—' — enrichment error: "
+                         f"{analysis.vt_enrichment_error or 'unknown'}.",
+        }.get(vs or "", "")
+        if msg:
+            _note(doc, msg)
+
+    doc.add_paragraph()
+
+
+def _section_attachments(doc: Document, analysis: EmailAnalysis) -> None:
+    _heading(doc, "5.  Attachment Indicators")
+
+    if not analysis.attachments:
+        doc.add_paragraph("No attachments found in this email.")
+        doc.add_paragraph()
+        return
+
+    tbl = _data_table(doc,
+                      ["Filename", "Content-Type", "SHA-256", "VT Hash", "Static Analysis Flags"],
+                      widths=[1.5, 1.3, 1.3, 0.8, 2.5])
+
+    for idx, att in enumerate(analysis.attachments):
+        flags = []
+        if att.is_executable_like:                          flags.append("⚠ dangerous ext.")
+        if att.is_double_extension:                         flags.append("⚠ double ext.")
+        if getattr(att, "is_macro_enabled", False):         flags.append("⚠ macro-enabled")
+        if getattr(att, "has_embedded_executable", False):  flags.append("⚠ embedded exe")
+        if getattr(att, "is_archive", False):               flags.append("archive")
+        if getattr(att, "mime_magic_mismatch", False):      flags.append("⚠ MIME mismatch")
+
+        vt_mal = getattr(att, "vt_hash_malicious", 0) or 0
+        vt_sus = getattr(att, "vt_hash_suspicious", 0) or 0
+        vt_status_att = getattr(att, "vt_hash_status", None)
+        if vt_mal > 0:
+            vt_str = f"Malicious ({vt_mal})"
+        elif vt_sus > 0:
+            vt_str = f"Suspicious ({vt_sus})"
+        elif vt_status_att == "ok":
+            vt_str = "Clean"
+        else:
+            vt_str = "—"
+
+        sha = (att.sha256[:20] + "…") if att.sha256 else "N/A"
+        flag_str = ", ".join(flags) if flags else "—"
+        zebra = idx % 2 == 1
+
+        row = tbl.add_row()
+        for i, val in enumerate([att.filename or "unknown",
+                                  att.content_type or "unknown",
+                                  sha, vt_str, flag_str]):
+            p = row.cells[i].paragraphs[0]
+            r = p.add_run(str(val))
+            r.font.size = Pt(9)
+            if zebra:
+                _set_cell_bg(row.cells[i], _HEX_ZEBRA)
+
+        if vt_mal > 0:
+            _set_cell_bg(row.cells[3], "FFE0E0")
+        if flags:
+            _set_cell_bg(row.cells[4], "FFE0E0")
+
+    doc.add_paragraph()
+
+    # File metadata block
+    for att in analysis.attachments:
+        meta = getattr(att, "file_metadata", None) or {}
+        inner = (meta.get("file_metadata") or meta) if isinstance(meta, dict) else {}
+        if isinstance(inner, dict) and inner:
+            p = doc.add_paragraph()
+            _run(p, f"Document metadata — {att.filename or 'attachment'}: ", bold=True, size_pt=10)
+            items = [f"{k}: {v}" for k, v in inner.items() if v]
+            _run(p, "  |  ".join(items), size_pt=9.5)
+
+    doc.add_paragraph()
+
+
+
+def _section_intel(doc: Document, analysis: EmailAnalysis) -> None:
+    _heading(doc, "6.  Threat Intelligence Enrichment")
+
+    # ── VirusTotal ────────────────────────────────────────────────────────
+    p = doc.add_paragraph()
+    _run(p, "VirusTotal — URL Scan", bold=True, colour=_NAVY, size_pt=11)
+
+    vt_status = analysis.vt_enrichment_status
+    vt_hits   = [u for u in analysis.urls
+                 if (u.vt_malicious or 0) > 0 or (u.vt_suspicious or 0) > 0]
+
+    if vt_status == "no_key":
+        _note(doc, "Not queried — no VirusTotal API key configured in Settings.")
+    elif vt_status == "rate_limit":
+        _note(doc, "Daily quota reached — results unavailable for this analysis.")
+    elif vt_status == "error":
+        _note(doc, f"Enrichment failed: {analysis.vt_enrichment_error or 'unknown error'}.")
+    elif vt_hits:
+        for u in vt_hits:
+            p2 = doc.add_paragraph(style="List Bullet")
+            _run(p2, u.url, size_pt=9.5)
+            _run(p2, f"  →  malicious={u.vt_malicious}, suspicious={u.vt_suspicious}, "
+                 f"harmless={u.vt_harmless}", colour=_RED, size_pt=9.5)
+    elif analysis.urls and vt_status == "ok":
+        _note(doc, f"All {len(analysis.urls)} URL(s) checked — no malicious detections.", colour=_GREEN)
+    elif not analysis.urls:
+        _note(doc, "No URLs found in this email — scan not performed.")
+    else:
+        _note(doc, "No VirusTotal results available.")
+
+    doc.add_paragraph()
+
+    # ── AbuseIPDB ─────────────────────────────────────────────────────────
+    p = doc.add_paragraph()
+    _run(p, "AbuseIPDB — Sender IP Reputation", bold=True, colour=_NAVY, size_pt=11)
+
+    abuse_status = analysis.abuse_enrichment_status
+    if analysis.abuse_score is not None:
+        abuse_colour = (_RED   if (analysis.abuse_score or 0) >= 50 else
+                        _AMBER if (analysis.abuse_score or 0) >= 10 else _GREEN)
+        _kv_table(doc, [
+            ("IP address",    analysis.sender_ip),
+            ("Abuse score",   f"{analysis.abuse_score}%  confidence of abuse"),
+            ("Total reports", str(analysis.abuse_total_reports or 0)),
+            ("Country",       analysis.abuse_country),
+            ("ISP",           analysis.abuse_isp),
+        ], label_width=1.6, value_width=4.6)
+        if (analysis.abuse_score or 0) >= 50:
+            _note(doc, "⚠  High abuse score — this IP has been widely reported for malicious activity.",
+                  colour=_RED)
+    elif abuse_status == "no_key":
+        _note(doc, "Not queried — no AbuseIPDB API key configured in Settings.")
+    elif abuse_status == "rate_limit":
+        _note(doc, "Daily quota reached — results unavailable.")
+    elif abuse_status == "error":
+        _note(doc, f"Lookup failed: {analysis.abuse_enrichment_error or 'unknown error'}.")
+    elif not analysis.sender_ip:
+        _note(doc, "No sender IP found in email headers — reputation check not performed.")
+    else:
+        _note(doc, f"{analysis.sender_ip} — no abuse reports on record.", colour=_GREEN)
+
+    doc.add_paragraph()
+
+    # ── Shodan ────────────────────────────────────────────────────────────
+    p = doc.add_paragraph()
+    _run(p, "Shodan — IP Intelligence", bold=True, colour=_NAVY, size_pt=11)
+
+    shodan = getattr(analysis, "shodan_data", None)
+    shodan_status = getattr(analysis, "shodan_enrichment_status", None)
+
+    if shodan:
+        rows = [
+            ("IP",         shodan.get("ip")),
+            ("Org",        shodan.get("org")),
+            ("ASN",        shodan.get("asn")),
+            ("Country",    shodan.get("country")),
+            ("City",       shodan.get("city")),
+            ("Open ports", ", ".join(str(p) for p in (shodan.get("ports") or [])) or "none"),
+            ("Tags",       ", ".join(shodan.get("tags") or []) or "none"),
+            ("Hostnames",  ", ".join(shodan.get("hostnames") or []) or "none"),
+        ]
+        _kv_table(doc, rows, label_width=1.4, value_width=4.8)
+        vulns = shodan.get("vulns") or []
+        if vulns:
+            p2 = doc.add_paragraph()
+            _run(p2, f"⚠  {len(vulns)} CVE(s) found: ", bold=True, colour=_RED, size_pt=10)
+            _run(p2, ", ".join(vulns[:10]) + (" …" if len(vulns) > 10 else ""), size_pt=10)
+    elif shodan_status == "no_key":
+        _note(doc, "Not queried — no Shodan API key configured (InternetDB free lookup also returned no data).")
+    elif shodan_status == "no_data":
+        _note(doc, f"{analysis.sender_ip or 'Sender IP'} — not indexed by Shodan / InternetDB.", colour=_GREEN)
+    elif shodan_status in ("error", "rate_limit"):
+        err = getattr(analysis, "shodan_enrichment_error", None)
+        _note(doc, f"Lookup failed: {err or 'unknown error'}.")
+    else:
+        _note(doc, "Shodan data not available for this analysis.")
+
+    doc.add_paragraph()
+
+
+def _section_social(doc: Document, analysis: EmailAnalysis) -> None:
+    _heading(doc, "7.  Social Engineering Signals")
+
+    # MIME structure
+    p = doc.add_paragraph()
+    _run(p, "MIME Structure", bold=True, size_pt=10.5)
+    mime_parts = getattr(analysis, "mime_parts", None) or []
+    if mime_parts:
+        for part in mime_parts:
+            _bullet(doc, part)
+    else:
+        _note(doc, "MIME structure data not available.")
+    doc.add_paragraph()
+
+    # Lure categories
+    p = doc.add_paragraph()
+    _run(p, "Lure-Category Detection", bold=True, size_pt=10.5)
+    lures = getattr(analysis, "lure_categories", None) or []
+    if lures:
+        for lure in lures:
+            cat = lure.get("category", "unknown").replace("_", " ").title()
+            kws = lure.get("matched_keywords", [])
+            kw_str = ", ".join(kws[:6]) + (" …" if len(kws) > 6 else "")
+            p2 = doc.add_paragraph(style="List Bullet")
+            _run(p2, f"{cat}: ", bold=True, size_pt=10)
+            _run(p2, kw_str, size_pt=10)
+    else:
+        _note(doc, "No lure categories detected.", colour=_GREEN)
+    doc.add_paragraph()
+
+    # Urgency keywords
+    if analysis.urgency_keywords_found:
+        p = doc.add_paragraph()
+        _run(p, "Urgency / Pressure Language: ", bold=True, size_pt=10.5)
+        _run(p, ", ".join(analysis.urgency_keywords_found), colour=_AMBER, size_pt=10)
+        doc.add_paragraph()
+
+    # Anchor mismatches
+    p = doc.add_paragraph()
+    _run(p, "Anchor Text / Href Mismatches", bold=True, size_pt=10.5)
+    anchors = getattr(analysis, "anchor_mismatches", None) or []
+    if anchors:
+        tbl = _data_table(doc, ["Display Text", "Actual Href", "Reason"],
+                          widths=[1.8, 2.5, 3.0])
+        for idx, am in enumerate(anchors[:20]):
+            zebra = idx % 2 == 1
+            row = tbl.add_row()
+            for i, val in enumerate([am.get("display_text", "")[:80],
+                                      am.get("href", ""),
+                                      am.get("reason", "")]):
+                r = row.cells[i].paragraphs[0].add_run(str(val))
+                r.font.size = Pt(9)
+                if zebra:
+                    _set_cell_bg(row.cells[i], _HEX_ZEBRA)
+            _set_cell_bg(row.cells[2], _HEX_AMBER)
+        if len(anchors) > 20:
+            _note(doc, f"… and {len(anchors) - 20} more mismatches not shown.")
+    else:
+        _note(doc, "No anchor text / href mismatches detected.", colour=_GREEN)
+
+    doc.add_paragraph()
+
+
+def _section_verdict(doc: Document, analysis: EmailAnalysis) -> None:
+    _heading(doc, "8.  Scoring & Verdict")
+
+    verdict_key = analysis.verdict
+    _kv_table(doc, [
+        ("Total suspicion score", str(analysis.score if analysis.score is not None else "N/A")),
+        ("Verdict",               (verdict_key or "unknown").upper()),
+    ], label_width=2.0, value_width=4.2)
+
+    if analysis.reasons:
+        p = doc.add_paragraph()
+        _run(p, "Indicators that contributed to this verdict:", bold=True, size_pt=10)
+        for r in analysis.reasons:
+            _bullet(doc, r.reason_text)
+    else:
+        _note(doc, "No specific indicators were triggered by the current detection rules.")
+
+    doc.add_paragraph()
+
+
+def _section_body(doc: Document, analysis: EmailAnalysis) -> None:
+    _heading(doc, "9.  Body Preview")
+
+    body = analysis.body_text or ""
+    if body:
+        preview = body[:1000].strip()
+        if len(body) > 1000:
+            preview += "\n\n[… content continues — full body stored in the database …]"
+        p = doc.add_paragraph()
+        r = p.add_run(preview)
+        r.font.size = Pt(9.5)
+        r.font.name = "Courier New"
+        r.font.color.rgb = _SLATE
+    else:
+        doc.add_paragraph("No readable body text was extracted from this email.")
+
+    doc.add_paragraph()
+
+
+def _appendix(doc: Document, analysis: EmailAnalysis) -> None:
+    if not analysis.auth_headers_raw:
+        return
+    _heading(doc, "Appendix — Raw Authentication Headers", level=2)
+    for h in analysis.auth_headers_raw:
+        p = doc.add_paragraph(style="List Bullet")
+        r = p.add_run(h)
+        r.font.size = Pt(8)
+        r.font.name = "Courier New"
+        r.font.color.rgb = _GREY
+
+
+def _footer_note(doc: Document) -> None:
+    doc.add_paragraph()
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run(
+        "Generated by Phish Analyzer Desktop  ·  "
+        "Results are indicative only  ·  "
+        "Always apply human judgement before acting on automated verdicts."
+    )
+    r.italic = True
+    r.font.size = Pt(8)
+    r.font.color.rgb = _GREY
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -171,328 +820,32 @@ def _auth_badge_para(doc: Document, label: str, verdict: str) -> None:
 def build_docx_report(analysis: EmailAnalysis) -> bytes:
     doc = Document()
 
+    # Base font
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
     style.font.size = Pt(11)
 
-    # ── Cover / title block ───────────────────────────────────────────────────
-    title = doc.add_heading("Phishing Email Analysis Report", level=0)
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # Heading styles
+    for lvl, sz in [(1, 13), (2, 11.5)]:
+        hs = doc.styles[f"Heading {lvl}"]
+        hs.font.name = "Calibri"
+        hs.font.size = Pt(sz)
+        hs.font.color.rgb = _NAVY
+        hs.font.bold = True
 
-    verdict_key = analysis.verdict
-    banner = doc.add_paragraph()
-    banner.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    banner_run = banner.add_run(_VERDICT_LABEL.get(verdict_key, "UNKNOWN"))
-    banner_run.bold = True
-    banner_run.font.size = Pt(14)
-    banner_run.font.color.rgb = _VERDICT_COLOUR.get(verdict_key, _GREY)
+    _cover(doc, analysis)
+    _section_metadata(doc, analysis)
+    _section_headers(doc, analysis)
+    _section_auth(doc, analysis)
+    _section_urls(doc, analysis)
+    _section_attachments(doc, analysis)
+    _section_intel(doc, analysis)
+    _section_social(doc, analysis)
+    _section_verdict(doc, analysis)
+    _section_body(doc, analysis)
+    _appendix(doc, analysis)
+    _footer_note(doc)
 
-    score_para = doc.add_paragraph()
-    score_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _bold_run(score_para, "Suspicion score: ")
-    score_para.add_run(str(analysis.score) if analysis.score is not None else "N/A")
-
-    doc.add_paragraph()
-
-    # ── Section 1 — Email Metadata ────────────────────────────────────────────
-    _section_heading(doc, "1. Email Metadata")
-
-    created = (
-        analysis.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        if analysis.created_at else None
-    )
-    _two_col_table(doc, [
-        ("Filename",    analysis.filename),
-        ("Subject",     analysis.subject or "— (no subject)"),
-        ("From",        analysis.from_addr),
-        ("Message-ID",  analysis.message_id),
-        ("Analysed at", created),
-    ])
-
-    # ── Section 2 — Sender & Header Analysis ─────────────────────────────────
-    _section_heading(doc, "2. Sender & Header Analysis")
-
-    header_rows = [
-        ("From domain",        analysis.from_domain),
-        ("Reply-To domain",    analysis.reply_domain),
-        ("Return-Path domain", analysis.return_domain),
-        ("Sender IP",          analysis.sender_ip),
-    ]
-
-    if analysis.is_lookalike_domain:
-        header_rows.append((
-            "⚠ Lookalike domain",
-            f"'{analysis.from_domain}' closely resembles '{analysis.lookalike_of}'"
-            " — possible typosquat or combosquat attack",
-        ))
-    if analysis.is_punycode_domain:
-        header_rows.append((
-            "⚠ Punycode / IDN domain",
-            f"'{analysis.from_domain}' uses international encoding — possible homograph spoof",
-        ))
-    if analysis.is_suspicious_sender_tld:
-        header_rows.append((
-            "⚠ Suspicious sender TLD",
-            f"The TLD of '{analysis.from_domain}' is commonly associated with phishing campaigns",
-        ))
-
-    _two_col_table(doc, header_rows)
-
-    if analysis.header_issues:
-        doc.add_paragraph("Header anomalies detected:")
-        for issue in analysis.header_issues:
-            doc.add_paragraph(issue, style="List Bullet")
-        doc.add_paragraph()
-    else:
-        doc.add_paragraph("No header anomalies detected.")
-        doc.add_paragraph()
-
-    # ── Section 3 — Email Authentication ─────────────────────────────────────
-    _section_heading(doc, "3. Email Authentication (SPF / DKIM / DMARC)")
-
-    for proto, value in [("SPF", analysis.spf), ("DKIM", analysis.dkim), ("DMARC", analysis.dmarc)]:
-        _auth_badge_para(doc, proto, value or "unknown")
-
-    doc.add_paragraph()
-
-    # ── Section 4 — URL Indicators ────────────────────────────────────────────
-    _section_heading(doc, "4. URL Indicators")
-
-    if analysis.urls:
-        # Determine if VT data is present in any URL row.
-        vt_ran = analysis.vt_enrichment_status in ("ok", "no_data")
-
-        url_tbl = doc.add_table(rows=0, cols=4)
-        url_tbl.style = "Table Grid"
-
-        hdr_row = url_tbl.add_row()
-        for i, txt in enumerate(("URL", "Flags", "VT Malicious", "VT Suspicious")):
-            hdr_row.cells[i].text = txt
-            hdr_row.cells[i].paragraphs[0].runs[0].bold = True
-            hdr_row.cells[i].paragraphs[0].runs[0].font.color.rgb = _WHITE
-            _set_cell_bg(hdr_row.cells[i], "1F3964")
-
-        for u in analysis.urls:
-            flags = []
-            if u.is_suspicious_keyword: flags.append("suspicious keyword")
-            if u.is_ip_host:            flags.append("raw IP host")
-            if u.is_shortener:          flags.append("URL shortener")
-            if u.is_suspicious_tld:     flags.append("suspicious TLD")
-            if u.is_punycode:           flags.append("punycode domain")
-
-            r = url_tbl.add_row()
-            r.cells[0].text = u.url
-            r.cells[1].text = ", ".join(flags) if flags else "—"
-            r.cells[2].text = str(u.vt_malicious) if (u.vt_malicious or 0) > 0 else "—"
-            r.cells[3].text = str(u.vt_suspicious) if (u.vt_suspicious or 0) > 0 else "—"
-
-            if (u.vt_malicious or 0) > 0:
-                _set_cell_bg(r.cells[2], "FFD7D7")
-            if (u.vt_suspicious or 0) > 0:
-                _set_cell_bg(r.cells[3], "FFF3CD")
-            if flags:
-                _set_cell_bg(r.cells[1], "FFF3CD")
-
-        doc.add_paragraph()
-
-        # Only add a note if VT didn't run — never add a note when results are present.
-        if not vt_ran:
-            vt_status = analysis.vt_enrichment_status
-            if vt_status == "no_key":
-                _note_para(doc, "VirusTotal columns show '—' — no API key is configured.")
-            elif vt_status == "rate_limit":
-                _note_para(doc, "VirusTotal columns show '—' — daily quota was reached during this analysis.")
-            elif vt_status == "error":
-                _note_para(doc, f"VirusTotal columns show '—' — enrichment error: {analysis.vt_enrichment_error or 'unknown'}.")
-    else:
-        doc.add_paragraph("No URLs were extracted from this email.")
-
-    # ── Section 5 — Attachment Indicators ────────────────────────────────────
-    _section_heading(doc, "5. Attachment Indicators")
-
-    if analysis.attachments:
-        att_tbl = doc.add_table(rows=0, cols=4)
-        att_tbl.style = "Table Grid"
-
-        hdr_row = att_tbl.add_row()
-        for i, txt in enumerate(("Filename", "Content-Type", "SHA-256 (partial)", "Flags")):
-            hdr_row.cells[i].text = txt
-            hdr_row.cells[i].paragraphs[0].runs[0].bold = True
-            hdr_row.cells[i].paragraphs[0].runs[0].font.color.rgb = _WHITE
-            _set_cell_bg(hdr_row.cells[i], "1F3964")
-
-        for att in analysis.attachments:
-            flags = []
-            if att.is_executable_like:  flags.append("⚠ dangerous extension")
-            if att.is_double_extension: flags.append("⚠ double extension")
-
-            r = att_tbl.add_row()
-            r.cells[0].text = att.filename or "unknown"
-            r.cells[1].text = att.content_type or "unknown"
-            r.cells[2].text = (att.sha256[:16] + "…") if att.sha256 else "N/A"
-            r.cells[3].text = ", ".join(flags) if flags else "—"
-
-            if flags:
-                _set_cell_bg(r.cells[3], "FFD7D7")
-
-        doc.add_paragraph()
-    else:
-        doc.add_paragraph("No attachments found in this email.")
-        doc.add_paragraph()
-
-    # ── Section 6 — Threat Intelligence Enrichment ───────────────────────────
-    _section_heading(doc, "6. Threat Intelligence Enrichment")
-
-    has_enrichment = False
-
-    # ── VirusTotal ────────────────────────────────────────────────────────
-    vt_status = analysis.vt_enrichment_status
-    vt_error  = analysis.vt_enrichment_error
-    vt_hits   = [u for u in analysis.urls
-                 if (u.vt_malicious or 0) > 0 or (u.vt_suspicious or 0) > 0]
-
-    if vt_status == "no_key":
-        _note_para(doc, "VirusTotal: not queried — no API key configured.")
-    elif vt_status == "rate_limit":
-        _note_para(doc, "VirusTotal: daily quota reached — results unavailable for this analysis.")
-    elif vt_status == "error":
-        _note_para(doc, f"VirusTotal: enrichment failed — {vt_error or 'unknown error'}.")
-    elif vt_hits:
-        has_enrichment = True
-        p = doc.add_paragraph()
-        _bold_run(p, "VirusTotal — Malicious URLs detected:")
-        for u in vt_hits:
-            doc.add_paragraph(
-                f"{u.url}  →  malicious={u.vt_malicious}, "
-                f"suspicious={u.vt_suspicious}, harmless={u.vt_harmless}",
-                style="List Bullet",
-            )
-    elif analysis.urls and vt_status == "ok":
-        has_enrichment = True
-        doc.add_paragraph(
-            "VirusTotal: all extracted URLs were checked — no malicious detections found."
-        )
-    elif analysis.urls and vt_status == "no_data":
-        doc.add_paragraph(
-            "VirusTotal: URLs submitted for analysis — no results returned "
-            "(URLs may be unrated or too new to have detections)."
-        )
-    elif not analysis.urls:
-        doc.add_paragraph("VirusTotal: no URLs found in this email — scan not performed.")
-    # If vt_status is None (old analysis), say nothing — no misleading text.
-
-    # ── AbuseIPDB ─────────────────────────────────────────────────────────
-    abuse_status = analysis.abuse_enrichment_status
-    abuse_error  = analysis.abuse_enrichment_error
-
-    if analysis.abuse_score is not None:
-        has_enrichment = True
-        p = doc.add_paragraph()
-        _bold_run(p, "AbuseIPDB — Sender IP reputation: ")
-        p.add_run(f"{analysis.sender_ip or 'N/A'}  →  ")
-        colour = (
-            _RED   if (analysis.abuse_score or 0) >= 50 else
-            _AMBER if (analysis.abuse_score or 0) >= 10 else
-            _GREEN
-        )
-        _coloured_run(p, f"abuse confidence score: {analysis.abuse_score}%", colour)
-        p.add_run(
-            f"  |  total reports: {analysis.abuse_total_reports or 0}"
-            f"  |  country: {analysis.abuse_country or 'N/A'}"
-            f"  |  ISP: {analysis.abuse_isp or 'N/A'}"
-        )
-    elif abuse_status == "no_key":
-        _note_para(doc, "AbuseIPDB: not queried — no API key configured.")
-    elif abuse_status == "rate_limit":
-        _note_para(doc, "AbuseIPDB: daily quota reached — results unavailable for this analysis.")
-    elif abuse_status == "error":
-        _note_para(doc, f"AbuseIPDB: enrichment failed — {abuse_error or 'unknown error'}.")
-    elif not analysis.sender_ip or abuse_status == "no_data":
-        doc.add_paragraph(
-            "AbuseIPDB: no sender IP found in email headers — reputation check not performed."
-        )
-    elif abuse_status in ("ok", None) and analysis.sender_ip:
-        has_enrichment = True
-        doc.add_paragraph(
-            f"AbuseIPDB: {analysis.sender_ip} — no abuse reports on record."
-        )
-
-    doc.add_paragraph()
-
-    # ── Section 7 — Scoring & Verdict Reasoning ───────────────────────────────
-    _section_heading(doc, "7. Scoring & Verdict Reasoning")
-
-    score_tbl = doc.add_table(rows=0, cols=2)
-    score_tbl.style = "Table Grid"
-    hdr_row = score_tbl.add_row()
-    for i, txt in enumerate(("Field", "Value")):
-        hdr_row.cells[i].text = txt
-        hdr_row.cells[i].paragraphs[0].runs[0].bold = True
-        hdr_row.cells[i].paragraphs[0].runs[0].font.color.rgb = _WHITE
-        _set_cell_bg(hdr_row.cells[i], "1F3964")
-
-    score_row = score_tbl.add_row()
-    score_row.cells[0].text = "Total suspicion score"
-    score_row.cells[1].text = str(analysis.score if analysis.score is not None else "N/A")
-
-    verdict_row = score_tbl.add_row()
-    verdict_row.cells[0].text = "Verdict"
-    vp = verdict_row.cells[1].paragraphs[0]
-    run = vp.add_run(analysis.verdict.upper() if analysis.verdict else "UNKNOWN")
-    run.bold = True
-    run.font.color.rgb = _VERDICT_COLOUR.get(analysis.verdict, _GREY)
-
-    doc.add_paragraph()
-
-    if analysis.reasons:
-        doc.add_paragraph("Indicators that contributed to this verdict:")
-        for reason in [r.reason_text for r in analysis.reasons]:
-            doc.add_paragraph(reason, style="List Bullet")
-    else:
-        doc.add_paragraph("No specific indicators were triggered by the current detection rules.")
-
-    if analysis.urgency_keywords_found:
-        doc.add_paragraph()
-        p = doc.add_paragraph()
-        _bold_run(p, "Urgency / pressure language detected: ")
-        p.add_run(", ".join(analysis.urgency_keywords_found))
-
-    doc.add_paragraph()
-
-    # ── Section 8 — Body Preview ──────────────────────────────────────────────
-    _section_heading(doc, "8. Body Preview")
-
-    body = analysis.body_text or ""
-    if body:
-        preview = body[:800].strip()
-        if len(body) > 800:
-            preview += "\n[… content continues …]"
-        doc.add_paragraph(preview)
-    else:
-        doc.add_paragraph("No readable body text was extracted from this email.")
-
-    # ── Appendix — Raw Authentication Headers ─────────────────────────────────
-    if analysis.auth_headers_raw:
-        _section_heading(doc, "Appendix — Raw Authentication Headers", level=2)
-        for h in analysis.auth_headers_raw:
-            p = doc.add_paragraph(style="List Bullet")
-            run = p.add_run(h)
-            run.font.size = Pt(8)
-            run.font.name = "Courier New"
-            run.font.color.rgb = _GREY
-
-    # ── Footer ────────────────────────────────────────────────────────────────
-    doc.add_paragraph()
-    footer_p = doc.add_paragraph()
-    footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = footer_p.add_run(
-        "Generated by Phish Analyzer Desktop  ·  Results are indicative only  ·  "
-        "Always apply human judgement before acting on automated verdicts."
-    )
-    run.font.size = Pt(8)
-    run.font.color.rgb = _GREY
-    run.italic = True
-
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    return buffer.getvalue()
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()

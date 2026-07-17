@@ -14,6 +14,10 @@ env/
 # Secrets — NEVER commit these
 .env
 *.sqlite3
+# config.yaml may contain API keys for the legacy CLI — keep it out of git.
+# If you need to version-control scoring/brand config, use config.yaml.example
+# (with all key fields empty) and copy it to config.yaml locally.
+config.yaml
 
 # PyInstaller build artefacts
 build/

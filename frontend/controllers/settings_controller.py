@@ -57,9 +57,23 @@ class SettingsController(BaseController):
         if "abuseipdb_key" in keys:
             payload["abuseipdb_key"] = keys["abuseipdb_key"]
             logger.info("Settings save: abuseipdb_key included in payload (len=%d)", len(keys["abuseipdb_key"]))
+        if "shodan_key" in keys:
+            payload["shodan_key"] = keys["shodan_key"]
+            logger.info("Settings save: shodan_key included in payload (len=%d)", len(keys["shodan_key"]))
 
-        has_keys = bool(keys)
-        logger.info("Settings save: payload keys present=%s, has_api_keys=%s", list(payload.keys()), has_keys)
+        # Sandbox: always include provider (user may have changed it to disabled);
+        # only include the API key when the user typed a new one.
+        sandbox = dialog.sandbox_payload()
+        payload["sandbox_provider"] = sandbox.get("sandbox_provider")
+        if "sandbox_api_key" in sandbox:
+            payload["sandbox_api_key"] = sandbox["sandbox_api_key"]
+            logger.info("Settings save: sandbox_api_key included in payload")
+
+        has_keys = bool(keys) or "sandbox_api_key" in sandbox
+        logger.info(
+            "Settings save: payload keys present=%s, has_api_keys=%s",
+            list(payload.keys()), has_keys,
+        )
 
         self.run_async(
             self.api_client.update_settings,

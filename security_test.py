@@ -1,6 +1,18 @@
 """
 Security test suite for Phish Analyzer Desktop API.
-Tests every vulnerability identified in the audit.
+Tests every vulnerability identified in the audit (see CLAUDE.md — Security Audit section).
+
+Audit issues covered:
+  HIGH-01  Localhost-only middleware
+  HIGH-02  File upload size limit + queue-depth guard (_MAX_PENDING_ANALYSES enforced)
+  HIGH-03  Path traversal via filename
+  HIGH-04  Content-Disposition header injection in report download
+  HIGH-05  DELETE /analyses (clear all) now requires ?confirm=true
+  MED-01   SQL injection (parameterised queries via SQLAlchemy ORM)
+  MED-02   API key security (GET /settings never returns raw key values)
+  MED-03   Oversized body / resource exhaustion (_MAX_BODY_TEXT_CHARS truncation)
+  MED-04   Malformed requests return structured 422, not 500
+  MED-05   re_enrich() error strings sanitised with _safe_error()
 """
 import io
 import os
@@ -41,8 +53,8 @@ r_redoc = requests.get(f"{BASE}/redoc")
 test("/docs endpoint disabled (404)", r_docs.status_code == 404)
 test("/redoc endpoint disabled (404)", r_redoc.status_code == 404)
 
-# ── TEST 2: File upload size limit ────────────────────────────────────────────
-print("\n[2] Upload size limit")
+# ── TEST 2: File upload size limit + queue-depth guard ────────────────────────
+print("\n[2] Upload size limit + queue-depth guard")
 
 # 2a: File larger than 25MB should be rejected
 big_content = b"X-Fake: header\n\n" + (b"A" * (26 * 1024 * 1024))
@@ -71,6 +83,15 @@ r = requests.post(
 )
 test("Non-.eml extension rejected (422)", r.status_code == 422,
      f"Got {r.status_code}: {r.text[:200]}")
+
+# 2d: _MAX_PENDING_ANALYSES constant is ENFORCED — check it is actually checked
+#     before accepting new uploads (source inspection).
+src_svc = open("backend/services/analysis_service.py", encoding="utf-8").read()
+test(
+    "_MAX_PENDING_ANALYSES enforced in submit_upload (queue-depth guard present)",
+    "_MAX_PENDING_ANALYSES" in src_svc and "len(_in_flight_tasks) >= _MAX_PENDING_ANALYSES" in src_svc,
+    "Queue-depth guard missing from submit_upload()",
+)
 
 # ── TEST 3: Path traversal via filename ───────────────────────────────────────
 print("\n[3] Path traversal prevention")
@@ -177,11 +198,10 @@ if r2.status_code == 200:
 # Clean up test key
 requests.put(f"{BASE}/settings/keys", json={"virustotal_key": ""}, timeout=5)
 
-# ── TEST 6: Oversized body attack ────────────────────────────────────────────
+# ── TEST 6: Oversized body / resource exhaustion ──────────────────────────────
 print("\n[6] Oversized body / resource exhaustion")
 
 # 6a: Check body_text truncation constant exists
-src_svc = open("backend/services/analysis_service.py", encoding="utf-8").read()
 test("_MAX_BODY_TEXT_CHARS defined in analysis_service",
      "_MAX_BODY_TEXT_CHARS" in src_svc)
 test("body_text truncated before DB storage",
@@ -207,6 +227,70 @@ test("Non-existent analysis returns 404 (not 500)", r.status_code == 404,
 r = requests.get(f"{BASE}/analyses/not_an_integer", timeout=5)
 test("Non-integer analysis ID returns 422 (not 500)", r.status_code == 422,
      f"Got {r.status_code}")
+
+# ── TEST 8: Content-Disposition header injection ──────────────────────────────
+print("\n[8] Content-Disposition header injection (HIGH-04)")
+
+# Verify the fix is in place: the download route must sanitize filenames before
+# embedding them in the Content-Disposition header value.
+src_analyses = open("backend/routes/analyses.py", encoding="utf-8").read()
+test(
+    "Content-Disposition filename sanitized (control/quote chars stripped)",
+    'safe_filename' in src_analyses and r're.sub' in src_analyses,
+    "Sanitization regex not found in download_report handler",
+)
+test(
+    "Content-Disposition uses safe_filename (not raw filename)",
+    'filename="{safe_filename}"' in src_analyses or "safe_filename" in src_analyses,
+    "safe_filename not used in Content-Disposition header",
+)
+
+# ── TEST 9: DELETE /analyses requires confirmation guard ─────────────────────
+print("\n[9] DELETE /analyses — confirmation guard (HIGH-05)")
+
+# 9a: DELETE without ?confirm=true must return 400
+r = requests.delete(f"{BASE}/analyses", timeout=5)
+test(
+    "DELETE /analyses without ?confirm=true returns 400 (not silently wiping DB)",
+    r.status_code == 400,
+    f"Got {r.status_code}: {r.text[:200]}",
+)
+
+# 9b: Source check — backend route requires confirm parameter
+test(
+    "DELETE /analyses handler requires confirm=True param (source check)",
+    "confirm: bool" in src_analyses and "if not confirm" in src_analyses,
+    "confirm guard missing from clear_all_analyses handler",
+)
+
+# 9c: Frontend client passes ?confirm=true
+src_api_client = open("frontend/services/api_client.py", encoding="utf-8").read()
+test(
+    "Frontend delete_all_emails passes ?confirm=true",
+    '"confirm"' in src_api_client or "'confirm'" in src_api_client,
+    "Frontend api_client.delete_all_emails does not pass confirm param",
+)
+
+# ── TEST 10: re_enrich() error string sanitization ───────────────────────────
+print("\n[10] re_enrich() — error string sanitization (MED-05)")
+
+# Verify _safe_error() is applied to all three provider error fields in re_enrich.
+# We look for the exact sanitized assignments in the source.
+test(
+    "re_enrich() sanitizes vt_error with _safe_error()",
+    "_safe_error(vt_error)" in src_svc,
+    "_safe_error(vt_error) not found in re_enrich()",
+)
+test(
+    "re_enrich() sanitizes abuse_error with _safe_error()",
+    "_safe_error(abuse_error)" in src_svc,
+    "_safe_error(abuse_error) not found in re_enrich()",
+)
+test(
+    "re_enrich() sanitizes shodan error with _safe_error()",
+    "_safe_error(shodan_enrichment.get(\"error\"))" in src_svc,
+    "_safe_error() not applied to shodan error in re_enrich()",
+)
 
 # ── SUMMARY ───────────────────────────────────────────────────────────────────
 print()

@@ -163,6 +163,35 @@ def get_attachment_content_type(att: dict) -> str | None:
     return None
 
 
+def extract_mime_parts(parsed: dict) -> list[str]:
+    """Return a flat list of MIME content-type strings for every body part
+    and every attachment in the parsed message.
+
+    This gives analysts a quick structural fingerprint of the email —
+    e.g. ['text/plain', 'text/html', 'application/pdf'] — and lets the
+    scoring engine flag suspicious MIME compositions without re-parsing.
+    """
+    parts: list[str] = []
+
+    # Body parts
+    for part in normalize_body(parsed.get("body", {})):
+        if not isinstance(part, dict):
+            continue
+        ct = part.get("content_type") or part.get("mime_type")
+        if ct:
+            parts.append(str(ct).split(";")[0].strip().lower())
+
+    # Attachments
+    for att in parsed.get("attachment", []) or []:
+        ct = get_attachment_content_type(att)
+        if ct:
+            parts.append(ct.lower())
+        else:
+            parts.append("application/octet-stream")
+
+    return parts
+
+
 def extract_global_hashes(parsed: dict) -> dict:
     hashes = parsed.get("hashes", {}) or parsed.get("hash", {})
     return {

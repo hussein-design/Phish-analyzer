@@ -16,6 +16,11 @@ alembic==1.18.5
 eml-parser==3.0.2
 publicsuffixlist==1.0.2.20260703
 beautifulsoup4==4.15.0
+# defusedxml: replaces stdlib xml.etree.ElementTree for OOXML metadata
+# parsing in attachment_intelligence_service.py.  The stdlib ET is vulnerable
+# to XXE (XML External Entity) and billion-laughs attacks when parsing
+# attacker-controlled XML inside a ZIP attachment.
+defusedxml==0.7.1
 python-docx==1.2.0
 vt-py==0.22.0
 httpx==0.28.1

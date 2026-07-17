@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AnalysisStatus(str, Enum):
@@ -59,6 +60,12 @@ class UrlIndicator(BaseModel):
     is_shortener: bool = False
     is_suspicious_tld: bool = False
     is_punycode: bool = False
+    # Phase 2
+    expanded_url: str | None = None
+    page_title: str | None = None
+    redirect_count: int = 0
+    final_status_code: int | None = None
+    is_redirect_suspicious: bool = False
 
 
 class AttachmentIndicator(BaseModel):
@@ -67,6 +74,16 @@ class AttachmentIndicator(BaseModel):
     sha256: str | None = None
     is_executable_like: bool = False
     is_double_extension: bool = False
+    # Phase 2: VirusTotal hash reputation
+    vt_hash_malicious: int = 0
+    vt_hash_suspicious: int = 0
+    vt_hash_status: str | None = None
+    # Phase 3: static attachment analysis flags
+    is_macro_enabled: bool = False
+    has_embedded_executable: bool = False
+    is_archive: bool = False
+    mime_magic_mismatch: bool = False
+    file_metadata: dict | None = None
 
 
 class GlobalHashes(BaseModel):
@@ -80,6 +97,18 @@ class AbuseResult(BaseModel):
     total_reports: int | None = None
     country_code: str | None = None
     isp: str | None = None
+
+
+class ShodanResult(BaseModel):
+    ip: str | None = None
+    hostnames: list[str] = []
+    ports: list[int] = []
+    vulns: list[str] = []
+    tags: list[str] = []
+    org: str | None = None
+    asn: str | None = None
+    country: str | None = None
+    city: str | None = None
 
 
 class EmailSummary(BaseModel):
@@ -114,6 +143,22 @@ class EmailDetail(EmailSummary):
     vt_enrichment_error: str | None = None
     abuse_enrichment_status: str | None = None
     abuse_enrichment_error: str | None = None
+    # Phase 1 additions
+    mime_parts: list[str] = []
+    lure_categories: list[dict] = []
+    anchor_mismatches: list[dict] = []
+    # Phase 2 additions
+    shodan_result: ShodanResult | None = None
+    shodan_enrichment_status: str | None = None
+    shodan_enrichment_error: str | None = None
+    # Phase 5: sandbox
+    sandbox_status: str | None = None
+    sandbox_provider: str | None = None
+    sandbox_verdict: str | None = None
+    sandbox_score: int | None = None
+    sandbox_report_url: str | None = None
+    sandbox_tags: list[str] = []
+    sandbox_error: str | None = None
 
 
 class UploadAccepted(BaseModel):
@@ -150,6 +195,15 @@ class ScoringWeights(BaseModel):
     url_shortener: int = 1
     attachment_double_extension: int = 4
     body_urgency_keyword: int = 1
+    # Phase 1 new signals
+    lure_category: int = 2
+    anchor_mismatch: int = 3
+    # Phase 2/3 new signals
+    redirect_suspicious: int = 3
+    macro_enabled: int = 4
+    embedded_executable: int = 5
+    mime_magic_mismatch: int = 3
+    vt_hash_malicious_points: int = 5
 
 
 class SettingsRead(BaseModel):
@@ -161,19 +215,36 @@ class SettingsRead(BaseModel):
     urgency_keywords: list[str] = []
     virustotal_key_configured: bool = False
     abuseipdb_key_configured: bool = False
+    shodan_key_configured: bool = False
+    sandbox_provider: str | None = None
+    sandbox_key_configured: bool = False
 
 
 class SettingsUpdate(BaseModel):
+    # MED-04: size-cap every collection field so a malicious PUT /settings
+    # payload cannot store megabytes of data into the single-row SQLite DB.
+    # Limits are generous enough for any legitimate use-case while preventing
+    # denial-of-service via oversized payloads.
+    #
+    # Per-item string cap: each keyword/TLD/domain entry is capped at 200 chars.
+    # List length cap: no more than 500 entries per list, 100 brand entries.
     scoring: ScoringWeights | None = None
-    brand_domains: dict[str, list[str]] | None = None
-    url_suspicious_keywords: list[str] | None = None
-    suspicious_tlds: list[str] | None = None
-    url_shorteners: list[str] | None = None
-    urgency_keywords: list[str] | None = None
+    brand_domains: Annotated[dict[
+        Annotated[str, Field(max_length=200)],
+        Annotated[list[Annotated[str, Field(max_length=200)]], Field(max_length=50)]
+    ], Field(max_length=100)] | None = None
+    url_suspicious_keywords: Annotated[list[Annotated[str, Field(max_length=200)]], Field(max_length=500)] | None = None
+    suspicious_tlds: Annotated[list[Annotated[str, Field(max_length=200)]], Field(max_length=500)] | None = None
+    url_shorteners: Annotated[list[Annotated[str, Field(max_length=200)]], Field(max_length=500)] | None = None
+    urgency_keywords: Annotated[list[Annotated[str, Field(max_length=200)]], Field(max_length=500)] | None = None
     # Optional API keys — only included when the user actually typed something.
     # None means "leave unchanged"; empty string means "clear the key".
-    virustotal_key: str | None = None
-    abuseipdb_key: str | None = None
+    virustotal_key: str | None = Field(default=None, max_length=255)
+    abuseipdb_key: str | None = Field(default=None, max_length=255)
+    shodan_key: str | None = Field(default=None, max_length=255)
+    # Phase 5: sandbox
+    sandbox_provider: str | None = Field(default=None, max_length=64)
+    sandbox_api_key: str | None = Field(default=None, max_length=255)
 
 
 class ApiKeysUpdate(BaseModel):

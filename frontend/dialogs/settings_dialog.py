@@ -1,10 +1,19 @@
 """API keys (masked) + scoring weights form -- a modal dialog, NOT a routed
 page, so it doesn't add a third route beyond Upload/Report.
+
+Includes:
+  - VirusTotal API key
+  - AbuseIPDB API key
+  - Shodan API key (Phase 2)
+  - Sandbox provider + API key (Phase 5)
+  - Full scoring weights including new Phase 1-4 signals
+  - Suspicious URL keywords / TLDs / shorteners / urgency phrases
 """
 
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -19,100 +28,150 @@ from PySide6.QtWidgets import (
 )
 
 _WEIGHT_LABELS = {
-    "brand_mismatch": "Brand mismatch (display name)",
-    "brand_domain_lookalike": "Lookalike/typosquat sender domain",
-    "brand_domain_lookalike_threshold": "Lookalike similarity threshold (%)",
-    "spf_fail": "SPF failure",
-    "dkim_fail": "DKIM failure",
-    "dmarc_fail": "DMARC failure",
-    "header_issue": "Header issue (each)",
-    "url_bad_keyword": "Suspicious URL keyword",
-    "url_ip_host": "URL uses raw IP host",
-    "url_shortener": "URL uses a link shortener",
-    "suspicious_tld": "Suspicious top-level domain",
-    "punycode_domain": "Punycode / IDN homograph domain",
-    "attachment_executable": "Dangerous attachment extension",
-    "attachment_double_extension": "Attachment double extension",
-    "body_urgency_keyword": "Urgency/pressure language in body",
-    "vt_malicious_threshold": "VirusTotal malicious engine threshold",
-    "vt_malicious_points": "VirusTotal malicious points",
-    "abuseipdb_high_score": "AbuseIPDB high-score threshold",
-    "abuseipdb_points": "AbuseIPDB high-score points",
+    # ── Original signals ──────────────────────────────────────────────────
+    "brand_mismatch":                  "Brand mismatch (display name)",
+    "brand_domain_lookalike":          "Lookalike/typosquat sender domain",
+    "brand_domain_lookalike_threshold":"Lookalike similarity threshold (%)",
+    "spf_fail":                        "SPF failure",
+    "dkim_fail":                       "DKIM failure",
+    "dmarc_fail":                      "DMARC failure",
+    "header_issue":                    "Header issue (each)",
+    "url_bad_keyword":                 "Suspicious URL keyword",
+    "url_ip_host":                     "URL uses raw IP host",
+    "url_shortener":                   "URL uses a link shortener",
+    "suspicious_tld":                  "Suspicious top-level domain",
+    "punycode_domain":                 "Punycode / IDN homograph domain",
+    "attachment_executable":           "Dangerous attachment extension",
+    "attachment_double_extension":     "Attachment double extension",
+    "body_urgency_keyword":            "Urgency/pressure language in body",
+    "vt_malicious_threshold":          "VirusTotal malicious engine threshold",
+    "vt_malicious_points":             "VirusTotal malicious points",
+    "abuseipdb_high_score":            "AbuseIPDB high-score threshold",
+    "abuseipdb_points":                "AbuseIPDB high-score points",
+    # ── Phase 1: social engineering signals ──────────────────────────────
+    "lure_category":                   "Lure category detected (per category)",
+    "anchor_mismatch":                 "Anchor text / href mismatch",
+    # ── Phase 2–4 new signals ─────────────────────────────────────────────
+    "redirect_suspicious":             "Suspicious redirect chain in URL",
+    "macro_enabled":                   "Macro-enabled Office attachment",
+    "embedded_executable":             "Embedded executable in attachment",
+    "mime_magic_mismatch":             "MIME magic-byte mismatch in attachment",
+    "vt_hash_malicious_points":        "VirusTotal attachment hash — malicious",
 }
+
+_SANDBOX_PROVIDERS = ["", "anyrun", "hybrid_analysis"]
 
 
 class SettingsDialog(QDialog):
     def __init__(self, settings: dict, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(520)
-        self.setMinimumHeight(600)
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(680)
 
         outer_layout = QVBoxLayout(self)
 
         content = QWidget()
         layout = QVBoxLayout(content)
 
+        # ── API Keys group ────────────────────────────────────────────────
         keys_group = QGroupBox("API Keys")
         keys_form = QFormLayout(keys_group)
 
-        # ── VirusTotal ────────────────────────────────────────────────────
+        # VirusTotal
         vt_configured = settings.get("virustotal_key_configured", False)
         vt_status_label = QLabel(
             "✓ Configured  (leave blank to keep, or type a new key to replace)"
-            if vt_configured
-            else "✗ Not configured"
+            if vt_configured else "✗ Not configured"
         )
         vt_status_label.setStyleSheet(
             "color: #37864a; font-size: 11px;" if vt_configured
             else "color: #c05000; font-size: 11px;"
         )
-
         self.vt_key_edit = QLineEdit()
         self.vt_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.vt_key_edit.setPlaceholderText(
-            "Leave blank to keep existing key"
-            if vt_configured
+            "Leave blank to keep existing key" if vt_configured
             else "Paste your VirusTotal API key here"
         )
+        vt_widget = _key_widget(vt_status_label, self.vt_key_edit)
 
-        vt_widget = QWidget()
-        vt_layout = QVBoxLayout(vt_widget)
-        vt_layout.setContentsMargins(0, 0, 0, 0)
-        vt_layout.setSpacing(2)
-        vt_layout.addWidget(vt_status_label)
-        vt_layout.addWidget(self.vt_key_edit)
-
-        # ── AbuseIPDB ─────────────────────────────────────────────────────
+        # AbuseIPDB
         abuse_configured = settings.get("abuseipdb_key_configured", False)
         abuse_status_label = QLabel(
             "✓ Configured  (leave blank to keep, or type a new key to replace)"
-            if abuse_configured
-            else "✗ Not configured"
+            if abuse_configured else "✗ Not configured"
         )
         abuse_status_label.setStyleSheet(
             "color: #37864a; font-size: 11px;" if abuse_configured
             else "color: #c05000; font-size: 11px;"
         )
-
         self.abuse_key_edit = QLineEdit()
         self.abuse_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.abuse_key_edit.setPlaceholderText(
-            "Leave blank to keep existing key"
-            if abuse_configured
+            "Leave blank to keep existing key" if abuse_configured
             else "Paste your AbuseIPDB API key here"
         )
+        abuse_widget = _key_widget(abuse_status_label, self.abuse_key_edit)
 
-        abuse_widget = QWidget()
-        abuse_layout = QVBoxLayout(abuse_widget)
-        abuse_layout.setContentsMargins(0, 0, 0, 0)
-        abuse_layout.setSpacing(2)
-        abuse_layout.addWidget(abuse_status_label)
-        abuse_layout.addWidget(self.abuse_key_edit)
+        # Shodan (Phase 2)
+        shodan_configured = settings.get("shodan_key_configured", False)
+        shodan_status_label = QLabel(
+            "✓ Configured  (leave blank to keep, or type a new key to replace)"
+            if shodan_configured else "✗ Not configured  (InternetDB free tier is always used)"
+        )
+        shodan_status_label.setStyleSheet(
+            "color: #37864a; font-size: 11px;" if shodan_configured
+            else "color: #888; font-size: 11px;"
+        )
+        self.shodan_key_edit = QLineEdit()
+        self.shodan_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.shodan_key_edit.setPlaceholderText(
+            "Leave blank to keep existing key" if shodan_configured
+            else "Optional — enables deep Shodan host lookups"
+        )
+        shodan_widget = _key_widget(shodan_status_label, self.shodan_key_edit)
 
         keys_form.addRow("VirusTotal API key", vt_widget)
         keys_form.addRow("AbuseIPDB API key", abuse_widget)
+        keys_form.addRow("Shodan API key", shodan_widget)
 
+        # ── Sandbox group (Phase 5) ───────────────────────────────────────
+        sandbox_group = QGroupBox("Sandbox Detonation (Phase 5)")
+        sandbox_form = QFormLayout(sandbox_group)
+
+        sandbox_configured = settings.get("sandbox_key_configured", False)
+        current_provider = settings.get("sandbox_provider") or ""
+
+        self.sandbox_provider_combo = QComboBox()
+        for p in _SANDBOX_PROVIDERS:
+            label = {"": "— disabled —", "anyrun": "Any.run", "hybrid_analysis": "Hybrid Analysis"}.get(p, p)
+            self.sandbox_provider_combo.addItem(label, p)
+        # Select current provider
+        idx = self.sandbox_provider_combo.findData(current_provider)
+        if idx >= 0:
+            self.sandbox_provider_combo.setCurrentIndex(idx)
+
+        sandbox_key_status_label = QLabel(
+            "✓ Key configured  (leave blank to keep, or type a new key to replace)"
+            if sandbox_configured else "✗ No API key — required for detonation"
+        )
+        sandbox_key_status_label.setStyleSheet(
+            "color: #37864a; font-size: 11px;" if sandbox_configured
+            else "color: #c05000; font-size: 11px;"
+        )
+        self.sandbox_key_edit = QLineEdit()
+        self.sandbox_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sandbox_key_edit.setPlaceholderText(
+            "Leave blank to keep existing key" if sandbox_configured
+            else "Paste sandbox API key here"
+        )
+        sandbox_key_widget = _key_widget(sandbox_key_status_label, self.sandbox_key_edit)
+
+        sandbox_form.addRow("Provider", self.sandbox_provider_combo)
+        sandbox_form.addRow("API key", sandbox_key_widget)
+
+        # ── Scoring weights group ─────────────────────────────────────────
         scoring_group = QGroupBox("Scoring weights")
         scoring_form = QFormLayout(scoring_group)
         self._weight_spins: dict[str, QSpinBox] = {}
@@ -124,6 +183,7 @@ class SettingsDialog(QDialog):
             self._weight_spins[key] = spin
             scoring_form.addRow(label, spin)
 
+        # ── List groups ───────────────────────────────────────────────────
         keywords_group = QGroupBox("Suspicious URL keywords (comma-separated)")
         keywords_layout = QVBoxLayout(keywords_group)
         self.keywords_edit = QLineEdit(", ".join(settings.get("url_suspicious_keywords", [])))
@@ -157,6 +217,7 @@ class SettingsDialog(QDialog):
         brands_layout.addWidget(brands_text)
 
         layout.addWidget(keys_group)
+        layout.addWidget(sandbox_group)
         layout.addWidget(scoring_group)
         layout.addWidget(keywords_group)
         layout.addWidget(tlds_group)
@@ -178,6 +239,8 @@ class SettingsDialog(QDialog):
         outer_layout.addWidget(scroll)
         outer_layout.addWidget(buttons)
 
+    # ── Payload helpers ───────────────────────────────────────────────────────
+
     @staticmethod
     def _parse_csv(text: str) -> list[str]:
         return [item.strip() for item in text.split(",") if item.strip()]
@@ -198,11 +261,42 @@ class SettingsDialog(QDialog):
         return self._parse_csv(self.urgency_edit.text())
 
     def keys_payload(self) -> dict:
-        """Only includes a key when the user actually typed something --
-        leaving a field blank means 'leave unchanged', not 'clear it'."""
+        """Returns only the fields the user actually filled in.
+
+        Leaving a field blank means 'leave unchanged'.
+        Omitting the field from the returned dict = 'no change'.
+        """
         payload: dict[str, str] = {}
         if self.vt_key_edit.text():
             payload["virustotal_key"] = self.vt_key_edit.text()
         if self.abuse_key_edit.text():
             payload["abuseipdb_key"] = self.abuse_key_edit.text()
+        if self.shodan_key_edit.text():
+            payload["shodan_key"] = self.shodan_key_edit.text()
         return payload
+
+    def sandbox_payload(self) -> dict:
+        """Returns sandbox provider and key if they have been touched.
+
+        The provider combo always has a value so we always include it.
+        The key is only included when the user typed something.
+        """
+        payload: dict = {}
+        provider = self.sandbox_provider_combo.currentData() or ""
+        payload["sandbox_provider"] = provider or None
+        if self.sandbox_key_edit.text():
+            payload["sandbox_api_key"] = self.sandbox_key_edit.text()
+        return payload
+
+
+# ── Private helper ─────────────────────────────────────────────────────────────
+
+def _key_widget(status_label: QLabel, line_edit: QLineEdit) -> QWidget:
+    """Stack a status label above the key input in a compact widget."""
+    widget = QWidget()
+    layout = QVBoxLayout(widget)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(2)
+    layout.addWidget(status_label)
+    layout.addWidget(line_edit)
+    return widget
