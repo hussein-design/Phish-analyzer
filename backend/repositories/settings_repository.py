@@ -74,11 +74,13 @@ class SettingsRepository:
         *,
         set_vt: bool = False,
         set_abuse: bool = False,
+        set_shodan: bool = False,
+        set_sandbox: bool = False,
     ) -> AppSettingsRecord:
         """Persist all columns in a single atomic commit.
 
         Always writes the 6 non-key JSON columns.  Also writes the key columns
-        when set_vt / set_abuse are True respectively.
+        when the corresponding flag is True.
 
         This is the preferred method when saving settings and keys together,
         because it avoids the two-request chain that was the root cause of keys
@@ -98,6 +100,15 @@ class SettingsRepository:
         if set_abuse:
             cols.append("abuseipdb_key")
             logger.info("save_all: including abuseipdb_key (configured=%s)", bool(record.abuseipdb_key))
+        if set_shodan:
+            cols.append("shodan_key")
+            logger.info("save_all: including shodan_key (configured=%s)", bool(getattr(record, "shodan_key", None)))
+        if set_sandbox:
+            cols.extend(["sandbox_provider", "sandbox_api_key"])
+            logger.info(
+                "save_all: including sandbox settings, provider=%s",
+                getattr(record, "sandbox_provider", None),
+            )
 
         for col in cols:
             flag_modified(record, col)
@@ -112,9 +123,12 @@ class SettingsRepository:
         await self.session.refresh(record)
 
         logger.info(
-            "save_all committed: vt_key_configured=%s, abuse_key_configured=%s",
+            "save_all committed: vt_key_configured=%s, abuse_key_configured=%s, "
+            "shodan_key_configured=%s, sandbox_configured=%s",
             bool(record.virustotal_key),
             bool(record.abuseipdb_key),
+            bool(getattr(record, "shodan_key", None)),
+            bool(getattr(record, "sandbox_api_key", None)),
         )
         return record
 

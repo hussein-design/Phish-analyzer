@@ -63,6 +63,20 @@ class EmailAnalysis(Base):
     abuse_enrichment_status: Mapped[str | None] = mapped_column(String(16), default=None)
     abuse_enrichment_error: Mapped[str | None] = mapped_column(Text, default=None)
 
+    # Phase 2: Shodan enrichment status and results
+    shodan_enrichment_status: Mapped[str | None] = mapped_column(String(16), default=None)
+    shodan_enrichment_error: Mapped[str | None] = mapped_column(Text, default=None)
+    shodan_data: Mapped[dict | None] = mapped_column(JSON, default=None)
+
+    # Phase 5: Sandbox detonation results
+    sandbox_status: Mapped[str | None] = mapped_column(String(16), default=None)
+    sandbox_provider: Mapped[str | None] = mapped_column(String(32), default=None)
+    sandbox_verdict: Mapped[str | None] = mapped_column(String(32), default=None)
+    sandbox_score: Mapped[int | None] = mapped_column(Integer, default=None)
+    sandbox_report_url: Mapped[str | None] = mapped_column(Text, default=None)
+    sandbox_tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    sandbox_error: Mapped[str | None] = mapped_column(Text, default=None)
+
     abuse_score: Mapped[int | None] = mapped_column(Integer, default=None)
     abuse_total_reports: Mapped[int | None] = mapped_column(Integer, default=None)
     abuse_country: Mapped[str | None] = mapped_column(String(8), default=None)
@@ -72,6 +86,19 @@ class EmailAnalysis(Base):
         JSON, default=lambda: {"md5": [], "sha1": [], "sha256": []}
     )
     body_text: Mapped[str | None] = mapped_column(Text, default=None)
+
+    # ── Phase 1: MIME structure ────────────────────────────────────────────────
+    # List of MIME content-type strings for every part in the message,
+    # e.g. ["text/plain", "text/html", "application/pdf"].
+    mime_parts: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+    # ── Phase 1: Lure-category detection ─────────────────────────────────────
+    # Serialised list of {"category": str, "matched_keywords": [str]} dicts.
+    lure_categories: Mapped[list[dict]] = mapped_column(JSON, default=list)
+
+    # ── Phase 1: HTML anchor-text vs href mismatches ──────────────────────────
+    # Serialised list of {"display_text": str, "href": str, "reason": str}.
+    anchor_mismatches: Mapped[list[dict]] = mapped_column(JSON, default=list)
 
     score: Mapped[int | None] = mapped_column(Integer, default=None)
     verdict: Mapped[str | None] = mapped_column(String(16), default=None)

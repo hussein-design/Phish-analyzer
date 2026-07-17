@@ -77,6 +77,51 @@ Windows box when one isn't available.
 
 ## Known issue
 
-`config.yaml` (legacy CLI only) is committed to git with what look like real VirusTotal/AbuseIPDB API
+`config.yaml` (legacy CLI only) was previously committed to git with what look like real VirusTotal/AbuseIPDB API
 keys. Rotate them regardless of any refactor — they're in git history. The desktop app never reads
-this file.
+this file. `config.yaml` is now in `.gitignore` so it cannot be accidentally re-committed.
+
+## Security audit — completed 2026-07-18
+
+A full security review was performed and six issues were identified and fixed.  `security_test.py`
+covers all of them and can be run against a live backend instance for regression testing.
+
+| ID      | Severity | Issue                                                             | Status  |
+|---------|----------|-------------------------------------------------------------------|---------|
+| HIGH-01 | High     | Localhost-only middleware (defence-in-depth)                      | ✅ Fixed (pre-existing) |
+| HIGH-02 | High     | `_MAX_PENDING_ANALYSES` constant defined but never enforced       | ✅ Fixed |
+| HIGH-03 | High     | Path traversal via uploaded filename                              | ✅ Fixed (pre-existing) |
+| HIGH-04 | High     | `Content-Disposition` header injection in report download         | ✅ Fixed |
+| HIGH-05 | High     | `DELETE /analyses` (clear all) had no confirmation guard          | ✅ Fixed |
+| MED-01  | Medium   | SQL injection (ORM parameterised queries)                         | ✅ Fixed (pre-existing) |
+| MED-02  | Medium   | API keys exposed via `GET /settings`                              | ✅ Fixed (pre-existing) |
+| MED-03  | Medium   | Oversized body / resource exhaustion (`_MAX_BODY_TEXT_CHARS`)     | ✅ Fixed (pre-existing) |
+| MED-04  | Medium   | Malformed requests return 422 not 500                             | ✅ Fixed (pre-existing) |
+| MED-05  | Medium   | `re_enrich()` stored raw error strings without `_safe_error()`    | ✅ Fixed |
+
+### Fix details
+
+**HIGH-02 — Queue-depth guard (`_MAX_PENDING_ANALYSES`):**  
+`AnalysisService.submit_upload()` now checks `len(_in_flight_tasks) >= _MAX_PENDING_ANALYSES`
+before accepting a new upload and raises `InvalidEmlError` (HTTP 422) if the queue is full.
+Previously the constant was declared but never consulted, meaning unlimited 25 MB uploads could
+be queued, exhausting process memory.
+
+**HIGH-04 — Content-Disposition header injection:**  
+The `download_report` route in `backend/routes/analyses.py` now strips all control characters,
+double-quotes, and backslashes from the filename before embedding it in the `Content-Disposition`
+header value. A filename containing `"` or `\r\n` could have injected additional HTTP response
+headers or split the response.
+
+**HIGH-05 — DELETE /analyses confirmation guard:**  
+`DELETE /analyses` (clear-all) now requires `?confirm=true` as an explicit query parameter.
+Without it the endpoint returns HTTP 400. This prevents trivial accidental wipes and raises the
+bar against CSRF-like requests from a rogue local web page. The frontend `api_client.delete_all_emails()`
+was updated to pass `?confirm=true` (the user has already confirmed via a Qt dialog before this
+call is made).
+
+**MED-05 — `re_enrich()` error string sanitization:**  
+`re_enrich()` now passes all three provider error strings (`vt_error`, `abuse_error`, shodan error)
+through `_safe_error()` before storing them, consistent with the main `_run_pipeline()` path.
+Raw exception strings can contain API key fragments embedded in Authorization headers, absolute
+filesystem paths, or internal service addresses.

@@ -109,7 +109,11 @@ class ApiClient:
         resp.raise_for_status()
 
     def delete_all_emails(self) -> dict:
-        resp = self.session.delete(self._url("/analyses"), timeout=self.timeout)
+        # HIGH-05: backend now requires ?confirm=true as a guard against
+        # accidental / CSRF-triggered wipes. Always pass it here — the
+        # frontend already shows its own confirmation dialog before calling
+        # this method, so the intent is unambiguous.
+        resp = self.session.delete(self._url("/analyses"), params={"confirm": "true"}, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
 

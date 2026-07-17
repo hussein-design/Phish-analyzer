@@ -44,6 +44,9 @@ def compute_score(
     suspicious_tlds: list[str],
     url_shorteners: list[str],
     urgency_keywords: list[str],
+    # Phase 1 additions — optional so old callers don't break
+    lure_categories: list[dict] | None = None,
+    anchor_mismatches: list[dict] | None = None,
 ) -> dict:
     score = 0
     reasons: list[str] = []
@@ -67,6 +70,13 @@ def compute_score(
     pts_url_shortener = scoring_weights.get("url_shortener", 1)
     pts_double_ext = scoring_weights.get("attachment_double_extension", 4)
     pts_urgency = scoring_weights.get("body_urgency_keyword", 1)
+    pts_lure_category = scoring_weights.get("lure_category", 2)
+    pts_anchor_mismatch = scoring_weights.get("anchor_mismatch", 3)
+    pts_macro_enabled = scoring_weights.get("macro_enabled", 4)
+    pts_embedded_exe = scoring_weights.get("embedded_executable", 5)
+    pts_mime_mismatch = scoring_weights.get("mime_magic_mismatch", 3)
+    pts_vt_hash = scoring_weights.get("vt_hash_malicious_points", 5)
+    pts_redirect_suspicious = scoring_weights.get("redirect_suspicious", 3)
 
     from_addr = from_addr or ""
 
@@ -134,6 +144,7 @@ def compute_score(
     # indicator row reflects its own state), but each rule only contributes
     # its point value once per analysis, not once per matching URL.
     keyword_hit = ip_host_hit = shortener_hit = url_tld_hit = url_punycode_hit = None
+    redirect_suspicious_hit = None
 
     for u in urls:
         host = _url_host(u["url"])
@@ -158,6 +169,10 @@ def compute_score(
             u["is_punycode"] = True
             url_punycode_hit = url_punycode_hit or u["url"]
 
+        # Phase 4: redirect suspicious flag set by url_intelligence_service
+        if u.get("is_redirect_suspicious") and not redirect_suspicious_hit:
+            redirect_suspicious_hit = u["url"]
+
     if keyword_hit:
         score += pts_url_keyword
         reasons.append(f"URL contains suspicious keyword: {keyword_hit}")
@@ -173,6 +188,9 @@ def compute_score(
     if url_punycode_hit:
         score += pts_punycode
         reasons.append(f"URL uses punycode encoding (possible IDN homograph): {url_punycode_hit}")
+    if redirect_suspicious_hit:
+        score += pts_redirect_suspicious
+        reasons.append(f"Suspicious redirect chain detected: {redirect_suspicious_hit}")
 
     # Attachment checks -- same "flag every match, score once per rule" shape.
     exec_hit = None
@@ -200,6 +218,38 @@ def compute_score(
         score += pts_double_ext
         reasons.append(f"Attachment uses a disguised double extension: {double_ext_hit}")
 
+    # Phase 3: static attachment intelligence scoring
+    macro_hit = mime_mismatch_hit = embedded_exe_hit = None
+    vt_hash_hit = None
+
+    for att in attachments:
+        if att.get("is_macro_enabled") and not macro_hit:
+            macro_hit = att.get("filename", "unknown")
+        if att.get("mime_magic_mismatch") and not mime_mismatch_hit:
+            mime_mismatch_hit = att.get("filename", "unknown")
+        if att.get("has_embedded_executable") and not embedded_exe_hit:
+            embedded_exe_hit = att.get("filename", "unknown")
+        mal = att.get("vt_hash_malicious", 0) or 0
+        if mal > 0 and not vt_hash_hit:
+            vt_hash_hit = (att.get("filename", "unknown"), mal)
+
+    if macro_hit:
+        score += pts_macro_enabled
+        reasons.append(f"Macro-enabled Office document attached: {macro_hit}")
+    if embedded_exe_hit:
+        score += pts_embedded_exe
+        reasons.append(f"Embedded executable detected in attachment: {embedded_exe_hit}")
+    if mime_mismatch_hit:
+        score += pts_mime_mismatch
+        reasons.append(
+            f"MIME type magic-byte mismatch in attachment: {mime_mismatch_hit} "
+            "(declared type does not match actual file signature)"
+        )
+    if vt_hash_hit:
+        fn, mal = vt_hash_hit
+        score += pts_vt_hash
+        reasons.append(f"VirusTotal: attachment '{fn}' flagged malicious by {mal} engines")
+
     # VirusTotal-based scoring
     for u in urls:
         mal = u.get("vt_malicious", 0)
@@ -219,6 +269,29 @@ def compute_score(
     if urgency_found:
         score += pts_urgency
         reasons.append(f"Body contains urgency/pressure language: {', '.join(urgency_found)}")
+
+    # Phase 1: Lure-category scoring — each unique category fires once.
+    # High-confidence categories (exec impersonation) score more.
+    _HIGH_VALUE_LURES = {"exec_impersonation", "account_takeover"}
+    if lure_categories:
+        for lure in lure_categories:
+            cat = lure.get("category", "")
+            kws = lure.get("matched_keywords", [])
+            pts = pts_lure_category + (1 if cat in _HIGH_VALUE_LURES else 0)
+            score += pts
+            reasons.append(
+                f"Lure category '{cat}' detected — keywords: {', '.join(kws[:4])}"
+                + (" …" if len(kws) > 4 else "")
+            )
+
+    # Phase 1: Anchor text vs href mismatch — score once regardless of count.
+    if anchor_mismatches:
+        score += pts_anchor_mismatch
+        first = anchor_mismatches[0]
+        reasons.append(
+            f"Anchor text/href mismatch: {first.get('reason', 'display text differs from href')}"
+            + (f" (+{len(anchor_mismatches) - 1} more)" if len(anchor_mismatches) > 1 else "")
+        )
 
     if score >= 9:
         verdict = VERDICT_PHISHING

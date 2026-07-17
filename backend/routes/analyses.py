@@ -21,6 +21,7 @@ from shared.schemas import (
     EmailSummary,
     GlobalHashes,
     HeaderInfo,
+    ShodanResult,
     UploadAccepted,
     UrlIndicator as UrlIndicatorSchema,
 )
@@ -81,6 +82,11 @@ def _to_detail(a: EmailAnalysis) -> EmailDetail:
                 is_shortener=u.is_shortener,
                 is_suspicious_tld=u.is_suspicious_tld,
                 is_punycode=u.is_punycode,
+                expanded_url=getattr(u, "expanded_url", None),
+                page_title=getattr(u, "page_title", None),
+                redirect_count=getattr(u, "redirect_count", 0) or 0,
+                final_status_code=getattr(u, "final_status_code", None),
+                is_redirect_suspicious=getattr(u, "is_redirect_suspicious", False),
             )
             for u in a.urls
         ],
@@ -91,6 +97,14 @@ def _to_detail(a: EmailAnalysis) -> EmailDetail:
                 sha256=att.sha256,
                 is_executable_like=att.is_executable_like,
                 is_double_extension=att.is_double_extension,
+                vt_hash_malicious=getattr(att, "vt_hash_malicious", 0) or 0,
+                vt_hash_suspicious=getattr(att, "vt_hash_suspicious", 0) or 0,
+                vt_hash_status=getattr(att, "vt_hash_status", None),
+                is_macro_enabled=getattr(att, "is_macro_enabled", False),
+                has_embedded_executable=getattr(att, "has_embedded_executable", False),
+                is_archive=getattr(att, "is_archive", False),
+                mime_magic_mismatch=getattr(att, "mime_magic_mismatch", False),
+                file_metadata=getattr(att, "file_metadata", None),
             )
             for att in a.attachments
         ],
@@ -114,6 +128,23 @@ def _to_detail(a: EmailAnalysis) -> EmailDetail:
         vt_enrichment_error=a.vt_enrichment_error,
         abuse_enrichment_status=a.abuse_enrichment_status,
         abuse_enrichment_error=a.abuse_enrichment_error,
+        mime_parts=a.mime_parts or [],
+        lure_categories=a.lure_categories or [],
+        anchor_mismatches=a.anchor_mismatches or [],
+        # Phase 2 additions
+        shodan_result=(
+            ShodanResult(**(a.shodan_data or {}))
+            if a.shodan_data else None
+        ),
+        shodan_enrichment_status=getattr(a, "shodan_enrichment_status", None),
+        shodan_enrichment_error=getattr(a, "shodan_enrichment_error", None),
+        sandbox_status=getattr(a, "sandbox_status", None),
+        sandbox_provider=getattr(a, "sandbox_provider", None),
+        sandbox_verdict=getattr(a, "sandbox_verdict", None),
+        sandbox_score=getattr(a, "sandbox_score", None),
+        sandbox_report_url=getattr(a, "sandbox_report_url", None),
+        sandbox_tags=getattr(a, "sandbox_tags", None) or [],
+        sandbox_error=getattr(a, "sandbox_error", None),
     )
 
 
@@ -169,8 +200,25 @@ async def get_email(
 
 
 @router.delete("", status_code=200)
-async def clear_all_analyses(session: AsyncSession = Depends(get_session)) -> dict:
-    """Delete every analysis in the database and their stored .eml files."""
+async def clear_all_analyses(
+    session: AsyncSession = Depends(get_session),
+    confirm: bool = Query(default=False),
+) -> dict:
+    """Delete every analysis in the database and their stored .eml files.
+
+    HIGH-05: a bare DELETE with no body is trivial to trigger accidentally
+    (or via a CSRF-like request from a rogue local web page).  The caller
+    must pass ``?confirm=true`` explicitly; omitting it returns 400.
+    """
+    if not confirm:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This action permanently deletes all analyses. "
+                "Pass ?confirm=true to proceed."
+            ),
+        )
     count = await AnalysisRepository(session).delete_all()
     return {"deleted": count}
 
@@ -229,8 +277,16 @@ async def download_report(
     docx_bytes = report_service.build_docx_report(analysis)
     base_name = analysis.filename.rsplit(".", 1)[0] if analysis.filename else f"analysis-{analysis.id}"
     filename = f"{base_name}.docx"
+    # HIGH-04: sanitize the filename before embedding it in the Content-Disposition
+    # header to prevent header injection via double-quotes, newlines, or CR characters
+    # that could split the HTTP response or smuggle additional headers.
+    # RFC 6266 / RFC 5987: use the "filename*" (percent-encoded) parameter for
+    # arbitrary names; for the legacy "filename" parameter we must strip all
+    # characters that could break the quoted-string syntax.
+    import re as _re
+    safe_filename = _re.sub(r'[\x00-\x1f\x7f"\\]', "_", filename)
     return Response(
         content=docx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
     )

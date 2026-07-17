@@ -72,12 +72,15 @@ async def enrich_ip(ip: str | None, api_key: str | None) -> dict:
         }
         return {"status": "ok", "error": None, "data": result}
 
-    except httpx.TimeoutException as exc:
-        msg = f"AbuseIPDB request timed out: {exc}"
+    except httpx.TimeoutException:
+        # MED-02: use type name only — exception message may contain the full
+        # request URL, which could embed the API key in the Authorization header.
+        msg = "AbuseIPDB request timed out"
         logger.warning(msg)
         return {"status": "error", "error": msg, "data": None}
 
     except Exception as exc:
-        msg = f"AbuseIPDB lookup failed: {exc}"
+        # MED-02: log the full exception internally but only return the type
+        # name to callers so internal details don't leak.
         logger.exception("AbuseIPDB lookup failed for %s", ip)
-        return {"status": "error", "error": msg, "data": None}
+        return {"status": "error", "error": f"AbuseIPDB lookup failed: {type(exc).__name__}", "data": None}
