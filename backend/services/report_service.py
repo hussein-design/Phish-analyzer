@@ -403,7 +403,8 @@ def _section_headers(doc: Document, analysis: EmailAnalysis) -> None:
     if analysis.is_suspicious_sender_tld:
         rows.append(("⚠  Suspicious TLD",
                      f"TLD of '{analysis.from_domain}' is commonly abused in phishing"))
-    _kv_table(doc, rows)
+    # label_width=2.2 keeps all field names ("Return-Path domain") on one line
+    _kv_table(doc, rows, label_width=2.2, value_width=4.1)
 
     if analysis.header_issues:
         p = doc.add_paragraph()
@@ -451,59 +452,86 @@ def _section_urls(doc: Document, analysis: EmailAnalysis) -> None:
 
     vt_ran = analysis.vt_enrichment_status in ("ok", "no_data")
 
-    tbl = _data_table(doc,
-                      ["URL", "Final / Expanded URL", "Redirects", "VT Result", "Flags"],
-                      widths=[2.2, 2.2, 0.7, 0.8, 1.5])
+    # Determine whether any URL actually has a different expanded URL
+    has_expanded = any(
+        getattr(u, "expanded_url", None) and getattr(u, "expanded_url") != u.url
+        for u in analysis.urls
+    )
+
+    # Helper: truncate a URL to a readable length for the table cell
+    def _trunc(url: str, max_len: int = 55) -> str:
+        return url if len(url) <= max_len else url[:max_len] + "…"
+
+    if has_expanded:
+        headers = ["URL", "Expanded / Final URL", "Hops", "VT", "Flags"]
+        widths  = [2.6, 2.1, 0.5, 0.8, 1.4]
+    else:
+        headers = ["URL", "Hops", "VT", "Flags"]
+        widths  = [3.5, 0.5, 0.8, 1.6]
+
+    tbl = _data_table(doc, headers, widths=widths)
 
     for idx, u in enumerate(analysis.urls):
         flags = []
-        if u.is_suspicious_keyword:                         flags.append("suspicious keyword")
-        if u.is_ip_host:                                    flags.append("raw IP host")
+        if u.is_suspicious_keyword:                         flags.append("keyword")
+        if u.is_ip_host:                                    flags.append("IP host")
         if u.is_shortener:                                  flags.append("shortener")
-        if u.is_suspicious_tld:                             flags.append("suspicious TLD")
+        if u.is_suspicious_tld:                             flags.append("susp. TLD")
         if u.is_punycode:                                   flags.append("punycode")
         if getattr(u, "is_redirect_suspicious", False):     flags.append("⚠ redirect")
 
         vt_mal = u.vt_malicious or 0
         vt_sus = u.vt_suspicious or 0
         if vt_mal > 0:
-            vt_str = f"Malicious ({vt_mal})"
+            vt_str = f"⚠ {vt_mal} mal."
         elif vt_sus > 0:
-            vt_str = f"Suspicious ({vt_sus})"
+            vt_str = f"~ {vt_sus} sus."
         elif vt_ran:
-            vt_str = "Clean"
+            vt_str = "✓ clean"
         else:
             vt_str = "—"
 
-        expanded = getattr(u, "expanded_url", None) or ""
         redirects = str(getattr(u, "redirect_count", 0) or 0)
-        flag_str = ", ".join(flags) if flags else "—"
-        zebra = idx % 2 == 1
+        flag_str  = ", ".join(flags) if flags else "—"
+        zebra     = idx % 2 == 1
+
+        # Truncated display URL
+        url_display = _trunc(u.url)
+
+        if has_expanded:
+            exp = getattr(u, "expanded_url", None) or ""
+            # Only show expanded if it actually differs
+            exp_display = _trunc(exp) if exp and exp != u.url else "—"
+            values = [url_display, exp_display, redirects, vt_str, flag_str]
+        else:
+            values = [url_display, redirects, vt_str, flag_str]
 
         row = tbl.add_row()
-        for i, val in enumerate([u.url, expanded, redirects, vt_str, flag_str]):
+        for i, val in enumerate(values):
             p = row.cells[i].paragraphs[0]
             r = p.add_run(str(val) if val else "—")
-            r.font.size = Pt(9)
+            r.font.size = Pt(8.5)
             if zebra:
                 _set_cell_bg(row.cells[i], _HEX_ZEBRA)
 
+        vt_col = 3 if has_expanded else 2
+        flag_col = 4 if has_expanded else 3
         if vt_mal > 0:
-            _set_cell_bg(row.cells[3], "FFE0E0")
+            _set_cell_bg(row.cells[vt_col], "FFE0E0")
         elif vt_sus > 0:
-            _set_cell_bg(row.cells[3], _HEX_AMBER)
+            _set_cell_bg(row.cells[vt_col], _HEX_AMBER)
         if flags:
-            _set_cell_bg(row.cells[4], _HEX_AMBER)
+            _set_cell_bg(row.cells[flag_col], _HEX_AMBER)
 
     doc.add_paragraph()
 
-    # Page title column if any
+    # Page titles (only URLs that actually have one)
     titled = [u for u in analysis.urls if getattr(u, "page_title", None)]
     if titled:
         p = doc.add_paragraph()
         _run(p, "Page titles retrieved:", bold=True, size_pt=10)
         for u in titled:
-            _bullet(doc, f"{u.url}  →  {u.page_title}")
+            _bullet(doc, f"{_trunc(u.url, 70)}  →  {u.page_title}")
 
     if not vt_ran:
         vs = analysis.vt_enrichment_status
@@ -590,7 +618,7 @@ def _section_attachments(doc: Document, analysis: EmailAnalysis) -> None:
 def _section_intel(doc: Document, analysis: EmailAnalysis) -> None:
     _heading(doc, "6.  Threat Intelligence Enrichment")
 
-    # ── VirusTotal ────────────────────────────────────────────────────────
+    # ── VirusTotal — summary only (full per-URL results are in Section 4) ─
     p = doc.add_paragraph()
     _run(p, "VirusTotal — URL Scan", bold=True, colour=_NAVY, size_pt=11)
 
@@ -604,18 +632,22 @@ def _section_intel(doc: Document, analysis: EmailAnalysis) -> None:
         _note(doc, "Daily quota reached — results unavailable for this analysis.")
     elif vt_status == "error":
         _note(doc, f"Enrichment failed: {analysis.vt_enrichment_error or 'unknown error'}.")
-    elif vt_hits:
-        for u in vt_hits:
-            p2 = doc.add_paragraph(style="List Bullet")
-            _run(p2, u.url, size_pt=9.5)
-            _run(p2, f"  →  malicious={u.vt_malicious}, suspicious={u.vt_suspicious}, "
-                 f"harmless={u.vt_harmless}", colour=_RED, size_pt=9.5)
-    elif analysis.urls and vt_status == "ok":
-        _note(doc, f"All {len(analysis.urls)} URL(s) checked — no malicious detections.", colour=_GREEN)
     elif not analysis.urls:
         _note(doc, "No URLs found in this email — scan not performed.")
+    elif vt_hits:
+        # Summary line only — per-URL details already in Section 4
+        mal_count = sum(u.vt_malicious or 0 for u in vt_hits)
+        sus_count = sum(u.vt_suspicious or 0 for u in vt_hits)
+        p2 = doc.add_paragraph()
+        _run(p2, f"⚠  {len(vt_hits)} of {len(analysis.urls)} URL(s) flagged — "
+             f"{mal_count} malicious, {sus_count} suspicious detection(s). "
+             f"See Section 4 for per-URL breakdown.",
+             colour=_RED, size_pt=10)
     else:
-        _note(doc, "No VirusTotal results available.")
+        _note(doc,
+              f"All {len(analysis.urls)} URL(s) scanned — no malicious or suspicious "
+              f"detections. See Section 4 for the full URL table.",
+              colour=_GREEN)
 
     doc.add_paragraph()
 

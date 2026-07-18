@@ -101,7 +101,7 @@ def _build_narrative(detail: EmailDetail) -> str:
     sender = detail.from_addr or "an unknown sender"
     subject = detail.subject or "(no subject)"
     lines.append(
-        f"An email arrived from {sender} with the subject "{subject}". "
+        f"An email arrived from {sender} with the subject \"{subject}\". "
         f"It was submitted for analysis on "
         f"{detail.created_at.strftime('%Y-%m-%d at %H:%M UTC')}."
     )

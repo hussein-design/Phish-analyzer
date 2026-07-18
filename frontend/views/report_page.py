@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -35,7 +36,7 @@ from frontend.widgets.report_widgets import (
     muted_label,
 )
 from frontend.widgets.verdict_badge import VerdictBadge
-from shared.schemas import EmailDetail
+from shared.schemas import AnalysisStatus, EmailDetail
 
 
 # ── Small internal helpers ────────────────────────────────────────────────────
@@ -91,6 +92,7 @@ class ReportPage(QWidget):
         super().__init__(parent)
         self._theme = theme_manager
         self._analysis_id: int | None = None
+        self._current_status: AnalysisStatus | None = None
 
         # ── Top bar ───────────────────────────────────────────────────────
         back_btn = _secondary("← Back")
@@ -108,6 +110,12 @@ class ReportPage(QWidget):
         self._verdict_badge = VerdictBadge(None, theme_manager, self)
 
         self._score_ring = ScoreRing(self)
+
+        self._status_label = QLabel("")
+        self._status_label.setStyleSheet(
+            "color: #64748B; background: transparent; font-size: 12px; padding: 0 4px;"
+        )
+        self._status_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self._re_enrich_btn = _secondary("🔄 Re-enrich")
         self._re_enrich_btn.setToolTip(
@@ -127,6 +135,7 @@ class ReportPage(QWidget):
         top_bar.setSpacing(10)
         top_bar.addWidget(back_btn)
         top_bar.addWidget(self._title_label, 1)
+        top_bar.addWidget(self._status_label)
         top_bar.addWidget(self._verdict_badge)
         top_bar.addWidget(self._score_ring)
         top_bar.addWidget(self._re_enrich_btn)
@@ -160,6 +169,15 @@ class ReportPage(QWidget):
         self._tabs.addTab(_scroll(self._tab_intel),       "🛡  Intel")
         self._tabs.addTab(_scroll(self._tab_body),        "📄  Body")
 
+        # ── Loading overlay (shown when status is PENDING/RUNNING) ────────
+        self._loading_widget = self._build_loading_widget()
+
+        # ── Stacked content: index 0 = loading, index 1 = tabs ───────────
+        self._content_stack = QStackedWidget()
+        self._content_stack.addWidget(self._loading_widget)  # index 0
+        self._content_stack.addWidget(self._tabs)            # index 1
+        self._content_stack.setCurrentIndex(1)               # default: show tabs
+
         # ── Page layout ───────────────────────────────────────────────────
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -171,7 +189,7 @@ class ReportPage(QWidget):
         divider.setStyleSheet("color:#E2E8F0; background:#E2E8F0; margin: 10px 0 0 0;")
         divider.setFixedHeight(1)
         root.addWidget(divider)
-        root.addWidget(self._tabs, 1)
+        root.addWidget(self._content_stack, 1)
 
         # ── Persistent section widgets (populated in display()) ───────────
         self._build_section_widgets()
@@ -189,6 +207,43 @@ class ReportPage(QWidget):
     def _insert(self, layout: QVBoxLayout, widget: QWidget) -> None:
         """Insert before the trailing stretch."""
         layout.insertWidget(layout.count() - 1, widget)
+
+    @staticmethod
+    def _build_loading_widget() -> QWidget:
+        """Centered loading message shown while analysis is PENDING/RUNNING."""
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        lyt = QVBoxLayout(container)
+        lyt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        spinner_lbl = QLabel("⏳")
+        spinner_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        spinner_lbl.setStyleSheet("font-size: 48px; background: transparent; border: none;")
+
+        msg_lbl = QLabel("Analysis in progress…")
+        msg_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        msg_font = QFont()
+        msg_font.setPointSize(14)
+        msg_font.setWeight(QFont.Weight.DemiBold)
+        msg_lbl.setFont(msg_font)
+        msg_lbl.setStyleSheet("background: transparent; border: none; color: #64748B;")
+
+        sub_lbl = QLabel("Results will appear automatically when the analysis is complete.")
+        sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub_lbl.setWordWrap(True)
+        sub_lbl.setStyleSheet(
+            "background: transparent; border: none; "
+            "color: #94A3B8; font-size: 12px;"
+        )
+
+        lyt.addStretch(1)
+        lyt.addWidget(spinner_lbl)
+        lyt.addSpacing(12)
+        lyt.addWidget(msg_lbl)
+        lyt.addSpacing(6)
+        lyt.addWidget(sub_lbl)
+        lyt.addStretch(1)
+        return container
 
     # ── Section widget construction ───────────────────────────────────────────
 
@@ -317,8 +372,62 @@ class ReportPage(QWidget):
         self._re_enrich_btn.setEnabled(True)
         self._re_enrich_btn.setText("🔄 Re-enrich")
 
-    # ── display() — populated in the next part ────────────────────────────────
+    # ── Status helpers ────────────────────────────────────────────────────────
+
+    def update_status(self, status) -> None:
+        """Update the status label without a full display() call (used by polling ticks)."""
+        self._current_status = status
+        _status_val = status.value if hasattr(status, "value") else str(status)
+        if _status_val in ("PENDING", "RUNNING"):
+            dots = "." * ((getattr(self, "_dot_count", 0) % 3) + 1)
+            self._dot_count = getattr(self, "_dot_count", 0) + 1
+            self._status_label.setText(f"⏳ Analyzing{dots}")
+            # Show loading view when no results yet
+            self._content_stack.setCurrentIndex(0)
+            self._re_enrich_btn.setEnabled(False)
+            self._re_enrich_btn.setToolTip("Cannot re-enrich while analysis is in progress.")
+        elif _status_val == "FAILED":
+            self._status_label.setText("✗ Failed")
+            self._content_stack.setCurrentIndex(1)
+            self.set_re_enrich_idle()
+        else:
+            self._status_label.setText("")
+            self._content_stack.setCurrentIndex(1)
+            self.set_re_enrich_idle()
+
+    # ── display() ─────────────────────────────────────────────────────────────
 
     def display(self, detail: EmailDetail) -> None:
+        """Populate all cards with data from `detail`."""
+        self._analysis_id = detail.id
+        _status_val = detail.status.value if detail.status else ""
+
+        # Update top-bar widgets
+        self._title_label.setText(
+            f"{detail.filename}  —  {detail.subject or '(no subject)'}"
+        )
+        self._verdict_badge.set_verdict(
+            detail.verdict.value if detail.verdict else None
+        )
+        self._score_ring.set_score(
+            detail.score, detail.verdict.value if detail.verdict else None
+        )
+
+        if _status_val in ("PENDING", "RUNNING"):
+            # Show loading screen — no card data available yet
+            self.update_status(detail.status)
+            # Still set the title so users know which analysis this is
+            return
+
+        # Completed (DONE or FAILED) — show the tabs
+        self._content_stack.setCurrentIndex(1)
+        self._status_label.setText("✗ Failed" if _status_val == "FAILED" else "")
+        # Re-enrich only makes sense on completed analyses
+        self._re_enrich_btn.setEnabled(True)
+        self._re_enrich_btn.setToolTip(
+            "Re-run VirusTotal, AbuseIPDB and Shodan with the keys currently in Settings."
+        )
+        self._re_enrich_btn.setText("🔄 Re-enrich")
+
         from frontend.views._report_display import populate
         populate(self, detail)
