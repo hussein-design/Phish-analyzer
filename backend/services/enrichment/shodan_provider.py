@@ -35,6 +35,8 @@ import logging
 
 import httpx
 
+from backend.services.enrichment.cache import enrichment_cache
+
 logger = logging.getLogger(__name__)
 
 _INTERNETDB_URL = "https://internetdb.shodan.io/{ip}"
@@ -60,6 +62,12 @@ async def enrich_ip(ip: str | None, api_key: str | None) -> dict:
     # Reject obviously private / loopback ranges — not useful to query.
     if _is_private_ip(ip):
         return {"status": "no_data", "error": "Private/reserved IP — skipped", "data": None}
+
+    # ── Cache check ───────────────────────────────────────────────────────────
+    cached = await enrichment_cache.get("shodan", ip)
+    if cached is not None:
+        logger.debug("Shodan cache hit: %s", ip)
+        return cached  # type: ignore[return-value]
 
     data: dict = {
         "ip":        ip,
@@ -159,11 +167,14 @@ async def enrich_ip(ip: str | None, api_key: str | None) -> dict:
         data["tags"], data["org"], data["asn"],
     ])
 
-    return {
+    result = {
         "status": "ok" if has_data else "no_data",
         "error": None,
         "data": data if has_data else None,
     }
+    # Cache both ok and no_data results — both are valid stable answers for this IP
+    await enrichment_cache.set("shodan", ip, result)
+    return result
 
 
 def _is_private_ip(ip: str) -> bool:

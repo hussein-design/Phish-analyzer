@@ -25,6 +25,8 @@ class AppSettingsRecord(Base):
     virustotal_key: Mapped[str | None] = mapped_column(String(255), default=None)
     abuseipdb_key: Mapped[str | None] = mapped_column(String(255), default=None)
     shodan_key: Mapped[str | None] = mapped_column(String(255), default=None)
+    # Phase 1 dynamic analysis: urlscan.io API key
+    urlscan_key: Mapped[str | None] = mapped_column(String(255), default=None)
     # Phase 5: sandbox provider settings
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), default=None)
     sandbox_api_key: Mapped[str | None] = mapped_column(String(255), default=None)

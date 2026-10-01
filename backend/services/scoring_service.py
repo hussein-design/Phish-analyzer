@@ -47,6 +47,9 @@ def compute_score(
     # Phase 1 additions — optional so old callers don't break
     lure_categories: list[dict] | None = None,
     anchor_mismatches: list[dict] | None = None,
+    # Phase 1 dynamic analysis additions — optional; None means "not run"
+    url_detonation_result: dict | None = None,
+    attachment_detonation_result: dict | None = None,
 ) -> dict:
     score = 0
     reasons: list[str] = []
@@ -77,6 +80,11 @@ def compute_score(
     pts_mime_mismatch = scoring_weights.get("mime_magic_mismatch", 3)
     pts_vt_hash = scoring_weights.get("vt_hash_malicious_points", 5)
     pts_redirect_suspicious = scoring_weights.get("redirect_suspicious", 3)
+    # Phase 1 dynamic analysis weights
+    pts_urlscan_malicious   = scoring_weights.get("urlscan_malicious", 4)
+    pts_urlscan_suspicious  = scoring_weights.get("urlscan_suspicious", 2)
+    pts_dyn_att_malicious   = scoring_weights.get("dynamic_attachment_malicious", 5)
+    pts_dyn_att_suspicious  = scoring_weights.get("dynamic_attachment_suspicious", 3)
 
     from_addr = from_addr or ""
 
@@ -301,6 +309,66 @@ def compute_score(
             + (f" (+{len(anchor_mismatches) - 1} more)" if len(anchor_mismatches) > 1 else "")
         )
 
+    # ── Static sub-score is everything computed above ─────────────────────────
+    static_score = score
+    static_reasons = list(reasons)
+
+    # ── Phase 1 dynamic analysis scoring ─────────────────────────────────────
+    # Dynamic signals are scored separately and added to the total.  The split
+    # is preserved in the return dict so callers can show a clear breakdown.
+    dynamic_score = 0
+    dynamic_reasons: list[str] = []
+
+    # URL detonation (urlscan.io)
+    if url_detonation_result and url_detonation_result.get("status") == "done":
+        ud_verdict = (url_detonation_result.get("verdict") or "").lower()
+        ud_score   = url_detonation_result.get("score")
+        ud_url     = url_detonation_result.get("final_url") or "submitted URL"
+
+        if ud_verdict == "malicious" or url_detonation_result.get("malicious"):
+            dynamic_score += pts_urlscan_malicious
+            dynamic_reasons.append(
+                f"urlscan.io: URL detonation verdict malicious "
+                f"(score={ud_score}) — {ud_url}"
+            )
+        elif ud_verdict == "suspicious":
+            dynamic_score += pts_urlscan_suspicious
+            dynamic_reasons.append(
+                f"urlscan.io: URL detonation verdict suspicious "
+                f"(score={ud_score}) — {ud_url}"
+            )
+
+    # Attachment detonation (Hybrid Analysis / Any.run behavioral report)
+    if attachment_detonation_result and attachment_detonation_result.get("status") == "done":
+        ad_verdict = (attachment_detonation_result.get("verdict") or "").lower()
+        ad_score   = attachment_detonation_result.get("score")
+        ad_procs   = attachment_detonation_result.get("processes") or []
+        ad_net     = attachment_detonation_result.get("network_calls") or []
+
+        detail_parts: list[str] = []
+        if ad_procs:
+            detail_parts.append(f"processes: {', '.join(ad_procs[:3])}")
+        if ad_net:
+            detail_parts.append(f"network: {', '.join(ad_net[:3])}")
+        detail = "; ".join(detail_parts)
+
+        if ad_verdict == "malicious":
+            dynamic_score += pts_dyn_att_malicious
+            dynamic_reasons.append(
+                f"Sandbox detonation verdict malicious (score={ad_score})"
+                + (f" — {detail}" if detail else "")
+            )
+        elif ad_verdict in ("suspicious",):
+            dynamic_score += pts_dyn_att_suspicious
+            dynamic_reasons.append(
+                f"Sandbox detonation verdict suspicious (score={ad_score})"
+                + (f" — {detail}" if detail else "")
+            )
+
+    # Merge dynamic signals into the combined totals
+    score += dynamic_score
+    reasons.extend(dynamic_reasons)
+
     if score >= 9:
         verdict = VERDICT_PHISHING
     elif score >= 5:
@@ -319,4 +387,9 @@ def compute_score(
             "is_suspicious_sender_tld": is_suspicious_sender_tld,
         },
         "urgency_keywords_found": urgency_found,
+        # Static vs dynamic contribution (Phase 1 dynamic analysis)
+        "static_score":    static_score,
+        "static_reasons":  static_reasons,
+        "dynamic_score":   dynamic_score,
+        "dynamic_reasons": dynamic_reasons,
     }

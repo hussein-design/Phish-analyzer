@@ -77,6 +77,25 @@ class EmailAnalysis(Base):
     sandbox_tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     sandbox_error: Mapped[str | None] = mapped_column(Text, default=None)
 
+    # Phase 1 dynamic analysis: urlscan.io URL detonation
+    urlscan_status: Mapped[str | None] = mapped_column(String(16), default=None)
+    urlscan_error: Mapped[str | None] = mapped_column(Text, default=None)
+    urlscan_screenshot_url: Mapped[str | None] = mapped_column(Text, default=None)
+    urlscan_verdict: Mapped[str | None] = mapped_column(String(32), default=None)
+    urlscan_redirect_chain: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+    # Phase 1 dynamic analysis: attachment behavioral detonation
+    dynamic_attachment_status: Mapped[str | None] = mapped_column(String(16), default=None)
+    dynamic_attachment_verdict: Mapped[str | None] = mapped_column(String(32), default=None)
+    dynamic_attachment_score: Mapped[int | None] = mapped_column(Integer, default=None)
+    dynamic_attachment_report_url: Mapped[str | None] = mapped_column(Text, default=None)
+    dynamic_attachment_tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    dynamic_attachment_error: Mapped[str | None] = mapped_column(Text, default=None)
+
+    # Phase 1 dynamic analysis: static vs dynamic score split
+    static_score: Mapped[int | None] = mapped_column(Integer, default=None)
+    dynamic_score: Mapped[int | None] = mapped_column(Integer, default=None)
+
     abuse_score: Mapped[int | None] = mapped_column(Integer, default=None)
     abuse_total_reports: Mapped[int | None] = mapped_column(Integer, default=None)
     abuse_country: Mapped[str | None] = mapped_column(String(8), default=None)

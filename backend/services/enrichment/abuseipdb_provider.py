@@ -14,6 +14,8 @@ import logging
 
 import httpx
 
+from backend.services.enrichment.cache import enrichment_cache
+
 logger = logging.getLogger(__name__)
 
 _ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check"
@@ -40,6 +42,12 @@ async def enrich_ip(ip: str | None, api_key: str | None) -> dict:
 
     if not ip:
         return {"status": "no_data", "error": None, "data": None}
+
+    # ── Cache check ───────────────────────────────────────────────────────────
+    cached = await enrichment_cache.get("abuseipdb", ip)
+    if cached is not None:
+        logger.debug("AbuseIPDB cache hit: %s", ip)
+        return cached  # type: ignore[return-value]
 
     headers = {"Key": api_key, "Accept": "application/json"}
     params = {"ipAddress": ip, "maxAgeInDays": "90"}
@@ -70,7 +78,9 @@ async def enrich_ip(ip: str | None, api_key: str | None) -> dict:
             "country_code":  payload.get("countryCode"),
             "isp":           payload.get("isp"),
         }
-        return {"status": "ok", "error": None, "data": result}
+        full_result = {"status": "ok", "error": None, "data": result}
+        await enrichment_cache.set("abuseipdb", ip, full_result)
+        return full_result
 
     except httpx.TimeoutException:
         # MED-02: use type name only — exception message may contain the full

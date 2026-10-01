@@ -145,6 +145,22 @@ def _to_detail(a: EmailAnalysis) -> EmailDetail:
         sandbox_report_url=getattr(a, "sandbox_report_url", None),
         sandbox_tags=getattr(a, "sandbox_tags", None) or [],
         sandbox_error=getattr(a, "sandbox_error", None),
+        # Phase 1 dynamic analysis: urlscan.io URL detonation
+        urlscan_status=getattr(a, "urlscan_status", None),
+        urlscan_error=getattr(a, "urlscan_error", None),
+        urlscan_screenshot_url=getattr(a, "urlscan_screenshot_url", None),
+        urlscan_verdict=getattr(a, "urlscan_verdict", None),
+        urlscan_redirect_chain=getattr(a, "urlscan_redirect_chain", None) or [],
+        # Phase 1 dynamic analysis: attachment behavioral detonation
+        dynamic_attachment_status=getattr(a, "dynamic_attachment_status", None),
+        dynamic_attachment_verdict=getattr(a, "dynamic_attachment_verdict", None),
+        dynamic_attachment_score=getattr(a, "dynamic_attachment_score", None),
+        dynamic_attachment_report_url=getattr(a, "dynamic_attachment_report_url", None),
+        dynamic_attachment_tags=getattr(a, "dynamic_attachment_tags", None) or [],
+        dynamic_attachment_error=getattr(a, "dynamic_attachment_error", None),
+        # Phase 1 dynamic analysis: static vs dynamic score split
+        static_score=getattr(a, "static_score", None),
+        dynamic_score=getattr(a, "dynamic_score", None),
     )
 
 

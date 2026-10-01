@@ -19,6 +19,8 @@ import logging
 
 import vt
 
+from backend.services.enrichment.cache import enrichment_cache
+
 logger = logging.getLogger(__name__)
 
 # VT free tier allows 4 requests/minute; cap concurrent lookups accordingly.
@@ -95,23 +97,38 @@ async def enrich_urls(urls: list[str], api_key: str | None) -> dict:
     if not urls:
         return {"status": "no_data", "error": None, "results": {}}
 
+    # ── Cache check: serve already-seen URLs from cache ───────────────────────
+    cached_results: dict[str, dict] = {}
+    uncached_urls: list[str] = []
+    for url in urls:
+        hit = await enrichment_cache.get("virustotal_url", url)
+        if hit is not None:
+            cached_results[url] = hit  # type: ignore[assignment]
+            logger.debug("VT URL cache hit: %s", url)
+        else:
+            uncached_urls.append(url)
+
+    if not uncached_urls:
+        # All URLs served from cache
+        return {"status": "ok", "error": None, "results": cached_results}
+
     try:
         async with vt.Client(api_key) as client:
             pairs = await asyncio.gather(
-                *(_lookup_one_async(client, u) for u in urls),
+                *(_lookup_one_async(client, u) for u in uncached_urls),
                 return_exceptions=True,
             )
     except vt.error.APIError as exc:
         if _is_quota_error(exc):
             logger.warning("VirusTotal rate limit / quota exceeded: %s", exc)
-            return {"status": "rate_limit", "error": str(exc), "results": {}}
+            return {"status": "rate_limit", "error": str(exc), "results": cached_results}
         logger.exception("VirusTotal client initialisation failed")
-        return {"status": "error", "error": str(exc), "results": {}}
+        return {"status": "error", "error": str(exc), "results": cached_results}
     except Exception as exc:
         logger.exception("VirusTotal client initialisation failed")
-        return {"status": "error", "error": str(exc), "results": {}}
+        return {"status": "error", "error": str(exc), "results": cached_results}
 
-    results: dict[str, dict] = {}
+    results: dict[str, dict] = dict(cached_results)
     last_error: str | None = None
 
     for pair in pairs:
@@ -124,6 +141,8 @@ async def enrich_urls(urls: list[str], api_key: str | None) -> dict:
             continue
         url, stats = pair
         results[url] = stats
+        # Cache the per-URL result so future analyses reuse it
+        await enrichment_cache.set("virustotal_url", url, stats)
 
     if not results and last_error:
         return {"status": "error", "error": last_error, "results": {}}
@@ -174,20 +193,34 @@ async def enrich_hashes(sha256_list: list[str], api_key: str | None) -> dict:
     if not hashes:
         return {"status": "no_data", "error": None, "results": {}}
 
+    # ── Cache check ───────────────────────────────────────────────────────────
+    cached_results: dict[str, dict] = {}
+    uncached_hashes: list[str] = []
+    for h in hashes:
+        hit = await enrichment_cache.get("virustotal_hash", h)
+        if hit is not None:
+            cached_results[h] = hit  # type: ignore[assignment]
+            logger.debug("VT hash cache hit: %s", h[:16])
+        else:
+            uncached_hashes.append(h)
+
+    if not uncached_hashes:
+        return {"status": "ok", "error": None, "results": cached_results}
+
     try:
         async with vt.Client(api_key) as client:
             pairs = await asyncio.gather(
-                *(_lookup_hash_async(client, h) for h in hashes),
+                *(_lookup_hash_async(client, h) for h in uncached_hashes),
                 return_exceptions=True,
             )
     except vt.error.APIError as exc:
         if _is_quota_error(exc):
-            return {"status": "rate_limit", "error": str(exc), "results": {}}
-        return {"status": "error", "error": str(exc), "results": {}}
+            return {"status": "rate_limit", "error": str(exc), "results": cached_results}
+        return {"status": "error", "error": str(exc), "results": cached_results}
     except Exception as exc:
-        return {"status": "error", "error": str(exc), "results": {}}
+        return {"status": "error", "error": str(exc), "results": cached_results}
 
-    results: dict[str, dict] = {}
+    results: dict[str, dict] = dict(cached_results)
     last_error: str | None = None
 
     for pair in pairs:
@@ -198,6 +231,7 @@ async def enrich_hashes(sha256_list: list[str], api_key: str | None) -> dict:
             continue
         sha256, stats = pair
         results[sha256] = stats
+        await enrichment_cache.set("virustotal_hash", sha256, stats)
 
     if not results and last_error:
         return {"status": "error", "error": last_error, "results": {}}

@@ -76,6 +76,7 @@ class SettingsRepository:
         set_abuse: bool = False,
         set_shodan: bool = False,
         set_sandbox: bool = False,
+        set_urlscan: bool = False,
     ) -> AppSettingsRecord:
         """Persist all columns in a single atomic commit.
 
@@ -109,6 +110,12 @@ class SettingsRepository:
                 "save_all: including sandbox settings, provider=%s",
                 getattr(record, "sandbox_provider", None),
             )
+        if set_urlscan:
+            cols.append("urlscan_key")
+            logger.info(
+                "save_all: including urlscan_key (configured=%s)",
+                bool(getattr(record, "urlscan_key", None)),
+            )
 
         for col in cols:
             flag_modified(record, col)
@@ -124,11 +131,12 @@ class SettingsRepository:
 
         logger.info(
             "save_all committed: vt_key_configured=%s, abuse_key_configured=%s, "
-            "shodan_key_configured=%s, sandbox_configured=%s",
+            "shodan_key_configured=%s, sandbox_configured=%s, urlscan_key_configured=%s",
             bool(record.virustotal_key),
             bool(record.abuseipdb_key),
             bool(getattr(record, "shodan_key", None)),
             bool(getattr(record, "sandbox_api_key", None)),
+            bool(getattr(record, "urlscan_key", None)),
         )
         return record
 

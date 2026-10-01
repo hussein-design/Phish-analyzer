@@ -270,9 +270,14 @@ The app works fully offline with no API keys. The following services add richer 
 | [VirusTotal](https://www.virustotal.com/gui/join-us) | URL scan (70+ AV engines) + file hash reputation | 500 req/day |
 | [AbuseIPDB](https://www.abuseipdb.com/register) | Sender IP abuse reputation | 1 000 req/day |
 | [Shodan](https://account.shodan.io/register) | IP open ports, CVEs, tags | Paid (InternetDB free fallback built-in) |
+| [urlscan.io](https://urlscan.io/user/signup) | URL detonation — screenshot, redirect chain, page title, malicious verdict | 100 public scans/day |
 
 Enter keys in **⚙ Settings → API Keys**. Keys are stored in the local SQLite database — never
 transmitted anywhere except to the respective API service.
+
+All external API responses are cached in a persistent SQLite table (same DB file as the analysis
+store) so repeated analyses of the same indicators — including after an app restart — do not consume
+extra API quota. TTLs: 1 h for VT/AbuseIPDB/Shodan, 4 h for urlscan.io.
 
 ---
 
@@ -314,7 +319,12 @@ extraction). Wrap with Inno Setup (`installer.iss`) for a single-file installer.
 
 ## Phase 0 — bug fixes (2026-10-01)
 
-A full code audit was performed after the initial security review. The following bugs were found and fixed. A regression test for each lives in `tests/test_phase0_regression.py` (37 tests, all passing).
+A full code audit was performed after the initial security review. **15 bugs were identified**
+(BUG-01 through BUG-13, BUG-17, BUG-18 — IDs 14–16 were not assigned during this audit).
+**13 were fixed**; 2 were deliberately deferred as low-severity (BUG-09, BUG-11, documented
+below). The commit message for this work reads "15 bugs fixed" — that is imprecise; the correct
+statement is 15 found, 13 fixed, 2 deferred. A regression test for each *fixed* bug lives in
+`tests/test_phase0_regression.py` (37 tests, all passing).
 
 | ID | Severity | File | Issue | Fix |
 |---|---|---|---|---|
@@ -339,6 +349,91 @@ Run the regression tests:
 ```bash
 pytest tests/test_phase0_regression.py -v
 ```
+
+---
+
+## Phase 1 — Dynamic analysis (2026-10-01)
+
+URL and attachment detonation via two optional providers. All new fields are optional — the tool
+works with no new keys configured.
+
+### urlscan.io URL detonation
+
+Configure `URLSCAN_API_KEY` in `.env` (first-run seed) or enter the key in **⚙ Settings → API Keys**.
+
+| Field in `.env` | Settings key | Purpose |
+|---|---|---|
+| `URLSCAN_API_KEY` | urlscan_key | urlscan.io API key for URL detonation |
+
+When configured, the most suspicious URL from each email is submitted to urlscan.io for detonation.
+The analysis waits up to **120 seconds** for the scan to complete (outer pipeline cap: 135 s), then
+stores:
+
+- Screenshot URL (`urlscan_screenshot_url`)
+- Redirect chain observed during detonation (`urlscan_redirect_chain`)
+- Final landing-page URL and title
+- Verdict (`malicious` / `suspicious` / `benign`)
+- Score contribution: +4 pts (malicious), +2 pts (suspicious)
+
+### Hybrid Analysis (Falcon Sandbox) attachment detonation
+
+Configure via **⚙ Settings → Sandbox** — set provider to `hybrid_analysis` and enter the API key.
+
+The existing Any.run / Hybrid Analysis sandbox integration (Phase 5) was extended to use Hybrid
+Analysis's full `/submit/file` endpoint (Windows 10 64-bit environment) instead of quick-scan,
+with polling of `/report/{job_id}/summary` for behavioral data:
+
+- Spawned process names
+- Network contacts (hosts/domains)
+- Extracted IOCs (dropped files, indicators)
+- Score contribution: +5 pts (malicious), +3 pts (suspicious)
+
+### Static vs dynamic score split
+
+The final verdict now shows two separate sub-scores:
+
+- `static_score` — headers, auth, URL heuristics, VT, AbuseIPDB, static attachment analysis
+- `dynamic_score` — urlscan detonation + sandbox detonation results only
+
+Both are stored in the DB and returned in `GET /analyses/{id}`.
+
+### New migration
+
+Run after upgrading:
+
+```bash
+alembic upgrade head
+```
+
+Migration `d1e2f3a4b5c6` adds 13 new columns to `email_analyses` and `urlscan_key` to `app_settings`.
+
+### Response caching
+
+All external API calls are cached in a persistent SQLite table (`enrichment_cache`) in the same
+database file as the analysis store. Cache entries survive app restarts — re-scanning a previously
+seen URL, IP, or file hash within the TTL window makes zero API calls.
+
+| Provider | Namespace | TTL |
+|---|---|---|
+| VirusTotal URLs | `virustotal_url` | 3 600 s (1 h) |
+| VirusTotal hashes | `virustotal_hash` | 3 600 s (1 h) |
+| AbuseIPDB | `abuseipdb` | 3 600 s (1 h) |
+| Shodan | `shodan` | 3 600 s (1 h) |
+| urlscan.io | `urlscan` | 14 400 s (4 h) |
+| Hybrid Analysis | `hybrid_analysis` | 14 400 s (4 h) |
+
+The cache uses a two-layer design: an in-memory L1 (monotonic TTL, no I/O) in front of the
+SQLite L2 (wall-clock TTL, survives restarts). A miss in L1 falls through to L2 and repopulates
+L1. Failed DB writes are non-fatal — the in-memory entry remains valid for the current session.
+TTL defaults are defined in `backend/services/enrichment/cache.py` and can be overridden per call.
+
+Run the Phase 1 tests:
+
+```bash
+pytest tests/test_phase1_dynamic_analysis.py -v
+```
+
+Expected: **47 passed**
 
 ---
 

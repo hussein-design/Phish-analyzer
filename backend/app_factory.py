@@ -15,6 +15,7 @@ from backend.database.session import create_engine_and_sessionmaker
 from backend.routes import analyses, health
 from backend.routes import settings as settings_routes
 from backend.services.analysis_service import AnalysisService
+from backend.services.enrichment.cache import enrichment_cache
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +71,15 @@ def create_app() -> FastAPI:
             abuseipdb_key_env=app_settings.abuseipdb_api_key,
         )
 
+        # Initialise the persistent enrichment cache — uses the same SQLite
+        # file as the main DB so no extra file or config is needed.
+        from shared.paths import db_path as _db_path
+        await enrichment_cache.init_cache(_db_path())
+
         logger.info("Backend startup complete (db=%s)", app_settings.async_database_url())
         yield
 
+        await enrichment_cache.close()
         await engine.dispose()
         logger.info("Backend shutdown complete")
 

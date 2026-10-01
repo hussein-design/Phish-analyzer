@@ -159,6 +159,22 @@ class EmailDetail(EmailSummary):
     sandbox_report_url: str | None = None
     sandbox_tags: list[str] = []
     sandbox_error: str | None = None
+    # Phase 1 dynamic analysis: urlscan.io URL detonation
+    urlscan_status: str | None = None
+    urlscan_error: str | None = None
+    urlscan_screenshot_url: str | None = None
+    urlscan_verdict: str | None = None
+    urlscan_redirect_chain: list[str] = []
+    # Phase 1 dynamic analysis: attachment behavioral detonation
+    dynamic_attachment_status: str | None = None
+    dynamic_attachment_verdict: str | None = None
+    dynamic_attachment_score: int | None = None
+    dynamic_attachment_report_url: str | None = None
+    dynamic_attachment_tags: list[str] = []
+    dynamic_attachment_error: str | None = None
+    # Phase 1 dynamic analysis: static vs dynamic score split
+    static_score: int | None = None
+    dynamic_score: int | None = None
 
 
 class UploadAccepted(BaseModel):
@@ -204,6 +220,11 @@ class ScoringWeights(BaseModel):
     embedded_executable: int = 5
     mime_magic_mismatch: int = 3
     vt_hash_malicious_points: int = 5
+    # Phase 1 dynamic analysis signals
+    urlscan_malicious: int = 4
+    urlscan_suspicious: int = 2
+    dynamic_attachment_malicious: int = 5
+    dynamic_attachment_suspicious: int = 3
 
 
 class SettingsRead(BaseModel):
@@ -218,6 +239,8 @@ class SettingsRead(BaseModel):
     shodan_key_configured: bool = False
     sandbox_provider: str | None = None
     sandbox_key_configured: bool = False
+    # Phase 1 dynamic analysis
+    urlscan_key_configured: bool = False
 
 
 class SettingsUpdate(BaseModel):
@@ -242,6 +265,8 @@ class SettingsUpdate(BaseModel):
     virustotal_key: str | None = Field(default=None, max_length=255)
     abuseipdb_key: str | None = Field(default=None, max_length=255)
     shodan_key: str | None = Field(default=None, max_length=255)
+    # Phase 1 dynamic analysis
+    urlscan_key: str | None = Field(default=None, max_length=255)
     # Phase 5: sandbox
     sandbox_provider: str | None = Field(default=None, max_length=64)
     sandbox_api_key: str | None = Field(default=None, max_length=255)

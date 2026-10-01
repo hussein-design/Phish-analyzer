@@ -27,6 +27,7 @@ def _to_read(record: AppSettingsRecord) -> SettingsRead:
         shodan_key_configured=bool(getattr(record, "shodan_key", None)),
         sandbox_provider=getattr(record, "sandbox_provider", None),
         sandbox_key_configured=bool(getattr(record, "sandbox_api_key", None)),
+        urlscan_key_configured=bool(getattr(record, "urlscan_key", None)),
     )
 
 
@@ -78,6 +79,7 @@ async def update_settings_endpoint(
     set_abuse = False
     set_shodan = False
     set_sandbox = False
+    set_urlscan = False
 
     if payload.virustotal_key is not None:
         new_vt = payload.virustotal_key.strip() or None
@@ -101,6 +103,14 @@ async def update_settings_endpoint(
         record.shodan_key = payload.shodan_key.strip() or None
         set_shodan = True
         logger.info("Settings PUT: updating shodan_key")
+
+    if getattr(payload, "urlscan_key", None) is not None:
+        record.urlscan_key = payload.urlscan_key.strip() or None
+        set_urlscan = True
+        logger.info(
+            "Settings PUT: updating urlscan_key, configured=%s",
+            bool(record.urlscan_key),
+        )
 
     if getattr(payload, "sandbox_provider", None) is not None:
         provider_val = payload.sandbox_provider.strip() or None
@@ -128,12 +138,15 @@ async def update_settings_endpoint(
     from sqlalchemy.orm.attributes import flag_modified
     if set_shodan:
         flag_modified(record, "shodan_key")
+    if set_urlscan:
+        flag_modified(record, "urlscan_key")
     if set_sandbox:
         flag_modified(record, "sandbox_provider")
         flag_modified(record, "sandbox_api_key")
 
     record = await repo.save_all(record, set_vt=set_vt, set_abuse=set_abuse,
-                                  set_shodan=set_shodan, set_sandbox=set_sandbox)
+                                  set_shodan=set_shodan, set_sandbox=set_sandbox,
+                                  set_urlscan=set_urlscan)
     return _to_read(record)
 
 

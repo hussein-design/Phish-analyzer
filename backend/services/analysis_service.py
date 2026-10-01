@@ -28,6 +28,7 @@ from backend.services import url_intelligence_service as url_intel
 from backend.services.enrichment import abuseipdb_provider, virustotal_provider
 from backend.services.enrichment import shodan_provider
 from backend.services.enrichment import sandbox_provider as sandbox_prov
+from backend.services.enrichment import urlscan_provider
 from shared.paths import analysis_upload_dir
 
 logger = logging.getLogger(__name__)
@@ -203,6 +204,7 @@ class AnalysisService:
                     vt_key = settings.virustotal_key or self._vt_api_key_env
                     abuse_key = settings.abuseipdb_key or self._abuseipdb_key_env
                     shodan_key = getattr(settings, "shodan_key", None)
+                    urlscan_key = getattr(settings, "urlscan_key", None)
                     _sandbox_provider = getattr(settings, "sandbox_provider", None)
                     _sandbox_key = getattr(settings, "sandbox_api_key", None)
                     scoring_weights = dict(settings.scoring_weights)
@@ -218,11 +220,64 @@ class AnalysisService:
                 #    "error": str|None, "results"/"data": ...}
                 # We log the status and store it on the analysis row so the
                 # UI can show a clear explanation instead of just "no data".
-                vt_enrichment, abuse_enrichment, shodan_enrichment, url_intel_results = await asyncio.gather(
+
+                # urlscan.io: pick the most suspicious URL to detonate.
+                # A fast-fail no_key result is returned immediately when the
+                # key is absent, so this never adds latency in that case.
+                # The call is wrapped in wait_for with a 100 s cap so a slow
+                # urlscan scan cannot block the pipeline even when a key IS set.
+                _urlscan_url: str | None = None
+                if urlscan_key and urls:
+                    # Prefer a URL that already looks suspicious from static analysis
+                    # (we don't have url_rows yet, so use a heuristic on raw strings)
+                    _urlscan_url = urls[0]  # default to first URL
+
+                async def _run_urlscan() -> dict:
+                    if not _urlscan_url or not urlscan_key:
+                        return {
+                            "status": "no_key", "error": None, "scan_uuid": None,
+                            "report_url": None, "screenshot_url": None,
+                            "verdict": None, "malicious": False, "redirect_chain": [],
+                            "final_url": None, "page_title": None, "tags": [], "score": None,
+                            "raw": None,
+                        }
+                    try:
+                        # Outer cap: urlscan provider polls internally up to 120 s
+                        # (_MAX_WAIT=120, _POLL_INTERVAL=10).  We allow 135 s here —
+                        # 120 s inner cap + 15 s grace for the final HTTP round-trip
+                        # and response parsing — so the inner timeout always fires
+                        # first and returns a clean "timeout" status rather than
+                        # having asyncio.CancelledError propagate to the pipeline.
+                        return await asyncio.wait_for(
+                            urlscan_provider.detonate_url(_urlscan_url, urlscan_key),
+                            timeout=135,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("urlscan.io: pipeline timeout exceeded for %s", _urlscan_url)
+                        return {
+                            "status": "timeout", "error": "Pipeline timeout exceeded",
+                            "scan_uuid": None, "report_url": None,
+                            "screenshot_url": None, "verdict": None, "malicious": False,
+                            "redirect_chain": [], "final_url": None, "page_title": None,
+                            "tags": [], "score": None, "raw": None,
+                        }
+                    except Exception as exc:
+                        logger.warning("urlscan.io: unexpected error: %s", type(exc).__name__)
+                        return {
+                            "status": "error",
+                            "error": f"urlscan.io: {type(exc).__name__}",
+                            "scan_uuid": None, "report_url": None,
+                            "screenshot_url": None, "verdict": None, "malicious": False,
+                            "redirect_chain": [], "final_url": None, "page_title": None,
+                            "tags": [], "score": None, "raw": None,
+                        }
+
+                vt_enrichment, abuse_enrichment, shodan_enrichment, url_intel_results, urlscan_result = await asyncio.gather(
                     virustotal_provider.enrich_urls(urls, vt_key),
                     abuseipdb_provider.enrich_ip(header_info["sender_ip"], abuse_key),
                     shodan_provider.enrich_ip(header_info["sender_ip"], shodan_key),
                     url_intel.expand_urls(urls),
+                    _run_urlscan(),
                 )
 
                 vt_status  = vt_enrichment["status"]
@@ -259,6 +314,20 @@ class AnalysisService:
                     logger.warning("Shodan: status=%s error=%s", shodan_status, shodan_error)
                 else:
                     logger.info("Shodan: status=%s", shodan_status)
+
+                urlscan_status = urlscan_result.get("status")
+                urlscan_error  = urlscan_result.get("error")
+                if urlscan_status == "no_key":
+                    logger.info("urlscan.io: skipped — no API key configured")
+                elif urlscan_status in ("timeout", "error"):
+                    logger.warning(
+                        "urlscan.io: status=%s error=%s", urlscan_status, urlscan_error
+                    )
+                else:
+                    logger.info(
+                        "urlscan.io: status=%s verdict=%s",
+                        urlscan_status, urlscan_result.get("verdict"),
+                    )
 
                 # ── Phase 3: Static attachment analysis ───────────────────
                 # Run in executor so zipfile / OLE2 scanning stays off the loop.
@@ -355,33 +424,15 @@ class AnalysisService:
                     for u in urls
                 ]
 
-                score_info = scoring_service.compute_score(
-                    from_addr=header_info["from_addr"],
-                    from_domain=header_info["from_domain"],
-                    auth=header_info["auth"],
-                    header_issues=header_info["issues"],
-                    urls=url_rows,
-                    attachments=attachment_rows,
-                    # scoring_service still expects the flat abuse dict
-                    abuse_result=abuse_data,
-                    sender_ip=header_info["sender_ip"],
-                    body_text=body_text,
-                    scoring_weights=scoring_weights,
-                    brand_domains=brand_domains,
-                    url_suspicious_keywords=suspicious_keywords,
-                    suspicious_tlds=suspicious_tlds,
-                    url_shorteners=url_shorteners,
-                    urgency_keywords=urgency_keywords,
-                    lure_categories=lure_categories,
-                    anchor_mismatches=anchor_mismatches,
-                )
+                score_info = None  # will be computed after sandbox detonation below
 
                 # ── Phase 5: Sandbox detonation ───────────────────────────
                 # Pick the most suspicious attachment (macro/executable first),
                 # or the most suspicious URL if no qualifying attachment.
                 sandbox_result: dict = {"status": "no_key", "provider": _sandbox_provider,
                                         "error": None, "report_url": None,
-                                        "verdict": None, "score": None, "tags": [], "raw": None}
+                                        "verdict": None, "score": None, "tags": [], "raw": None,
+                                        "processes": [], "network_calls": [], "iocs": []}
                 if _sandbox_provider and _sandbox_key:
                     # Prefer macro-enabled or embedded-exe attachments
                     sandbox_att = next(
@@ -449,6 +500,52 @@ class AnalysisService:
                                 sandbox_result["status"] = "error"
                                 sandbox_result["error"] = f"Submission error: {type(exc).__name__}"
 
+                # ── Phase 1: Dynamic attachment detonation (behavioral report) ──
+                # The dynamic_attachment_* columns capture the full behavioral
+                # result separately from the legacy sandbox_* columns so both
+                # data sets are independently queryable.
+                # When the sandbox already ran (status done/submitted), we reuse
+                # that result directly.  The behavioral fields (processes,
+                # network_calls, iocs) are only populated for Hybrid Analysis
+                # status=done; for other providers/statuses they remain empty.
+                dynamic_attachment_result: dict = {
+                    "status": sandbox_result.get("status", "no_key"),
+                    "verdict": sandbox_result.get("verdict"),
+                    "score": sandbox_result.get("score"),
+                    "report_url": sandbox_result.get("report_url"),
+                    "tags": sandbox_result.get("tags") or [],
+                    "error": sandbox_result.get("error"),
+                    "processes": sandbox_result.get("processes") or [],
+                    "network_calls": sandbox_result.get("network_calls") or [],
+                    "iocs": sandbox_result.get("iocs") or [],
+                }
+
+                # Re-score with dynamic attachment findings (scored once after sandbox)
+                score_info = scoring_service.compute_score(
+                    from_addr=header_info["from_addr"],
+                    from_domain=header_info["from_domain"],
+                    auth=header_info["auth"],
+                    header_issues=header_info["issues"],
+                    urls=url_rows,
+                    attachments=attachment_rows,
+                    abuse_result=abuse_data,
+                    sender_ip=header_info["sender_ip"],
+                    body_text=body_text,
+                    scoring_weights=scoring_weights,
+                    brand_domains=brand_domains,
+                    url_suspicious_keywords=suspicious_keywords,
+                    suspicious_tlds=suspicious_tlds,
+                    url_shorteners=url_shorteners,
+                    urgency_keywords=urgency_keywords,
+                    lure_categories=lure_categories,
+                    anchor_mismatches=anchor_mismatches,
+                    url_detonation_result=urlscan_result if urlscan_result.get("status") == "done" else None,
+                    attachment_detonation_result=(
+                        dynamic_attachment_result
+                        if dynamic_attachment_result.get("status") == "done" else None
+                    ),
+                )
+
                 async with self.session_factory() as session:
                     repo = AnalysisRepository(session)
                     analysis = await repo.get_by_id(analysis_id)
@@ -489,6 +586,25 @@ class AnalysisService:
                     analysis.sandbox_report_url = sandbox_result.get("report_url")
                     analysis.sandbox_tags       = sandbox_result.get("tags") or []
                     analysis.sandbox_error      = _safe_error(sandbox_result.get("error"))
+
+                    # Phase 1 dynamic analysis: urlscan.io URL detonation
+                    analysis.urlscan_status         = urlscan_result.get("status")
+                    analysis.urlscan_error          = _safe_error(urlscan_result.get("error"))
+                    analysis.urlscan_screenshot_url = urlscan_result.get("screenshot_url")
+                    analysis.urlscan_verdict        = urlscan_result.get("verdict")
+                    analysis.urlscan_redirect_chain = urlscan_result.get("redirect_chain") or []
+
+                    # Phase 1 dynamic analysis: attachment behavioral detonation
+                    analysis.dynamic_attachment_status     = dynamic_attachment_result.get("status")
+                    analysis.dynamic_attachment_verdict    = dynamic_attachment_result.get("verdict")
+                    analysis.dynamic_attachment_score      = dynamic_attachment_result.get("score")
+                    analysis.dynamic_attachment_report_url = dynamic_attachment_result.get("report_url")
+                    analysis.dynamic_attachment_tags       = dynamic_attachment_result.get("tags") or []
+                    analysis.dynamic_attachment_error      = _safe_error(dynamic_attachment_result.get("error"))
+
+                    # Phase 1 dynamic analysis: static vs dynamic score split
+                    analysis.static_score  = score_info.get("static_score")
+                    analysis.dynamic_score = score_info.get("dynamic_score")
 
                     analysis.abuse_score         = abuse_data.get("abuse_score")
                     analysis.abuse_total_reports = abuse_data.get("total_reports")
