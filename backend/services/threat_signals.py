@@ -170,13 +170,22 @@ def find_lookalike_domain(
     best: tuple[str, str] | None = None
     best_ratio = 0.0
 
+    # BUG-07 fix: check the legitimate-domain exemption BEFORE any brand
+    # matching runs.  Previously the exemption was inside the per-brand loop
+    # and came AFTER the brand_token substring check, meaning a genuine
+    # subdomain like "microsoft-support.microsoft.com" would be flagged as a
+    # lookalike before the exemption could fire.  Now we scan every brand's
+    # legit list upfront so the per-brand logic only sees non-exempt domains.
+    for _brand, _legit_domains in brand_domains.items():
+        _legit_lowers = [d.lower() for d in _legit_domains]
+        if any(
+            sender_domain == d or sender_domain.endswith("." + d)
+            for d in _legit_lowers
+        ):
+            return None
+
     for brand, legit_domains in brand_domains.items():
         legit_lowers = [d.lower() for d in legit_domains]
-
-        # Exempt genuinely legitimate domains/subdomains (unnormalized --
-        # normalizing here would make e.g. micros0ft.com == microsoft.com).
-        if any(sender_domain == d or sender_domain.endswith("." + d) for d in legit_lowers):
-            return None
 
         brand_token = re.sub(r"[^a-z0-9]", "", brand.lower())
         if brand_token and brand_token in normalized_compact:

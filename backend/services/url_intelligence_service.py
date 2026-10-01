@@ -204,11 +204,16 @@ async def _fetch_with_redirects(
                 location = resp.headers.get("location", "").strip()
                 if not location:
                     break
-                # Resolve relative redirects
-                if location.startswith("/"):
-                    base = current_url.split("://", 1)
-                    scheme_host = base[0] + "://" + base[1].split("/", 1)[0] if len(base) > 1 else ""
-                    location = scheme_host + location
+                # BUG-08 fix: the old code only handled absolute-path redirects
+                # (location starting with "/").  Relative redirects like
+                # "redirect?foo=bar" were followed as-is, which would form an
+                # invalid URL and cause an immediate connection error.
+                # urllib.parse.urljoin handles all cases correctly:
+                #   absolute URL  → returned unchanged
+                #   /absolute-path → scheme+host prepended
+                #   relative/path  → resolved against current_url's directory
+                from urllib.parse import urljoin
+                location = urljoin(current_url, location)
                 result.redirect_chain.append(location)
                 current_url = location
                 hops += 1

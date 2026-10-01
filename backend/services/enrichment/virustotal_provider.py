@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # VT free tier allows 4 requests/minute; cap concurrent lookups accordingly.
 _RATE_LIMIT = asyncio.Semaphore(4)
 
+# BUG-12 fix: maximum seconds to wait for a scan_url_async poll to complete.
+# vt-py polls internally with no upper bound; cap it so a slow VT analysis
+# cannot hold a semaphore slot indefinitely and starve other URL lookups.
+_SCAN_WAIT_TIMEOUT = 120  # 2 minutes
+
 _QUOTA_MESSAGES = ("quota exceeded", "rate limit", "too many requests")
 
 
@@ -36,6 +41,11 @@ async def _lookup_one_async(client: vt.Client, url: str) -> tuple[str, dict]:
 
     If the URL is not yet in VT's database, submit it for scanning and wait
     for the result (up to the client's timeout).
+
+    BUG-12 fix: scan_url_async(wait_for_completion=True) polls internally
+    with no upper bound.  A slow VT analysis could hold the semaphore slot
+    indefinitely, starving all other concurrent URL lookups.  We wrap it with
+    asyncio.wait_for so it is capped at _SCAN_WAIT_TIMEOUT seconds.
     """
     async with _RATE_LIMIT:
         try:
@@ -47,7 +57,10 @@ async def _lookup_one_async(client: vt.Client, url: str) -> tuple[str, dict]:
             if "NotFoundError" in str(type(exc)) or code == "NotFoundError":
                 # URL not in VT — submit and wait for the analysis to finish.
                 try:
-                    analysis = await client.scan_url_async(url, wait_for_completion=True)
+                    analysis = await asyncio.wait_for(
+                        client.scan_url_async(url, wait_for_completion=True),
+                        timeout=_SCAN_WAIT_TIMEOUT,
+                    )
                     stats = (
                         analysis.get("stats")
                         or getattr(analysis, "stats", None)

@@ -251,11 +251,19 @@ def compute_score(
         reasons.append(f"VirusTotal: attachment '{fn}' flagged malicious by {mal} engines")
 
     # VirusTotal-based scoring
+    # BUG-06 fix: score once per analysis, not once per matching URL.
+    # Every other rule in this function follows the "hit-once" pattern;
+    # the old loop incremented the score for EACH URL that exceeded the
+    # threshold, inflating the score arbitrarily for emails with many URLs.
+    vt_url_hit: tuple[str, int] | None = None
     for u in urls:
-        mal = u.get("vt_malicious", 0)
-        if mal >= vt_thresh:
-            score += vt_pts
-            reasons.append(f"VirusTotal: URL {u['url']} flagged malicious by {mal} engines")
+        mal = u.get("vt_malicious", 0) or 0
+        if mal >= vt_thresh and vt_url_hit is None:
+            vt_url_hit = (u["url"], mal)
+    if vt_url_hit:
+        hit_url, hit_mal = vt_url_hit
+        score += vt_pts
+        reasons.append(f"VirusTotal: URL {hit_url} flagged malicious by {hit_mal} engines")
 
     # AbuseIPDB-based scoring
     if abuse_result:

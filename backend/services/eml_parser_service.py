@@ -6,6 +6,7 @@ since eml_parser/BeautifulSoup are sync libraries.
 from __future__ import annotations
 
 import email
+import email.policy
 import hashlib
 import re
 from email.utils import parseaddr
@@ -17,12 +18,25 @@ URL_REGEX = re.compile(r"https?://[^\s\"'>]+")
 
 
 def parse_eml_bytes(raw_email: bytes) -> dict:
-    ep = eml_parser.EmlParser(
-        include_raw_body=True,
-        include_attachment_data=True,
-        parse_attachments=True,
-    )
-    parsed = ep.decode_email_bytes(raw_email)
+    """Parse raw .eml bytes via eml_parser.
+
+    BUG-02 fix: wraps the parser call so that corrupt / truncated .eml files
+    raise a structured InvalidEmlError (caught cleanly in the pipeline) rather
+    than propagating a raw eml_parser exception whose traceback leaks internal
+    paths and schema details.
+    """
+    from backend.core.exceptions import InvalidEmlError  # avoid circular at module level
+    try:
+        ep = eml_parser.EmlParser(
+            include_raw_body=True,
+            include_attachment_data=True,
+            parse_attachments=True,
+        )
+        parsed = ep.decode_email_bytes(raw_email)
+    except Exception as exc:
+        raise InvalidEmlError(
+            f"Failed to parse .eml file: {type(exc).__name__}"
+        ) from exc
     parsed["_raw_email"] = raw_email
     return parsed
 
@@ -55,6 +69,10 @@ def extract_text_from_body(body_raw) -> str:
             continue
         if isinstance(content, list):
             content = " ".join(str(c) for c in content)
+        # BUG-03 fix: eml_parser can return bytes for certain charsets.
+        # str(b'hello') produces "b'hello'" — decode properly instead.
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
         if "text/plain" in ct:
             return str(content)
 
@@ -68,6 +86,9 @@ def extract_text_from_body(body_raw) -> str:
             continue
         if isinstance(content, list):
             content = " ".join(str(c) for c in content)
+        # BUG-03 fix: same bytes-decode guard for HTML parts
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
         if "text/html" in ct:
             soup = BeautifulSoup(content, "html.parser")
             return soup.get_text(separator=" ")
@@ -216,20 +237,41 @@ def extract_sender_ip(headers: dict) -> str | None:
     eml_parser builds a structured ``received_ip`` list (all IPs seen across
     Received chains) and a ``received`` list of structured dicts, each with a
     ``from`` key that holds the IP(s) for that hop.  We prefer the last entry
-    in ``received`` that carries a real IPv4 address in its ``from`` field,
-    which corresponds to the first external hop that handed the message to the
-    receiving infrastructure — i.e. the actual sender IP.
+    in ``received`` that carries a real IPv4 **or IPv6** address in its ``from``
+    field, which corresponds to the first external hop that handed the message
+    to the receiving infrastructure — i.e. the actual sender IP.
 
-    Falls back to the last IPv4 in ``received_ip`` if the structured path
+    Falls back to the last IPv4/IPv6 in ``received_ip`` if the structured path
     yields nothing, and finally tries a regex over the raw ``received`` strings
     for maximum compatibility with unusual eml_parser builds.
+
+    BUG-01 fix: all three strategies previously used an IPv4-only regex.
+    IPv6 sender addresses (increasingly common) are now also matched.
     """
+    # Compiled once — IPv4 dotted-decimal
+    _ipv4_re = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+    # Full IPv6: 8 groups of 1-4 hex digits separated by colons, plus
+    # compressed forms (::) and IPv4-mapped (::ffff:1.2.3.4).
+    # We keep this deliberately broad (valid enough to be actionable)
+    # rather than a 100-accurate RFC 4291 parser.
+    _ipv6_re = re.compile(
+        r"^("
+        r"([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"         # full
+        r"|([0-9a-fA-F]{1,4}:){1,7}:"                       # ::suffix
+        r"|:([0-9a-fA-F]{1,4}:){1,6}[0-9a-fA-F]{1,4}"      # prefix::
+        r"|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}"      # prefix::suffix
+        r"|::([fF]{4}:)?(?:\d{1,3}\.){3}\d{1,3}"            # IPv4-mapped ::ffff:
+        r"|::"                                               # loopback ::
+        r")$"
+    )
+
+    def _is_ip(val: str) -> bool:
+        v = val.strip().strip("[]")  # strip brackets used in Received headers
+        return bool(_ipv4_re.match(v) or _ipv6_re.match(v))
+
     # --- Strategy 1: structured received list from eml_parser ---
     received_list = headers.get("received")
     if isinstance(received_list, list):
-        # Iterate from the last (outermost) hop backwards; take the first
-        # entry whose "from" field contains a dotted-decimal IPv4.
-        ipv4_re = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
         for entry in reversed(received_list):
             if not isinstance(entry, dict):
                 continue
@@ -237,24 +279,35 @@ def extract_sender_ip(headers: dict) -> str | None:
             if isinstance(from_fields, str):
                 from_fields = [from_fields]
             for field in from_fields:
-                if ipv4_re.match(str(field).strip()):
-                    return str(field).strip()
+                candidate = str(field).strip().strip("[]")
+                if _is_ip(candidate):
+                    return candidate
 
     # --- Strategy 2: received_ip list pre-built by eml_parser ---
     received_ips = headers.get("received_ip")
     if isinstance(received_ips, list):
-        ipv4_re = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
         for ip in reversed(received_ips):
-            if ipv4_re.match(str(ip).strip()):
-                return str(ip).strip()
+            candidate = str(ip).strip().strip("[]")
+            if _is_ip(candidate):
+                return candidate
 
     # --- Strategy 3: regex over raw Received strings (last resort) ---
     if isinstance(received_list, list):
+        # IPv4 pattern for raw scanning
+        _ipv4_scan = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+        # Simplified IPv6 scan: bracket-enclosed or full-length colon groups
+        _ipv6_scan = re.compile(
+            r"\[([0-9a-fA-F:]{3,39})\]"           # [IPv6] bracket form
+            r"|(?<!\w)((?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{0,4})(?!\w)"
+        )
         for entry in reversed(received_list):
             line = entry.get("src", "") if isinstance(entry, dict) else str(entry)
-            match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", line)
-            if match:
-                return match.group(0)
+            m = _ipv4_scan.search(line)
+            if m:
+                return m.group(0)
+            m6 = _ipv6_scan.search(line)
+            if m6:
+                return (m6.group(1) or m6.group(2)).strip()
 
     return None
 
@@ -314,7 +367,11 @@ def extract_auth_from_raw(parsed: dict) -> tuple[dict, list[str]]:
     if not raw_email:
         return result, sources
 
-    msg = email.message_from_bytes(raw_email)
+    # BUG-17 fix: use policy.default (the modern EmailMessage API) so that
+    # RFC2047-encoded header values are decoded before the verdict regex runs.
+    # The legacy default policy returns raw folded/encoded strings, meaning
+    # SPF/DKIM results wrapped in =?UTF-8?q?…?= encoding would be missed.
+    msg = email.message_from_bytes(raw_email, policy=email.policy.default)
 
     # ---------- 1. Authentication-Results (final MTA) ----------
     auth_results = msg.get_all("Authentication-Results") or []

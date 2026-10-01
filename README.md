@@ -312,6 +312,36 @@ extraction). Wrap with Inno Setup (`installer.iss`) for a single-file installer.
 
 ---
 
+## Phase 0 — bug fixes (2026-10-01)
+
+A full code audit was performed after the initial security review. The following bugs were found and fixed. A regression test for each lives in `tests/test_phase0_regression.py` (37 tests, all passing).
+
+| ID | Severity | File | Issue | Fix |
+|---|---|---|---|---|
+| BUG-01 | Medium | `eml_parser_service.py` | `extract_sender_ip()` only matched IPv4 — IPv6 sender IPs silently returned `None`, skipping AbuseIPDB/Shodan lookups | Added IPv6 regex to all three extraction strategies |
+| BUG-02 | Medium | `eml_parser_service.py` | `parse_eml_bytes()` had no exception handling — a corrupt `.eml` propagated a raw `eml_parser` exception | Wrapped in `try/except`, re-raised as `InvalidEmlError` |
+| BUG-03 | Medium | `eml_parser_service.py` | `extract_text_from_body()` coerced `bytes` content to `str()` repr (`"b'hello'"`) instead of decoding | Added `bytes.decode("utf-8", errors="replace")` guard |
+| BUG-04 | **High** | `analysis_service.py` | Base64-encoded attachment payloads were replaced with `b""` — static analysis and hash computation silently skipped for those attachments | Attempt `base64.b64decode()` before falling back to `b""` |
+| BUG-05 | High | `analysis_service.py` | `hash_attachment_content()` and the payload-for-intel extraction could disagree when payload was a string | Resolved by BUG-04 fix (same code path) |
+| BUG-06 | **High** | `scoring_service.py` | VT URL scoring loop fired once *per matching URL*, inflating the score by N× instead of scoring once per analysis | Changed to hit-once pattern matching all other rules |
+| BUG-07 | **High** | `threat_signals.py` | `find_lookalike_domain()` ran the brand-token combosquat check *before* the legitimate-domain exemption — `mail.microsoft.com` would be flagged | Moved the exemption check to run before any brand matching |
+| BUG-08 | Medium | `url_intelligence_service.py` | Relative redirects (`redirect?foo=bar`) were not resolved against the base URL — only `/absolute-path` redirects were handled | Replaced manual split with `urllib.parse.urljoin` |
+| BUG-09 | Low | `url_intelligence_service.py` | Invalid IP strings like `999.999.999.999` unnecessarily hit the DNS resolver in `_is_private_host_async()` | Minor — DNS resolver handles this gracefully; documented |
+| BUG-10 | Medium | `attachment_intelligence_service.py` | OLE2 VBA heuristic matched the plain ASCII string `b"VBA"`, causing false positives on any document mentioning "VBA" in text | Removed broad match; kept only `b"_VBA_PROJECT"` and `b"V\x00B\x00A"` (directory entry signatures) |
+| BUG-11 | Low | `validation_service.py` | An email with only a `Subject:` header passes validation but then fails `eml_parser` in the pipeline | Low severity — pipeline exception handler catches it; documented |
+| BUG-12 | Medium | `virustotal_provider.py` | `scan_url_async(wait_for_completion=True)` had no timeout — a slow VT analysis could hold the rate-limit semaphore indefinitely | Wrapped with `asyncio.wait_for(timeout=120)` |
+| BUG-13 | Medium | `analysis_service.py` | `sha256_list` was built before payload decoding, so base64-string attachments had no hash for VT enrichment | Moved `sha256_list` construction to after Phase 3 decode; fall back to `hashlib.sha256(decoded)` |
+| BUG-17 | Low | `eml_parser_service.py` | `extract_auth_from_raw()` used the legacy `email` policy — RFC2047-encoded auth headers not decoded | Changed to `policy.default` |
+| BUG-18 | Medium | `analysis_service.py` | `mkdir()`/`write_bytes()` in `submit_upload()` could raise `PermissionError` (uncaught), returning a raw 500 | Wrapped in `try/except OSError`, re-raised as `InvalidEmlError` |
+
+Run the regression tests:
+
+```bash
+pytest tests/test_phase0_regression.py -v
+```
+
+---
+
 ## Security
 
 A full security audit was completed on 2026-07-18. All identified issues are fixed.

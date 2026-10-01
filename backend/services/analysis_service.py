@@ -132,8 +132,18 @@ class AnalysisService:
             )
 
         stored_path = analysis_upload_dir(analysis.id) / filename
-        stored_path.parent.mkdir(parents=True, exist_ok=True)  # MED-06: ensure dir exists
-        stored_path.write_bytes(raw_bytes)
+        # BUG-18 fix: mkdir and write_bytes can raise PermissionError or OSError
+        # on Windows if the data directory has unusual ACLs.  Without this guard
+        # the exception would propagate out of submit_upload (not the pipeline
+        # task), causing an unhandled 500 instead of a clean 422 with a message.
+        try:
+            stored_path.parent.mkdir(parents=True, exist_ok=True)
+            stored_path.write_bytes(raw_bytes)
+        except OSError as exc:
+            from backend.core.exceptions import InvalidEmlError
+            raise InvalidEmlError(
+                f"Could not save uploaded file: {type(exc).__name__}"
+            ) from exc
 
         async with self.session_factory() as session:
             repo = AnalysisRepository(session)
@@ -250,46 +260,23 @@ class AnalysisService:
                 else:
                     logger.info("Shodan: status=%s", shodan_status)
 
-                # ── Phase 2: VT hash reputation for attachments ────────────
-                sha256_list = [
-                    eml.hash_attachment_content(att)
-                    for att in attachments_raw
-                ]
-                vt_hash_enrichment = await virustotal_provider.enrich_hashes(
-                    [h for h in sha256_list if h], vt_key
-                )
-                vt_hash_results = vt_hash_enrichment.get("results", {})
-
-                # ── Phase 4: Build URL rows with intelligence data ─────────
-                url_intel_map = {r.original_url: r for r in url_intel_results}
-
-                url_rows = [
-                    {
-                        "url": u,
-                        "vt_malicious":  vt_results.get(u, {}).get("malicious", 0),
-                        "vt_harmless":   vt_results.get(u, {}).get("harmless", 0),
-                        "vt_suspicious": vt_results.get(u, {}).get("suspicious", 0),
-                        "is_suspicious_keyword": False,
-                        "is_ip_host":            False,
-                        "is_shortener":          False,
-                        "is_suspicious_tld":     False,
-                        "is_punycode":           False,
-                        # Phase 4: URL intelligence
-                        "expanded_url":          url_intel_map[u].expanded_url if u in url_intel_map else None,
-                        "page_title":            url_intel_map[u].page_title if u in url_intel_map else None,
-                        "redirect_count":        url_intel_map[u].redirect_count if u in url_intel_map else 0,
-                        "final_status_code":     url_intel_map[u].final_status_code if u in url_intel_map else None,
-                        "is_redirect_suspicious": url_intel_map[u].is_redirect_suspicious if u in url_intel_map else False,
-                    }
-                    for u in urls
-                ]
                 # ── Phase 3: Static attachment analysis ───────────────────
                 # Run in executor so zipfile / OLE2 scanning stays off the loop.
                 att_intel_results = []
+                decoded_payloads: list[bytes] = []
                 for att in attachments_raw:
                     payload = att.get("payload") or b""
                     if isinstance(payload, str):
-                        payload = b""  # encoded payload — skip static analysis
+                        # BUG-04 fix: eml_parser returns base64-encoded strings
+                        # for certain MIME configurations.  The old code replaced
+                        # any string payload with b"", dropping all static analysis
+                        # and hash computation for those attachments.  Decode first.
+                        import base64 as _b64
+                        try:
+                            payload = _b64.b64decode(payload, validate=False)
+                        except Exception:
+                            payload = b""
+                    decoded_payloads.append(payload)
                     fname = att.get("filename")
                     declared_ct = eml.get_attachment_content_type(att)
                     intel = await loop.run_in_executor(
@@ -300,6 +287,24 @@ class AnalysisService:
                         declared_ct,
                     )
                     att_intel_results.append(intel)
+
+                # ── Phase 2: VT hash reputation for attachments ────────────
+                # BUG-13 fix: build sha256_list AFTER Phase 3 decodes payloads.
+                # For attachments where eml_parser returned a base64 string,
+                # hash_attachment_content() would previously return None because
+                # att["payload"] was a string.  Now we compute the hash from the
+                # decoded bytes in decoded_payloads when the att dict has no bytes.
+                sha256_list: list[str | None] = []
+                for att, decoded in zip(attachments_raw, decoded_payloads):
+                    h = eml.hash_attachment_content(att)
+                    if h is None and decoded:
+                        import hashlib as _hl
+                        h = _hl.sha256(decoded).hexdigest()
+                    sha256_list.append(h)
+                vt_hash_enrichment = await virustotal_provider.enrich_hashes(
+                    [h for h in sha256_list if h], vt_key
+                )
+                vt_hash_results = vt_hash_enrichment.get("results", {})
 
                 attachment_rows = []
                 for att, intel in zip(attachments_raw, att_intel_results):
@@ -325,6 +330,30 @@ class AnalysisService:
                             or intel.has_embedded_executable or intel.file_metadata
                         ) else None,
                     })
+
+                # ── Phase 4: Build URL rows with intelligence data ─────────
+                url_intel_map = {r.original_url: r for r in url_intel_results}
+
+                url_rows = [
+                    {
+                        "url": u,
+                        "vt_malicious":  vt_results.get(u, {}).get("malicious", 0),
+                        "vt_harmless":   vt_results.get(u, {}).get("harmless", 0),
+                        "vt_suspicious": vt_results.get(u, {}).get("suspicious", 0),
+                        "is_suspicious_keyword": False,
+                        "is_ip_host":            False,
+                        "is_shortener":          False,
+                        "is_suspicious_tld":     False,
+                        "is_punycode":           False,
+                        # Phase 4: URL intelligence
+                        "expanded_url":          url_intel_map[u].expanded_url if u in url_intel_map else None,
+                        "page_title":            url_intel_map[u].page_title if u in url_intel_map else None,
+                        "redirect_count":        url_intel_map[u].redirect_count if u in url_intel_map else 0,
+                        "final_status_code":     url_intel_map[u].final_status_code if u in url_intel_map else None,
+                        "is_redirect_suspicious": url_intel_map[u].is_redirect_suspicious if u in url_intel_map else False,
+                    }
+                    for u in urls
+                ]
 
                 score_info = scoring_service.compute_score(
                     from_addr=header_info["from_addr"],
@@ -368,7 +397,12 @@ class AnalysisService:
                         att_row, att_raw = sandbox_att
                         payload = att_raw.get("payload") or b""
                         if isinstance(payload, str):
-                            payload = b""
+                            # BUG-04 fix (sandbox path): same base64-decode fallback
+                            import base64 as _b64s
+                            try:
+                                payload = _b64s.b64decode(payload, validate=False)
+                            except Exception:
+                                payload = b""
                         if payload:
                             try:
                                 sandbox_result = await sandbox_prov.submit_for_sandbox(

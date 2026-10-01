@@ -326,10 +326,21 @@ def _check_macro(payload: bytes, filename: str | None, result: AttachmentIntelli
     # OLE2 stream scan for VBA storage signature
     # OLE2 magic: D0 CF 11 E0 A1 B1 1A E1
     if len(payload) > 8 and payload[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
-        # VBA storage CLSID is stored in directory entries.  A quick heuristic:
-        # scan for the ASCII string "VBA" in the first 64 KB of the compound doc.
+        # BUG-10 fix: the old heuristic scanned for the plain ASCII string
+        # b"VBA" which fires false positives on any OLE2 document that merely
+        # mentions "VBA" in its text content (e.g. a Word doc discussing macros).
+        #
+        # Reliable indicators:
+        #   b"_VBA_PROJECT"   — the name of the VBA storage stream; only
+        #                       present in the OLE2 directory when the document
+        #                       actually contains compiled VBA code.
+        #   b"V\x00B\x00A"   — the UTF-16LE encoding used in OLE2 directory
+        #                       entry names; catches cases where _VBA_PROJECT
+        #                       is stored as a wide-char name.
+        #
+        # We drop the plain b"VBA" match entirely.
         chunk = payload[:65536]
-        if b"V\x00B\x00A" in chunk or b"VBA" in chunk or b"_VBA_PROJECT" in chunk:
+        if b"_VBA_PROJECT" in chunk or b"V\x00B\x00A" in chunk:
             result.is_macro_enabled = True
             result.macro_evidence = "OLE2 VBA storage detected"
 
