@@ -96,6 +96,29 @@ class EmailAnalysis(Base):
     static_score: Mapped[int | None] = mapped_column(Integer, default=None)
     dynamic_score: Mapped[int | None] = mapped_column(Integer, default=None)
 
+    # Phase 2 behavioral analysis: independent behavioral_score and signal flags.
+    # These are intentionally separate from static_score and dynamic_score —
+    # they reflect sender/recipient relationship history, not email content.
+    behavioral_score: Mapped[int | None] = mapped_column(Integer, default=None)
+    behavioral_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+    # Individual behavioral signal flags — surfaced separately in the API
+    # so the UI can show exactly which signals fired.
+    sig_first_time_sender: Mapped[bool | None] = mapped_column(Boolean, default=None)
+    sig_domain_age_anomaly: Mapped[bool | None] = mapped_column(Boolean, default=None)
+    sig_display_name_mismatch: Mapped[bool | None] = mapped_column(Boolean, default=None)
+    sig_reply_chain_break: Mapped[bool | None] = mapped_column(Boolean, default=None)
+    sig_send_time_anomaly: Mapped[bool | None] = mapped_column(Boolean, default=None)
+
+    # Phase 3 BEC detection: independent bec_score and signal flags.
+    bec_score: Mapped[int | None] = mapped_column(Integer, default=None)
+    bec_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+    sig_vip_impersonation: Mapped[bool | None] = mapped_column(Boolean, default=None)
+    sig_financial_request: Mapped[bool | None] = mapped_column(Boolean, default=None)
+    sig_vendor_fraud: Mapped[bool | None] = mapped_column(Boolean, default=None)
+    sig_authority_pressure: Mapped[bool | None] = mapped_column(Boolean, default=None)
+
     abuse_score: Mapped[int | None] = mapped_column(Integer, default=None)
     abuse_total_reports: Mapped[int | None] = mapped_column(Integer, default=None)
     abuse_country: Mapped[str | None] = mapped_column(String(8), default=None)

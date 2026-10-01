@@ -103,6 +103,7 @@ class ReportPage(QWidget):
         title_font.setPointSize(13)
         title_font.setWeight(QFont.Weight.DemiBold)
         self._title_label.setFont(title_font)
+        self._title_label.setTextFormat(Qt.TextFormat.PlainText)  # SECURITY: filename+subject are attacker-controlled
         self._title_label.setStyleSheet("color:#1E3A5F; background:transparent;")
         self._title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._title_label.setWordWrap(False)
@@ -276,8 +277,17 @@ class ReportPage(QWidget):
         self._lbl_urgency    = body_label()
         self._card_urgency.add_widget(self._lbl_urgency)
 
+        self._card_behavioral = Card("Behavioral Analysis")
+        self._lbl_behavioral  = body_label()
+        self._card_behavioral.add_widget(self._lbl_behavioral)
+
+        self._card_bec = Card("BEC Detection (Business Email Compromise)")
+        self._lbl_bec  = body_label()
+        self._card_bec.add_widget(self._lbl_bec)
+
         for w in (self._card_summary, self._card_auth,
-                  self._card_reasons, self._card_lures, self._card_urgency):
+                  self._card_reasons, self._card_lures, self._card_urgency,
+                  self._card_behavioral, self._card_bec):
             self._insert(self._ov_lyt, w)
 
         # ── Headers tab ───────────────────────────────────────────────────

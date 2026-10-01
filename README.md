@@ -3,7 +3,7 @@
 > A local, privacy-first desktop tool for analysing suspicious `.eml` files for phishing indicators.  
 > No cloud. No telemetry. Everything runs on your machine.
 
-[![Build](https://github.com/your-org/phish-analyzer/actions/workflows/build-windows.yml/badge.svg)](../../actions/workflows/build-windows.yml)
+[![Build](https://github.com/hussein-design/Phish-analyzer/actions/workflows/build-windows.yml/badge.svg)](https://github.com/hussein-design/Phish-analyzer/actions/workflows/build-windows.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Security Audited](https://img.shields.io/badge/security-audited-brightgreen)](#security)
@@ -434,6 +434,335 @@ pytest tests/test_phase1_dynamic_analysis.py -v
 ```
 
 Expected: **47 passed**
+
+---
+
+## Phase 2 — Rule-based behavioral analysis (2026-10-01)
+
+A third, independent signal category — `behavioral_score` — built from sender/recipient history
+tracked over time, not from inspecting a single email in isolation.  This is the foundation BEC
+(Business Email Compromise) detection will build on.
+
+### What it detects
+
+| Signal | Fires when | Requires history? | Score weight |
+|---|---|---|---|
+| `first_time_sender` | This sender has never emailed this recipient before | Yes (cold-start safe) | +1 |
+| `domain_age_anomaly` | Sender's domain was registered within 30 days of the email | No (async RDAP/WHOIS) | +3 |
+| `display_name_mismatch` | From display implies a trusted brand but sending domain is not legitimate for it | No | +2 |
+| `reply_chain_break` | Subject looks like Re:/Fwd: but sender is not in the known thread history | Yes (cold-start safe) | +3 |
+| `send_time_anomaly` | Email sent at an unusual hour for this sender (needs ≥5 observations) | Yes (threshold-gated) | +1 |
+
+All five scores add up to `behavioral_score`, which is stored and returned **independently** — it
+is never merged into the combined `score` field.  The UI and API surface all three separately:
+`static_score | dynamic_score | behavioral_score`.
+
+### Cold-start policy
+
+The first `N` emails analyzed for a new recipient mailbox have no history to compare against.
+Rather than produce false positives, the three history-dependent signals default to **False**
+(neutral) until data exists:
+
+- `first_time_sender` — returns False when the recipient has no history at all (fresh install)
+- `reply_chain_break` — returns False when the thread has no prior messages
+- `send_time_anomaly` — returns False until `BEHAVIORAL_MIN_SEND_HISTORY` (default 5) prior
+  observations exist for this (recipient, sender) pair
+
+`display_name_mismatch` and `domain_age_anomaly` fire immediately because they are derived
+from the email content, not from accumulated history.
+
+The rationale: it is better to miss the first suspicious email to a new mailbox than to raise a
+behavioral alert on every email during the warm-up period.  Both signals are still visible via
+the content-based static score.
+
+### Domain age lookup
+
+Domain registration dates are looked up via RDAP (tried first) then a free WHOIS-over-HTTP
+fallback, and cached via the existing `EnrichmentCache` with:
+
+- **Namespace**: `domain_age`
+- **TTL**: 2 592 000 seconds (30 days)
+- **Rationale**: Registration dates are immutable facts — once a domain is registered, its
+  creation date never changes.  30 days is generous; a 365-day TTL would also be correct.
+
+No API key is required.  The lookup uses public RDAP endpoints and `whoisjsonapi.com` (free, no
+registration).  If both fail, `domain_age_anomaly` returns `None` (signal undetermined — no
+score contribution and no false positive).
+
+### New persistent tables
+
+Two new tables are created by migration `e2f3a4b5c6d7`:
+
+| Table | Purpose |
+|---|---|
+| `sender_history` | Per (recipient, sender) pair: first_seen, last_seen, message_count, send_hours (JSON list of UTC hours) |
+| `thread_history` | Per (recipient, thread_key): all message-IDs and senders seen in that thread |
+
+Unlike the `enrichment_cache` table (disposable, TTL-based), these tables are **application data**
+that the user will want preserved across upgrades.  They use a proper Alembic migration.
+
+### Configuration
+
+All settings have safe defaults — no configuration required to activate behavioral analysis.
+Override in `.env` (first-run only) or by environment variable:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BEHAVIORAL_DOMAIN_AGE_THRESHOLD_DAYS` | `30` | Flag domains registered within N days before the email |
+| `BEHAVIORAL_MIN_SEND_HISTORY` | `5` | Minimum prior observations before `send_time_anomaly` activates |
+| `BEHAVIORAL_SEND_TIME_TOLERANCE_HOURS` | `2` | Hours of tolerance around each historical send hour |
+| `BEHAVIORAL_MAX_SEND_HOURS` | `200` | Cap on stored send-hour samples per (recipient, sender) pair |
+
+### History recording
+
+History is written **after** scoring so the current email never influences its own behavioral
+scores.  The pipeline order is:
+
+1. `compute_behavioral_signals()` — read history, compute scores
+2. `compute_score()` — incorporate behavioral result
+3. Save analysis row to DB
+4. `record_observation()` — write history for future analyses
+
+### New migration
+
+Run after upgrading:
+
+```bash
+alembic upgrade head
+```
+
+Migration `e2f3a4b5c6d7` creates `sender_history` and `thread_history` tables and adds 7 new
+columns to `email_analyses` (`behavioral_score`, `behavioral_reasons`, and 5 `sig_*` boolean flags).
+
+### Run the Phase 2 tests
+
+```bash
+pytest tests/test_phase2_behavioral_analysis.py -v
+```
+
+Expected: **~52 passed**
+
+---
+
+## Phase 3 — BEC (Business Email Compromise) detection (2026-10-02)
+
+A fourth independent signal category — `bec_score` — built specifically for attacks that have
+**zero static or dynamic signal**: no malicious URL, no attachment, SPF/DKIM pass on the
+attacker's own domain.  These emails bypass every content scanner.  BEC detection fires on
+social-engineering and impersonation patterns instead.
+
+### What it detects
+
+| Signal | Fires when | Default pts |
+|---|---|---|
+| `vip_impersonation` | From display name or address matches a VIP in the protected-identity table, but the sending domain is not that VIP's legitimate domain | 4 |
+| `financial_request_language` | Body contains keywords from one or more of the five financial pattern categories (see below) | 2 per category, max 6 |
+| `vendor_fraud_pattern` | Bank-detail-change language from a sender unknown to the recipient's history | 3 |
+| `authority_pressure_combo` | `financial_request_language` fires AND at least one identity signal co-occurs (`vip_impersonation` or `first_time_sender` from Phase 2) | 3 |
+
+### Verdict-merge formula
+
+BEC score contributes at **2× weight** to the combined verdict.  The full formula is:
+
+```
+combined_score = static_score + dynamic_score + (bec_score × 2) + behavioral_score
+
+≥ 9  → phishing
+≥ 5  → suspicious
+< 5  → benign   (subject to BEC_SUSPICIOUS_FLOOR — see below)
+```
+
+**Why 2× for BEC, 1× for behavioral:**
+`authority_pressure_combo` only fires when two independent signals already co-occur, so a
+`bec_score ≥ 4` represents converging evidence.  Doubling it places a VIP-impersonation hit
+(4 pts → 8 combined) on par with a known-malicious VirusTotal URL hit (4 pts direct).
+Behavioral signals keep 1× because `first_time_sender` alone is weak; even all five behavioral
+signals firing together (score = 5) can push a borderline email but cannot manufacture a
+phishing verdict from zero content signal.
+
+**Worked example — classic CEO wire-transfer fraud:**
+
+```
+From:    "Jane Smith" <attacker@evil-acctg.com>
+To:      accounts@corp.com
+Subject: Urgent wire needed
+Body:    "Please wire transfer the funds to our new account.
+          This is time sensitive. Strictly confidential."
+Links:   none   Attachments: none   SPF/DKIM: pass
+```
+
+| Source | Signal | Points |
+|---|---|---|
+| static | No bad URLs, no attachments, SPF/DKIM pass | 0 |
+| dynamic | No urlscan, no sandbox | 0 |
+| behavioral | `first_time_sender` fires (1 pt) | 1 |
+| BEC | `vip_impersonation`: "Jane Smith" matches CFO entry, domain is `evil-acctg.com` ≠ `corp.com` | 4 |
+| BEC | `financial_request_language`: `wire_transfer` category + `urgency_authority` category = 2 × 2 pts | 4 |
+| BEC | `authority_pressure_combo`: financial + vip_impersonation co-occur | 3 |
+| **bec_score total** | | **11** |
+
+```
+combined_score = 0 + (11 × 2) + 1 = 23  →  verdict: PHISHING
+```
+
+Stored independently: `static_score=0`, `dynamic_score=0`, `behavioral_score=1`, `bec_score=11`.
+The analyst sees exactly which of the four buckets drove the result.
+
+### BEC_SUSPICIOUS_FLOOR
+
+**Decision: keep it.**
+
+The floor forces the verdict to at least "suspicious" when `bec_score ≥ BEC_SUSPICIOUS_FLOOR`
+(default 4) even if the formula would otherwise produce "benign".
+
+It is currently redundant at the default settings: a `bec_score` of 4 with 2× weight already
+contributes 8 combined points, which the formula independently calls "suspicious".  It becomes
+relevant if signal weights are tuned down in the future — for example, lowering
+`bec_financial_per_category` from 2 to 1 would mean two firing categories contribute only 4
+combined points (benign by the formula).  The floor catches that case without requiring every
+weight-tuning change to also revisit the threshold arithmetic.
+
+Set `BEC_SUSPICIOUS_FLOOR=0` in `.env` to disable it entirely.
+
+### Financial pattern categories
+
+All keyword matching is case-insensitive substring search.  Each category that fires adds 2 pts
+to `bec_score`, capped at `BEC_FINANCIAL_MAX_PTS` (default 6).
+
+**Category 1 — `wire_transfer`** (explicit fund-movement vocabulary)
+
+> wire transfer · wire the funds · wire payment · wire $ · initiate a transfer ·
+> initiate the transfer · transfer the funds · international transfer · ach transfer ·
+> swift transfer · telegraphic transfer · funds transfer · transfer funds · send the money ·
+> remit payment · remit the amount · same-day transfer · urgent transfer · immediate transfer
+
+**Category 2 — `bank_detail_change`** (account/routing number change requests)
+
+> new bank account · new account details · new banking details · updated bank · updated account ·
+> changed bank · change our bank · new routing number · new account number ·
+> account number has changed · banking information has changed · new payment details ·
+> please update your records · update your payment · use the following account ·
+> use these bank details · our bank details have · payment should be made to
+
+**Category 3 — `urgency_authority`** (executive-pressure and secrecy framing)
+
+> strictly confidential · do not discuss · do not share · between us only ·
+> keep this between · personal request · direct request · acting on behalf of the ceo ·
+> on behalf of the president · on behalf of our ceo · approved by the board ·
+> board has approved · this is time sensitive · needs to be done today ·
+> needs to happen today · before end of business · by close of business · eod today ·
+> no later than today · do not reply to this email · call me directly
+
+**Category 4 — `gift_card`** (common low-level BEC)
+
+> gift card · gift cards · itunes card · google play card · amazon gift card ·
+> steam gift card · buy gift cards · purchase gift cards · send me the codes ·
+> scratch the back · redemption code · card number and pin
+
+**Category 5 — `invoice_redirect`** (invoice or payment redirect to new account)
+
+> new invoice · revised invoice · updated invoice · please process this invoice ·
+> process the attached invoice · payment for invoice · settle this invoice ·
+> redirect this payment · send payment to · please use new account for future payments ·
+> future invoices should be · upcoming payments should go to ·
+> we have changed our bank · effective immediately
+
+To add or remove keywords, edit `_FINANCIAL_PATTERN_CATEGORIES` in
+`backend/services/bec_signals_service.py`.  No code changes to detection logic are required —
+the patterns are data.
+
+### !! False-positive risk: `financial_request_language` !!
+
+This is the signal most likely to fire on legitimate emails.  Known cases:
+
+- CFO asking a supplier to confirm wire-transfer details
+- Finance team circulating a payment approval for an invoice
+- IT team asking a vendor to update banking details after a legitimate account change
+- Executive asking team to purchase gift cards for a legitimate incentive programme
+
+**The formula provides one layer of protection:** a single `financial_request_language` hit
+(bec_score = 2) contributes only 4 combined points — benign by the formula, and below
+`BEC_SUSPICIOUS_FLOOR` (default 4, exclusive).  It needs a second BEC signal to reach
+"suspicious".
+
+**The VIP list provides the main mitigation:**
+Add real executive and finance-team email addresses to the `vip_identities` table (see below).
+Their legitimate emails will still trigger `financial_request_language`, but will **not** trigger
+`vip_impersonation` (their sending domain matches `protected_domain`), so
+`authority_pressure_combo` will not fire.  This keeps the `bec_score` contribution from a
+known-legitimate sender below the "suspicious" threshold.
+
+Analysts should treat `bec_score` and `behavioral_score` as context for investigation, not as
+automated block/quarantine decisions.
+
+### VIP / protected-identity table
+
+The `vip_identities` table is **admin-configurable and starts empty**.  There are no hardcoded
+entries.  When the table is empty, `vip_impersonation` is silently disabled (returns False).
+
+**Schema** (created by migration `g4b5c6d7e8f9`):
+
+| Column | Type | Purpose |
+|---|---|---|
+| `name` | VARCHAR(255) | Human-readable label, e.g. "Jane Smith (CFO)" |
+| `protected_email` | VARCHAR(512) nullable | Real email address, e.g. "jane.smith@corp.com" |
+| `protected_domain` | VARCHAR(255) | Legitimate sending domain, e.g. "corp.com" |
+| `title` | VARCHAR(128) nullable | Role label for UI display, e.g. "Chief Financial Officer" |
+| `is_active` | BOOLEAN | Soft-delete — set False instead of deleting to preserve history |
+
+A sender whose display name contains all words of a VIP's `name` (case-insensitive) but whose
+sending domain does **not** match `protected_domain` (or a subdomain of it) triggers the signal.
+Exact bare-address spoofing (address matches `protected_email` but wrong domain) also fires.
+
+Populate via direct DB edit or a future Settings UI row.  Typical entries:
+
+- CEO, CFO, COO, board members
+- Finance team members with wire-transfer authority
+- IT administrators (to catch fake IT password-reset / gift-card requests)
+- Key external partners (auditors, legal counsel, major vendors)
+
+### `vendor_fraud_pattern`
+
+Fires when `financial_request_language` is present **and** the sender has never previously
+contacted this recipient (using the `sender_history` table from Phase 2).  An In-Reply-To
+tiebreaker suppresses the signal when the email correctly references a known thread message-ID,
+allowing legitimate new-thread financial emails from partners who haven't emailed before.
+
+Cold-start: returns False (neutral) when the recipient mailbox has no history at all.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BEC_SUSPICIOUS_FLOOR` | `4` | Minimum `bec_score` to force verdict to "suspicious" when formula says "benign". Set to 0 to disable. |
+| `BEC_FINANCIAL_MAX_PTS` | `6` | Cap on points `financial_request_language` can contribute per analysis (prevents runaway scoring on verbose emails). |
+
+Override in `.env` or by environment variable.  The scoring weights for individual signals
+(`bec_vip_impersonation`, `bec_financial_per_category`, `bec_vendor_fraud`,
+`bec_authority_pressure`) can be overridden via the `scoring_weights` dict in the Settings DB
+row (same mechanism as all other signal weights).
+
+### New DB table
+
+Migration `g4b5c6d7e8f9` creates:
+
+- `vip_identities` table (see schema above)
+- Six new columns on `email_analyses`: `bec_score`, `bec_reasons`, `sig_vip_impersonation`,
+  `sig_financial_request`, `sig_vendor_fraud`, `sig_authority_pressure`
+
+Run after upgrading:
+
+```bash
+alembic upgrade head
+```
+
+### Run the Phase 3 tests
+
+```bash
+pytest tests/test_phase3_bec.py -v
+```
+
+Expected: **84 passed**
 
 ---
 

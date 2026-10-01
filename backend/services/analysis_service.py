@@ -25,6 +25,9 @@ from backend.services import threat_signals
 from backend.services import validation_service
 from backend.services import attachment_intelligence_service as att_intel
 from backend.services import url_intelligence_service as url_intel
+from backend.services import behavioral_signals_service as behavioral_svc
+from backend.services import bec_signals_service as bec_svc
+from backend.services.url_intelligence_service import _is_private_ip as _url_is_private_ip
 from backend.services.enrichment import abuseipdb_provider, virustotal_provider
 from backend.services.enrichment import shodan_provider
 from backend.services.enrichment import sandbox_provider as sandbox_prov
@@ -96,6 +99,56 @@ _ANALYSIS_CONCURRENCY = asyncio.Semaphore(3)
 # asyncio explicitly warns fire-and-forget tasks can be GC'd mid-flight --
 # this dict keeps a live reference until each task finishes.
 _in_flight_tasks: dict[int, asyncio.Task] = {}
+
+
+def _is_safe_for_external_submission(url: str) -> bool:
+    """Return True only when url is safe to submit to an external cloud service.
+
+    SSRF guard for urlscan.io and sandbox submission: an attacker can embed
+    http://192.168.1.1/ or http://10.0.0.1/admin in an email body and cause
+    the tool to leak internal network topology to a third-party API, or (for
+    on-premises sandboxes) cause the sandbox agent to actually connect to the
+    private address.
+
+    Uses urllib.parse for hostname extraction so that alternate IP notations
+    such as http://0x7f000001/ or http://2130706433/ are normalised before the
+    RFC-1918 check — these forms bypass a naive string-split host extractor
+    but urllib handles them correctly.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    try:
+        host = urlparse(url).hostname  # handles hex/octal/decimal IP forms
+    except Exception:
+        return False
+    if not host:
+        return False
+
+    # Blocked hostname list (metadata services, localhost aliases)
+    _BLOCKED = frozenset({
+        "localhost", "ip6-localhost", "ip6-loopback",
+        "metadata.google.internal", "metadata.internal",
+        "169.254.169.254", "100.100.100.200",
+    })
+    if host.lower() in _BLOCKED:
+        return False
+
+    # Resolve and check every returned address
+    try:
+        results = socket.getaddrinfo(host, None)
+    except OSError:
+        # DNS failure — fail-open for external submission (the API will reject
+        # unresolvable hosts itself).  This differs from the URL-expansion SSRF
+        # guard which fails-closed because it actually follows redirects.
+        return True
+
+    for _family, _type, _proto, _canon, sockaddr in results:
+        addr_str = sockaddr[0]
+        if _url_is_private_ip(addr_str):
+            return False
+
+    return True
 
 
 class AnalysisService:
@@ -174,6 +227,7 @@ class AnalysisService:
                 urls = eml.extract_urls_from_body(parsed.get("body", {}), body_text)
                 message_id = eml.get_message_id(parsed, headers)
                 subject = eml.get_subject(parsed, headers)
+                in_reply_to = eml.get_in_reply_to(parsed, headers)
 
                 # ── Phase 1: MIME structure + social engineering signals ───────
                 mime_parts = eml.extract_mime_parts(parsed)
@@ -229,8 +283,17 @@ class AnalysisService:
                 _urlscan_url: str | None = None
                 if urlscan_key and urls:
                     # Prefer a URL that already looks suspicious from static analysis
-                    # (we don't have url_rows yet, so use a heuristic on raw strings)
-                    _urlscan_url = urls[0]  # default to first URL
+                    # (we don't have url_rows yet, so use a heuristic on raw strings).
+                    # SSRF guard: only submit URLs that resolve to public addresses.
+                    # An attacker can embed http://192.168.1.1/ in an email body and
+                    # trick the tool into submitting internal addresses to urlscan.io,
+                    # leaking network topology to a third-party cloud service.
+                    for _candidate in urls:
+                        if _is_safe_for_external_submission(_candidate):
+                            _urlscan_url = _candidate
+                            break
+                    # If no URL passes the guard, _urlscan_url remains None and
+                    # _run_urlscan() returns status="no_key" (intentional no-op).
 
                 async def _run_urlscan() -> dict:
                     if not _urlscan_url or not urlscan_key:
@@ -481,7 +544,13 @@ class AnalysisService:
                              or r.get("vt_malicious", 0) > 0),
                             urls[0] if urls else None,
                         )
-                        if suspicious_url and suspicious_url.startswith(("http://", "https://")):
+                        # SSRF guard: verify the URL resolves to a public address
+                        # before submitting to the sandbox. An attacker-controlled
+                        # email body could contain http://10.0.0.1/admin and cause
+                        # an on-premises sandbox agent to actually connect to it.
+                        if (suspicious_url
+                                and suspicious_url.startswith(("http://", "https://"))
+                                and _is_safe_for_external_submission(suspicious_url)):
                             try:
                                 sandbox_result = await sandbox_prov.submit_for_sandbox(
                                     provider=_sandbox_provider,
@@ -521,6 +590,76 @@ class AnalysisService:
                 }
 
                 # Re-score with dynamic attachment findings (scored once after sandbox)
+
+                # ── Phase 2: Behavioral signals ───────────────────────────
+                # Computed here, before compute_score, so the result can be
+                # passed in as behavioral_result.  History is written AFTER
+                # scoring (record_observation call below) so the current email
+                # does not influence its own behavioral scores.
+                # Recipient is derived from the To header if available,
+                # falling back to a synthetic placeholder so the service
+                # always has a non-empty recipient key.
+                _recipient = (
+                    eml.get_recipient(parsed, headers)
+                    or "unknown@local"
+                )
+                behavioral_result_obj = None
+                async with self.session_factory() as _beh_session:
+                    try:
+                        behavioral_result_obj = await behavioral_svc.compute_behavioral_signals(
+                            session=_beh_session,
+                            from_addr=header_info["from_addr"],
+                            from_domain=header_info["from_domain"],
+                            subject=subject,
+                            message_id=message_id,
+                            in_reply_to=in_reply_to,
+                            email_date=eml.get_email_date(parsed, headers),
+                            recipient=_recipient,
+                            brand_domains=brand_domains,
+                            scoring_weights=scoring_weights,
+                            lookalike_threshold=scoring_weights.get(
+                                "brand_domain_lookalike_threshold", 82
+                            ),
+                        )
+                    except Exception as _beh_exc:
+                        logger.warning(
+                            "Behavioral signals computation failed for id=%s: %s",
+                            analysis_id, type(_beh_exc).__name__,
+                        )
+                        behavioral_result_obj = None
+
+                # ── Phase 3: BEC signals ──────────────────────────────────
+                # Computed here, after behavioral_result_obj, so we can pass
+                # first_time_sender directly without a second DB query.
+                # Like behavioral signals, BEC signals are computed before
+                # compute_score() and passed in — they are NOT added to the
+                # combined score inline here.
+                bec_result_obj = None
+                async with self.session_factory() as _bec_session:
+                    try:
+                        _first_time_sender = (
+                            behavioral_result_obj.sig_first_time_sender
+                            if behavioral_result_obj is not None else None
+                        )
+                        bec_result_obj = await bec_svc.compute_bec_signals(
+                            session=_bec_session,
+                            from_addr=header_info["from_addr"],
+                            from_domain=header_info["from_domain"],
+                            subject=subject,
+                            message_id=message_id,
+                            in_reply_to=in_reply_to,
+                            body_text=body_text or "",
+                            recipient=_recipient,
+                            first_time_sender=_first_time_sender,
+                            scoring_weights=scoring_weights,
+                        )
+                    except Exception as _bec_exc:
+                        logger.warning(
+                            "BEC signals computation failed for id=%s: %s",
+                            analysis_id, type(_bec_exc).__name__,
+                        )
+                        bec_result_obj = None
+
                 score_info = scoring_service.compute_score(
                     from_addr=header_info["from_addr"],
                     from_domain=header_info["from_domain"],
@@ -544,6 +683,10 @@ class AnalysisService:
                         dynamic_attachment_result
                         if dynamic_attachment_result.get("status") == "done" else None
                     ),
+                    # Phase 2: behavioral result (computed above, before this call)
+                    behavioral_result=behavioral_result_obj,
+                    # Phase 3: BEC result (computed above, before this call)
+                    bec_result=bec_result_obj,
                 )
 
                 async with self.session_factory() as session:
@@ -606,6 +749,23 @@ class AnalysisService:
                     analysis.static_score  = score_info.get("static_score")
                     analysis.dynamic_score = score_info.get("dynamic_score")
 
+                    # Phase 2 behavioral analysis: independent behavioral score
+                    analysis.behavioral_score          = score_info.get("behavioral_score")
+                    analysis.behavioral_reasons        = score_info.get("behavioral_reasons") or []
+                    analysis.sig_first_time_sender     = score_info.get("sig_first_time_sender")
+                    analysis.sig_domain_age_anomaly    = score_info.get("sig_domain_age_anomaly")
+                    analysis.sig_display_name_mismatch = score_info.get("sig_display_name_mismatch")
+                    analysis.sig_reply_chain_break     = score_info.get("sig_reply_chain_break")
+                    analysis.sig_send_time_anomaly     = score_info.get("sig_send_time_anomaly")
+
+                    # Phase 3 BEC detection: independent BEC score
+                    analysis.bec_score              = score_info.get("bec_score")
+                    analysis.bec_reasons            = score_info.get("bec_reasons") or []
+                    analysis.sig_vip_impersonation  = score_info.get("sig_vip_impersonation")
+                    analysis.sig_financial_request  = score_info.get("sig_financial_request")
+                    analysis.sig_vendor_fraud       = score_info.get("sig_vendor_fraud")
+                    analysis.sig_authority_pressure = score_info.get("sig_authority_pressure")
+
                     analysis.abuse_score         = abuse_data.get("abuse_score")
                     analysis.abuse_total_reports = abuse_data.get("total_reports")
                     analysis.abuse_country       = abuse_data.get("country_code")
@@ -640,6 +800,27 @@ class AnalysisService:
                     ]
 
                     await repo.save(analysis)
+
+                # ── Phase 2: Record behavioral observation AFTER scoring ────
+                # History is written after the analysis row is saved so the
+                # current email never influences its own behavioral scores.
+                async with self.session_factory() as _obs_session:
+                    try:
+                        await behavioral_svc.record_observation(
+                            session=_obs_session,
+                            from_addr=header_info["from_addr"],
+                            subject=subject,
+                            message_id=message_id,
+                            in_reply_to=in_reply_to,
+                            email_date=eml.get_email_date(parsed, headers),
+                            recipient=_recipient,
+                        )
+                        await _obs_session.commit()
+                    except Exception as _obs_exc:
+                        logger.warning(
+                            "Behavioral observation recording failed for id=%s: %s",
+                            analysis_id, type(_obs_exc).__name__,
+                        )
 
             except Exception as exc:
                 logger.exception("Analysis pipeline failed for id=%s", analysis_id)

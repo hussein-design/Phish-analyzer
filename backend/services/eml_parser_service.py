@@ -536,3 +536,133 @@ def analyze_headers(parsed: dict) -> dict:
         "auth_headers": auth_sources,
         "issues": issues,
     }
+
+
+# ── Phase 2: Behavioral analysis helpers ──────────────────────────────────────
+
+def get_email_date(parsed: dict, headers: dict) -> "datetime | None":
+    """Return the Date header as a timezone-aware UTC datetime, or None.
+
+    Tries (in order):
+    1. eml_parser outer header dict 'date' key (already decoded as datetime).
+    2. Inner raw header dict 'date' key, parsed via email.utils.
+    3. Python email.Message.get('Date') + email.utils.parsedate_to_datetime.
+    """
+    from datetime import datetime, timezone
+
+    outer_headers = headers  # parsed['header']
+
+    # eml_parser outer dict may carry 'date' as an already-decoded datetime
+    raw_date = outer_headers.get("date")
+    if raw_date:
+        if hasattr(raw_date, "year"):
+            dt: datetime = raw_date
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        try:
+            dt = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            pass
+
+    # Inner header dict stores raw string lists
+    inner = outer_headers.get("header", {}) or {}
+    date_raw = inner.get("date")
+    if isinstance(date_raw, list):
+        date_raw = date_raw[0] if date_raw else None
+    if date_raw:
+        try:
+            import email.utils as _eu
+            dt = _eu.parsedate_to_datetime(str(date_raw))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            pass
+
+    # Fall back to Python's email.Message
+    raw_email = parsed.get("_raw_email")
+    if raw_email:
+        import email.utils as _eu
+        msg = email.message_from_bytes(raw_email)
+        date_str = msg.get("Date")
+        if date_str:
+            try:
+                dt = _eu.parsedate_to_datetime(date_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except Exception:
+                pass
+
+    return None
+
+
+def get_in_reply_to(parsed: dict, headers: dict) -> "str | None":
+    """Return the In-Reply-To header value (the Message-ID of the email being replied to).
+
+    Used by behavioral_signals_service as a tiebreaker for reply_chain_break:
+    if the subject collides with a known thread but In-Reply-To matches a
+    known message_id in thread_history, the email is a legitimate continuation
+    rather than a hijacked thread injection.
+
+    Returns the bare message-ID string (with angle-brackets stripped), or None.
+    """
+    inner = headers.get("header", {}) or {}
+    raw_email = parsed.get("_raw_email")
+    msg = email.message_from_bytes(raw_email) if raw_email else None
+
+    val: str | None = None
+    if msg is not None:
+        val = msg.get("In-Reply-To")
+    if not val:
+        raw = inner.get("in-reply-to")
+        if isinstance(raw, list):
+            val = raw[0] if raw else None
+        elif isinstance(raw, str):
+            val = raw
+
+    if not val:
+        return None
+
+    # Strip surrounding angle brackets: <abc@example.com> → abc@example.com
+    val = val.strip()
+    if val.startswith("<") and val.endswith(">"):
+        val = val[1:-1]
+    return val.strip() or None
+
+
+def get_recipient(parsed: dict, headers: dict) -> "str | None":
+    """Return the first To: address as a bare lowercase email address, or None.
+
+    Used by behavioral_signals_service as the mailbox key for
+    sender_history / thread_history lookups.
+    """
+    inner = headers.get("header", {}) or {}
+    raw_email = parsed.get("_raw_email")
+    msg = email.message_from_bytes(raw_email) if raw_email else None
+
+    to_val: str | None = None
+    if msg is not None:
+        to_val = msg.get("To")
+    if not to_val:
+        raw = inner.get("to")
+        if isinstance(raw, list):
+            to_val = raw[0] if raw else None
+        elif isinstance(raw, str):
+            to_val = raw
+
+    if not to_val:
+        return None
+
+    # Extract bare address from "Display Name <addr@example.com>" or "addr@example.com"
+    m = re.search(r"<([^>]+)>", to_val)
+    if m:
+        return m.group(1).strip().lower()
+    bare = to_val.strip().lower()
+    if "@" in bare:
+        return bare
+    return None

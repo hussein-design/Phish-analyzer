@@ -85,7 +85,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="Phish Analyzer Desktop API",
-        version="1.0.0",
+        version="3.0.0",
         lifespan=lifespan,
         # Disable the interactive docs UI and raw OpenAPI schema endpoint in
         # the packaged app.  The /openapi.json endpoint is still available for

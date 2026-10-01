@@ -175,6 +175,21 @@ class EmailDetail(EmailSummary):
     # Phase 1 dynamic analysis: static vs dynamic score split
     static_score: int | None = None
     dynamic_score: int | None = None
+    # Phase 2 behavioral analysis: independent third signal category
+    behavioral_score: int | None = None
+    behavioral_reasons: list[str] = []
+    sig_first_time_sender: bool | None = None
+    sig_domain_age_anomaly: bool | None = None
+    sig_display_name_mismatch: bool | None = None
+    sig_reply_chain_break: bool | None = None
+    sig_send_time_anomaly: bool | None = None
+    # Phase 3 BEC detection: independent fourth signal category
+    bec_score: int | None = None
+    bec_reasons: list[str] = []
+    sig_vip_impersonation: bool | None = None
+    sig_financial_request: bool | None = None
+    sig_vendor_fraud: bool | None = None
+    sig_authority_pressure: bool | None = None
 
 
 class UploadAccepted(BaseModel):

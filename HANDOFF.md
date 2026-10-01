@@ -1,8 +1,8 @@
 # Phish-Analyzer — Development Handoff
 
-**Last commit:** `phase-1: dynamic analysis — urlscan.io, Hybrid Analysis behavioral report, persistent cache`  
+**Last commit:** `phase-3: BEC detection — vip_impersonation, financial_request_language, vendor_fraud, authority_pressure_combo`  
 **Branch:** `main`  
-**Date:** 2026-10-01
+**Date:** 2026-10-02
 
 ---
 
@@ -55,7 +55,7 @@ URL detonation via urlscan.io, attachment behavioral detonation via Hybrid Analy
 persistent enrichment cache, static/dynamic score split.
 47 new tests in `tests/test_phase1_dynamic_analysis.py` — all pass.
 
-**Total test count: 84 (37 Phase 0 + 47 Phase 1), all passing.**
+**Total test count at Phase 1 completion: 84 (37 Phase 0 + 47 Phase 1), all passing.**
 
 #### Files changed in Phase 1
 
@@ -127,61 +127,109 @@ persistent enrichment cache, static/dynamic score split.
 
 ---
 
-## What comes next — Phase 2
+---
 
-The original HANDOFF described three remaining phases. Phase 1 (dynamic analysis, as described in the prompt) is now done. The original HANDOFF's "Phase 1 — BEC detection" has been renumbered: it is now **Phase 2**.
+### Phase 2 — Behavioral analysis ✅
 
-### Phase 2 — Rule-based behavioral analysis & BEC detection
+Sender/recipient relationship history, domain age, display-name mismatch, reply-chain injection,
+and send-time anomaly signals.  Phase 2 also wired the behavioral_signals_service into the
+analysis pipeline and extended scoring_service with a third independent score column.
+59 new tests in `tests/test_phase2_behavioral_analysis.py` — all pass.
 
-**Goal:** Detect Business Email Compromise patterns that pure static header checks miss.
+**Total test count at Phase 2 completion: 143 (37+47+59), all passing.**
 
-**Key things to build:**
+#### Files changed in Phase 2
 
-1. **BEC detection service** (`backend/services/bec_detection_service.py`)
-   - Wire-transfer / direct-payment request detection
-   - Executive impersonation via display-name spoofing (CEO/CFO in `From` display, domain doesn't match known-good list)
-   - First-contact detection (sender domain never seen before in analysis history)
-   - Reply-chain injection (email has `In-Reply-To` but no matching prior thread in DB)
-   - Lookalike free-email domains (`paypal-support@gmail.com` style)
+| File | What changed |
+|---|---|
+| `backend/services/behavioral_signals_service.py` | **NEW** — 5 behavioral signals, `compute_behavioral_signals()`, `record_observation()` |
+| `backend/models/sender_history.py` | **NEW** — per-(recipient, sender) message count + send-hour list |
+| `backend/models/thread_history.py` | **NEW** — per-(recipient, thread_key) message history for reply-chain break |
+| `backend/services/analysis_service.py` | Wired behavioral signals before `compute_score()`, records observation after |
+| `backend/services/scoring_service.py` | Added `behavioral_result` param, 3-way score split |
+| `backend/models/analysis.py` | `behavioral_score`, `behavioral_reasons`, `sig_*` columns |
+| `backend/routes/analyses.py` | Behavioral fields mapped in `_to_detail()` |
+| `shared/schemas.py` | Behavioral fields in `EmailDetail` |
+| `backend/services/eml_parser_service.py` | `get_email_date()`, `get_recipient()`, `get_in_reply_to()` helpers |
+| `migrations/versions/e2f3a4b5c6d7_phase2_behavioral_analysis.py` | **NEW** — Alembic migration |
+| `migrations/versions/f3a4b5c6d7e8_add_in_reply_to_thread_history.py` | **NEW** — In-Reply-To tiebreaker column |
+| `tests/test_phase2_behavioral_analysis.py` | **NEW** — 59 tests |
 
-2. **Rule engine** (`backend/services/rule_engine.py`)
-   - YAML-configurable rules: `if signal X and signal Y → add Z points + reason`
-   - Each rule: `id`, `name`, `conditions`, `score_delta`, `verdict_override`, `enabled` flag
-   - Hot-reloadable from the `app_settings` DB row
-   - Feature-flagged — tool works with no rules configured
+---
 
-3. **Scoring integration**
-   - `bec_detection_service` results fed into `scoring_service.compute_score()`
-   - New weight keys: `bec_wire_transfer`, `bec_exec_impersonation`, `bec_first_contact`, `bec_reply_injection`
-   - New DB columns: `bec_signals` (JSON), `bec_score_contribution` (int)
+### Phase 3 — BEC (Business Email Compromise) detection ✅
 
-4. **Schema updates** (`shared/schemas.py`)
-   - `bec_signals: list[dict]` on `EmailDetail`
-   - `bec_score_contribution: int` on `EmailDetail`
+Four BEC-specific signals wired into the analysis pipeline as an independent fourth score category.
+BEC score contributes at 2× weight to the combined verdict (vs 1× for behavioral) because BEC
+signals are combinatorial — they only fire together when converging evidence is present.
+84 new tests in `tests/test_phase3_bec.py` — all pass.
 
-5. **Migration** — new Alembic migration for `bec_signals` + `bec_score_contribution`
+**Total test count at Phase 3 completion: 227 (37+47+59+84), all passing.**
 
-6. **Tests** — unit tests for every BEC rule, mocked inputs
+#### Files changed in Phase 3
 
-**Entry point for the next session:**
+| File | What changed |
+|---|---|
+| `backend/services/bec_signals_service.py` | **NEW** — 4 BEC signals, `compute_bec_signals()`, `BecResult`, `BEC_SUSPICIOUS_FLOOR` |
+| `backend/models/vip_identity.py` | **NEW** — admin-configurable VIP/protected-identity table |
+| `backend/services/analysis_service.py` | Wired BEC signals after behavioral block; passes `bec_result` to `compute_score()`; saves 6 BEC columns |
+| `backend/services/scoring_service.py` | Added `bec_result` param, 2× BEC weight in combined score, `BEC_SUSPICIOUS_FLOOR` verdict floor |
+| `backend/models/analysis.py` | `bec_score`, `bec_reasons`, `sig_vip_impersonation`, `sig_financial_request`, `sig_vendor_fraud`, `sig_authority_pressure` columns |
+| `backend/routes/analyses.py` | BEC fields mapped in `_to_detail()` |
+| `shared/schemas.py` | BEC fields in `EmailDetail` |
+| `migrations/versions/g4b5c6d7e8f9_phase3_bec_detection.py` | **NEW** — Alembic migration; creates `vip_identities` table and adds 6 BEC columns to `email_analyses` |
+| `frontend/views/report_page.py` | **NEW** `_card_bec` / `_lbl_bec` widget added to Overview tab |
+| `frontend/views/_report_display.py` | **NEW** `_populate_bec()` wired into `populate()` dispatcher |
+| `README.md` | Phase 3 BEC section added |
+| `.env.example` | `BEC_SUSPICIOUS_FLOOR` and `BEC_FINANCIAL_MAX_PTS` added |
+| `tests/test_phase3_bec.py` | **NEW** — 84 tests |
 
+#### What Phase 3 built
+
+**Signal 1 — vip_impersonation** (`_check_vip_impersonation`):
+- Loads the `vip_identities` table (admin-populated DB table, not hardcoded).
+- Fires when the From display name matches a VIP's name but the sending domain ≠ protected_domain.
+- Also fires on exact bare-address spoofing (protected_email match from wrong domain).
+- Subdomain of protected_domain is explicitly allowed (no false positive for mail.corp.com).
+- Default weight: **4 pts**.
+
+**Signal 2 — financial_request_language** (`_check_financial_request_language`):
+- Five keyword-pattern categories: `wire_transfer`, `bank_detail_change`, `urgency_authority`,
+  `gift_card`, `invoice_redirect`.
+- Each firing category adds `_PTS_FINANCIAL_PER_CATEGORY` (default 2) up to `BEC_FINANCIAL_MAX_PTS` (default 6).
+- Case-insensitive, pre-compiled regex — zero regex compilation overhead at runtime.
+- ⚠️ **Known false-positive risk** — legitimate finance emails trigger this. See module docstring
+  for mitigation guidance (keep the VIP list accurate).
+
+**Signal 3 — vendor_fraud_pattern** (`_check_vendor_fraud_pattern`):
+- Bank-detail-change language (financial_fired=True) + sender unknown in `sender_history`.
+- In-Reply-To tiebreaker: if In-Reply-To matches a known thread message_id, suppresses the signal.
+- Cold-start guard: if the recipient has no prior history at all, returns neutral (False).
+- Default weight: **3 pts**.
+
+**Signal 4 — authority_pressure_combo** (`_check_authority_pressure_combo`):
+- Fires when `financial_request_language` AND at least one identity signal co-occur:
+  `vip_impersonation` or `first_time_sender` (Phase 2 flag, passed in from `behavioral_result_obj`).
+- Additive — on top of the individual signals, not instead of them.
+- Default weight: **3 pts**.
+
+**Scoring formula (combined_score)**:
 ```
-1. Read: backend/services/analysis_service.py  (pipeline orchestrator — understand where to inject BEC)
-2. Read: backend/services/scoring_service.py   (understand how to extend compute_score)
-3. Read: backend/repositories/analysis_repository.py  (for first-contact domain history query)
-4. Create: backend/services/bec_detection_service.py
-5. Create: backend/services/rule_engine.py
-6. Modify: backend/services/scoring_service.py  (add bec params)
-7. Modify: backend/services/analysis_service.py  (wire BEC service into pipeline)
-8. Modify: shared/schemas.py  (add BEC fields)
-9. Create: migrations/versions/e2f3a4b5c6d7_phase2_bec_detection.py
-10. Create: tests/test_phase2_bec.py
+combined_score = static_score + dynamic_score + (bec_score × 2) + behavioral_score
 ```
+Verdict thresholds: ≥ 9 → phishing, ≥ 5 → suspicious, < 5 → benign.
 
-### Phase 3 — Dynamic enrichment background updates
+`BEC_SUSPICIOUS_FLOOR` (default 4, env-overridable): if `bec_score ≥ floor` and the formula
+would produce "benign", the verdict is forced to "suspicious".  Handles zero-content BEC emails.
+
+---
+
+## What comes next — Phase 4 (formerly Phase 3)
+
+### Phase 4 — Dynamic enrichment background updates
 
 The current design returns the static verdict immediately and runs all enrichment in the same
-pipeline task. Phase 3 decouples them:
+pipeline task. Phase 4 decouples them:
 
 - Static verdict returned immediately (already done)
 - Enrichment (VT, AbuseIPDB, Shodan, urlscan, sandbox) fires as a **separate** background task
@@ -190,6 +238,18 @@ pipeline task. Phase 3 decouples them:
 
 The `re_enrich` endpoint already exists. The gap is per-provider status tracking in the UI and a
 background-task trigger on upload rather than inline enrichment.
+
+**Entry point for the next session:**
+
+```
+1. Read: backend/services/analysis_service.py  (pipeline orchestrator — understand current flow)
+2. Read: backend/app_factory.py  (lifespan, background task patterns)
+3. Read: frontend/views/  (understand how the UI currently polls status)
+4. Design: per-provider status fields or a separate enrichment_status table
+5. Implement: background-task trigger on upload; static verdict returned first
+6. Implement: frontend per-provider "Enriching…" state (spinner per provider)
+7. Tests: mock background task execution, verify status transitions
+```
 
 ---
 
@@ -201,7 +261,7 @@ pip install pytest pytest-asyncio
 pytest tests/ -v
 ```
 
-Expected: **84 passed** (37 Phase 0 + 47 Phase 1)
+Expected: **227 passed** (37 Phase 0 + 47 Phase 1 + 59 Phase 2 + 84 Phase 3)
 
 ## How to run the app
 

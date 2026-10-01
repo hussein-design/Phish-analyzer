@@ -45,9 +45,11 @@ class KeyValueTable(QWidget):
             lbl.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
             lbl.setMinimumWidth(140)
 
-            # Value
+            # Value — SECURITY: force PlainText so attacker-controlled header
+            # values (From, Subject, Reply-To, etc.) are never rendered as HTML.
             val = QLabel(value_text if value_text else "—")
             val.setWordWrap(True)
+            val.setTextFormat(Qt.TextFormat.PlainText)
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             val.setStyleSheet(
                 "font-size: 13px; padding: 8px 12px 8px 0; background: transparent;"

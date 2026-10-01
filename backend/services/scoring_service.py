@@ -50,6 +50,16 @@ def compute_score(
     # Phase 1 dynamic analysis additions — optional; None means "not run"
     url_detonation_result: dict | None = None,
     attachment_detonation_result: dict | None = None,
+    # Phase 2 behavioral analysis — optional; None means "not run".
+    # Pass the BehavioralResult namedtuple (or a plain dict with the same
+    # keys) returned by behavioral_signals_service.compute_behavioral_signals().
+    # behavioral_score is intentionally NOT merged into the combined score here:
+    # behavioral signals are surfaced as a third independent column so the user
+    # can see exactly how much of the total comes from content vs. behaviour.
+    behavioral_result: "object | None" = None,
+    # Phase 3 BEC detection — optional; None means "not run".
+    # Pass the BecResult namedtuple (or dict) from bec_signals_service.
+    bec_result: "object | None" = None,
 ) -> dict:
     score = 0
     reasons: list[str] = []
@@ -369,15 +379,106 @@ def compute_score(
     score += dynamic_score
     reasons.extend(dynamic_reasons)
 
-    if score >= 9:
+    # ── Phase 2 behavioral scoring ────────────────────────────────────────────
+    # Behavioral signals are computed externally (they require an async DB
+    # session) and passed in as a BehavioralResult namedtuple or dict.
+    # They are stored and surfaced separately — NOT added to the combined score
+    # so the caller can show a clear three-way breakdown:
+    #   static_score | dynamic_score | behavioral_score
+    #
+    # The combined `score` and `verdict` therefore reflect only content-based
+    # analysis (static + dynamic), keeping behavioral influence explicit and
+    # auditable.  Phase 3 (BEC detection) will decide whether to gate on
+    # behavioral_score independently.
+    behavioral_score = 0
+    behavioral_reasons: list[str] = []
+    sig_first_time_sender: "bool | None" = None
+    sig_domain_age_anomaly: "bool | None" = None
+    sig_display_name_mismatch: "bool | None" = None
+    sig_reply_chain_break: "bool | None" = None
+    sig_send_time_anomaly: "bool | None" = None
+
+    if behavioral_result is not None:
+        # Support both namedtuple access and plain dict access
+        def _get(obj, key, default=None):
+            try:
+                return getattr(obj, key)
+            except AttributeError:
+                return obj.get(key, default) if isinstance(obj, dict) else default
+
+        behavioral_score         = _get(behavioral_result, "behavioral_score", 0) or 0
+        behavioral_reasons       = list(_get(behavioral_result, "behavioral_reasons", []) or [])
+        sig_first_time_sender    = _get(behavioral_result, "sig_first_time_sender")
+        sig_domain_age_anomaly   = _get(behavioral_result, "sig_domain_age_anomaly")
+        sig_display_name_mismatch = _get(behavioral_result, "sig_display_name_mismatch")
+        sig_reply_chain_break    = _get(behavioral_result, "sig_reply_chain_break")
+        sig_send_time_anomaly    = _get(behavioral_result, "sig_send_time_anomaly")
+
+    # ── Phase 3 BEC scoring ───────────────────────────────────────────────────
+    # BEC signals are computed externally (require an async DB session) and
+    # passed in as a BecResult namedtuple or dict.  Like behavioral_score, they
+    # are stored and surfaced separately so each signal category is auditable.
+    bec_score = 0
+    bec_reasons: list[str] = []
+    sig_vip_impersonation: "bool | None" = None
+    sig_financial_request: "bool | None" = None
+    sig_vendor_fraud:      "bool | None" = None
+    sig_authority_pressure:"bool | None" = None
+
+    if bec_result is not None:
+        def _get(obj, key, default=None):  # noqa: F811  (local shadow is fine here)
+            try:
+                return getattr(obj, key)
+            except AttributeError:
+                return obj.get(key, default) if isinstance(obj, dict) else default
+
+        bec_score              = _get(bec_result, "bec_score", 0) or 0
+        bec_reasons            = list(_get(bec_result, "bec_reasons", []) or [])
+        sig_vip_impersonation  = _get(bec_result, "sig_vip_impersonation")
+        sig_financial_request  = _get(bec_result, "sig_financial_request")
+        sig_vendor_fraud       = _get(bec_result, "sig_vendor_fraud")
+        sig_authority_pressure = _get(bec_result, "sig_authority_pressure")
+
+    # ── UNIFIED VERDICT MERGE ─────────────────────────────────────────────────
+    # Design rationale (Phase 3):
+    #
+    # content_score = static_score + dynamic_score  (unchanged — existing rules)
+    #
+    # BEC signals are given 2× weight because they are combinatorial:
+    # authority_pressure_combo only fires when two or more weaker signals
+    # co-occur, so a bec_score ≥ 4 represents converging evidence.  Doubling
+    # its contribution places it on par with a known-malicious VT URL hit.
+    #
+    # Behavioral signals keep 1× weight — first_time_sender alone is weak
+    # evidence; the 1× weight means a full behavioral_score=5 (all five signals)
+    # contributes 5 combined points, which can push a borderline email but
+    # cannot manufacture a phishing verdict from thin air.
+    #
+    # combined_score is what the user sees as "Score" in the UI.
+    #
+    # BEC_SUSPICIOUS_FLOOR: if bec_score ≥ floor and the formula still yields
+    # "benign", force the verdict to "suspicious".  This handles the zero-link
+    # zero-attachment BEC case where content_score=0 but impersonation+financial
+    # language is strong.
+
+    from backend.services.bec_signals_service import BEC_SUSPICIOUS_FLOOR
+
+    combined_score = score + (bec_score * 2) + behavioral_score
+
+    if combined_score >= 9:
         verdict = VERDICT_PHISHING
-    elif score >= 5:
+    elif combined_score >= 5:
         verdict = VERDICT_SUSPICIOUS
     else:
         verdict = VERDICT_BENIGN
 
+    # BEC hard floor: prevent a clean-content BEC from staying "benign"
+    if verdict == VERDICT_BENIGN and bec_score >= BEC_SUSPICIOUS_FLOOR:
+        verdict = VERDICT_SUSPICIOUS
+
     return {
-        "score": score,
+        # Combined score (static + dynamic + 2×BEC + behavioral) — shown to user
+        "score":   combined_score,
         "verdict": verdict,
         "reasons": reasons,
         "header_flags": {
@@ -387,9 +488,24 @@ def compute_score(
             "is_suspicious_sender_tld": is_suspicious_sender_tld,
         },
         "urgency_keywords_found": urgency_found,
-        # Static vs dynamic contribution (Phase 1 dynamic analysis)
+        # Static vs dynamic contribution (Phase 1)
         "static_score":    static_score,
         "static_reasons":  static_reasons,
         "dynamic_score":   dynamic_score,
         "dynamic_reasons": dynamic_reasons,
+        # Phase 2 behavioral analysis (independent third category)
+        "behavioral_score":            behavioral_score,
+        "behavioral_reasons":          behavioral_reasons,
+        "sig_first_time_sender":       sig_first_time_sender,
+        "sig_domain_age_anomaly":      sig_domain_age_anomaly,
+        "sig_display_name_mismatch":   sig_display_name_mismatch,
+        "sig_reply_chain_break":       sig_reply_chain_break,
+        "sig_send_time_anomaly":       sig_send_time_anomaly,
+        # Phase 3 BEC detection (independent fourth category)
+        "bec_score":              bec_score,
+        "bec_reasons":            bec_reasons,
+        "sig_vip_impersonation":  sig_vip_impersonation,
+        "sig_financial_request":  sig_financial_request,
+        "sig_vendor_fraud":       sig_vendor_fraud,
+        "sig_authority_pressure": sig_authority_pressure,
     }

@@ -27,6 +27,8 @@ def populate(page, detail: EmailDetail) -> None:
     _populate_attachments(page, detail)
     _populate_intel(page, detail)
     _populate_body(page, detail)
+    _populate_behavioral(page, detail)
+    _populate_bec(page, detail)
 
 
 # ── Overview tab ──────────────────────────────────────────────────────────────
@@ -470,6 +472,177 @@ def _populate_intel(page, detail: EmailDetail) -> None:
 
 def _populate_body(page, detail: EmailDetail) -> None:
     page._lbl_body.setText(detail.body_preview or "[No body content]")
+
+
+# ── Behavioral Analysis tab section (Overview) ───────────────────────────────
+
+def _populate_behavioral(page, detail: EmailDetail) -> None:
+    """Populate the Behavioral Analysis card on the Overview tab.
+
+    Shows:
+      - behavioral_score with a plain-English severity label
+      - Each individual signal flag (True/False/None) with icon + label
+      - behavioral_reasons list (one line per reason that fired)
+
+    None means the signal could not be evaluated (lookup failed / no history).
+    This is displayed as "—  unknown" so the analyst knows it was attempted.
+    """
+    bscore = detail.behavioral_score  # may be None for pre-Phase-2 analyses
+
+    # Signals as (attribute_name, display_label) pairs
+    signals = [
+        ("sig_first_time_sender",     "First-time sender"),
+        ("sig_domain_age_anomaly",    "Domain age anomaly (< 30 days)"),
+        ("sig_display_name_mismatch", "Display name / domain mismatch"),
+        ("sig_reply_chain_break",     "Reply chain break"),
+        ("sig_send_time_anomaly",     "Send time anomaly"),
+    ]
+
+    lines: list[str] = []
+
+    # ── Score header ──────────────────────────────────────────────────────
+    if bscore is None:
+        lines.append("ℹ  Behavioral score not available (analysis predates Phase 2).")
+    else:
+        if bscore == 0:
+            severity = "✓  No behavioral signals fired"
+        elif bscore <= 2:
+            severity = "⚠  Low — minor behavioral indicator(s)"
+        elif bscore <= 4:
+            severity = "⚠  Moderate — notable behavioral concern"
+        else:
+            severity = "🔴  High — strong behavioral red flag(s)"
+        lines.append(f"Score:  {bscore}   {severity}")
+
+    lines.append("")
+
+    # ── Signal flags ──────────────────────────────────────────────────────
+    lines.append("Signals:")
+    for attr, label in signals:
+        val = getattr(detail, attr, None)
+        if val is True:
+            icon = "🔴  FIRED  "
+        elif val is False:
+            icon = "✓  clear  "
+        else:
+            icon = "—  unknown"
+        lines.append(f"  {icon}  {label}")
+
+    # ── Reasons ───────────────────────────────────────────────────────────
+    reasons = detail.behavioral_reasons or []
+    if reasons:
+        lines.append("")
+        lines.append("Why:")
+        for i, r in enumerate(reasons, 1):
+            lines.append(f"  {i}.  {r}")
+
+    page._lbl_behavioral.setText("\n".join(lines))
+
+
+# ── BEC Detection card (Overview) ─────────────────────────────────────────────
+
+def _populate_bec(page, detail: EmailDetail) -> None:
+    """Populate the BEC Detection card on the Overview tab.
+
+    Shows:
+      - bec_score with a plain-English severity label
+      - Each of the four BEC signal flags (True/False/None) with icon + label
+      - bec_reasons list (one line per reason that fired)
+      - A standing false-positive notice for financial_request_language
+
+    None means the signal could not be evaluated (e.g. DB error, or analysis
+    predates Phase 3).  Displayed as "—  unknown".
+
+    !! FALSE-POSITIVE NOTE !!
+    financial_request_language fires on any email containing wire-transfer,
+    bank-detail-change, urgency/authority, gift-card, or invoice-redirect
+    keywords.  Legitimate finance-team emails will trigger this signal.
+    A single financial_request_language hit (2 pts × 2× weight = 4) alone
+    does NOT reach the suspicious threshold (5).  It requires a second signal
+    (vip_impersonation, vendor_fraud, or authority_pressure_combo) to produce
+    a "suspicious" verdict, or the BEC_SUSPICIOUS_FLOOR to kick in.
+    """
+    bec_score = detail.bec_score  # may be None for pre-Phase-3 analyses
+
+    # Signal definitions: (attribute_name, display_label, false_positive_note)
+    signals = [
+        (
+            "sig_vip_impersonation",
+            "VIP / executive impersonation",
+            None,
+        ),
+        (
+            "sig_financial_request",
+            "Financial request language",
+            "⚠  Known false-positive risk — legitimate finance emails match this.",
+        ),
+        (
+            "sig_vendor_fraud",
+            "Vendor fraud pattern (bank-detail change from unknown sender)",
+            None,
+        ),
+        (
+            "sig_authority_pressure",
+            "Authority-pressure combination (financial + identity signal co-occur)",
+            None,
+        ),
+    ]
+
+    lines: list[str] = []
+
+    # ── Score header ──────────────────────────────────────────────────────
+    if bec_score is None:
+        lines.append("ℹ  BEC score not available (analysis predates Phase 3).")
+    else:
+        if bec_score == 0:
+            severity = "✓  No BEC signals fired"
+        elif bec_score <= 3:
+            severity = "⚠  Low — single BEC indicator"
+        elif bec_score <= 7:
+            severity = "⚠  Moderate — multiple BEC indicators"
+        else:
+            severity = "🔴  High — strong BEC pattern (investigate immediately)"
+        lines.append(f"Score:  {bec_score}   {severity}")
+        lines.append(
+            f"        Combined verdict contribution: {bec_score} × 2 = {bec_score * 2} pts"
+        )
+
+    lines.append("")
+
+    # ── Signal flags ──────────────────────────────────────────────────────
+    lines.append("Signals:")
+    for attr, label, fp_note in signals:
+        val = getattr(detail, attr, None)
+        if val is True:
+            icon = "🔴  FIRED  "
+        elif val is False:
+            icon = "✓  clear  "
+        else:
+            icon = "—  unknown"
+        lines.append(f"  {icon}  {label}")
+        # Show false-positive note inline when signal fired
+        if val is True and fp_note:
+            lines.append(f"          {fp_note}")
+
+    # ── Reasons ───────────────────────────────────────────────────────────
+    reasons = detail.bec_reasons or []
+    if reasons:
+        lines.append("")
+        lines.append("Why:")
+        for i, r in enumerate(reasons, 1):
+            lines.append(f"  {i}.  {r}")
+
+    # ── Standing false-positive notice ────────────────────────────────────
+    lines.append("")
+    lines.append(
+        "ℹ  financial_request_language is the highest false-positive risk signal.\n"
+        "   Legitimate urgent payment emails from finance teams will trigger it.\n"
+        "   Add real executive and finance-team email addresses to the VIP list\n"
+        "   (Settings → VIP Identities) so their legitimate emails do not trigger\n"
+        "   vip_impersonation or authority_pressure_combo alongside it."
+    )
+
+    page._lbl_bec.setText("\n".join(lines))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

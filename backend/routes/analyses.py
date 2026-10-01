@@ -161,6 +161,21 @@ def _to_detail(a: EmailAnalysis) -> EmailDetail:
         # Phase 1 dynamic analysis: static vs dynamic score split
         static_score=getattr(a, "static_score", None),
         dynamic_score=getattr(a, "dynamic_score", None),
+        # Phase 2 behavioral analysis: independent third signal category
+        behavioral_score=getattr(a, "behavioral_score", None),
+        behavioral_reasons=getattr(a, "behavioral_reasons", None) or [],
+        sig_first_time_sender=getattr(a, "sig_first_time_sender", None),
+        sig_domain_age_anomaly=getattr(a, "sig_domain_age_anomaly", None),
+        sig_display_name_mismatch=getattr(a, "sig_display_name_mismatch", None),
+        sig_reply_chain_break=getattr(a, "sig_reply_chain_break", None),
+        sig_send_time_anomaly=getattr(a, "sig_send_time_anomaly", None),
+        # Phase 3 BEC detection: independent fourth signal category
+        bec_score=getattr(a, "bec_score", None),
+        bec_reasons=getattr(a, "bec_reasons", None) or [],
+        sig_vip_impersonation=getattr(a, "sig_vip_impersonation", None),
+        sig_financial_request=getattr(a, "sig_financial_request", None),
+        sig_vendor_fraud=getattr(a, "sig_vendor_fraud", None),
+        sig_authority_pressure=getattr(a, "sig_authority_pressure", None),
     )
 
 

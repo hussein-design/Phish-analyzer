@@ -239,9 +239,16 @@ def h_separator() -> QFrame:
 
 
 def body_label(text: str = "") -> QLabel:
-    """Standard readable label — inherits theme text color, word-wraps."""
+    """Standard readable label — inherits theme text color, word-wraps.
+
+    Text format is forced to PlainText so that attacker-controlled content
+    (From addresses, subjects, email bodies) is never interpreted as HTML
+    by Qt's AutoText detection — preventing XSS-equivalent rendering of
+    crafted HTML tags in the desktop UI.
+    """
     lbl = QLabel(text)
     lbl.setWordWrap(True)
+    lbl.setTextFormat(Qt.TextFormat.PlainText)  # SECURITY: never render attacker HTML
     lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     # No hardcoded color — let QSS QLabel rule set the correct light/dark color.
     lbl.setStyleSheet(
