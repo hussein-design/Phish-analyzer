@@ -176,6 +176,10 @@ def _to_detail(a: EmailAnalysis) -> EmailDetail:
         sig_financial_request=getattr(a, "sig_financial_request", None),
         sig_vendor_fraud=getattr(a, "sig_vendor_fraud", None),
         sig_authority_pressure=getattr(a, "sig_authority_pressure", None),
+        # Phase B: per-stage pipeline progress tracking.
+        # getattr with None default ensures old analyses (no column yet) return
+        # None, which the frontend renders as "no stage data" — not "pending".
+        pipeline_stages=getattr(a, "pipeline_stages", None),
     )
 
 

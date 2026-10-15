@@ -544,6 +544,166 @@ Expected: **~52 passed**
 
 ---
 
+## Phase B — Progressive analysis feedback (Step 2: UI, 2026-10-15)
+
+Live per-stage progress is now visible in the desktop UI.  No scoring or
+detection logic was changed.
+
+### Loading view — five-row stage list
+
+While an analysis is PENDING or RUNNING, the center pane shows five independent
+stage rows instead of a plain "Analysis in progress" message:
+
+| Stage label | Stage key | Covers |
+|---|---|---|
+| Parsing & static analysis | `static` | EML parse, headers, body, static attachment scan |
+| Threat intel | `enrichment` | VirusTotal, AbuseIPDB, Shodan |
+| URL detonation | `urlscan` | urlscan.io — shows `skipped` when no key configured |
+| Sandbox detonation | `sandbox` | Hybrid Analysis / Any.run — shows `skipped` when not configured |
+| Behavioral & BEC | `behavioral` | Behavioral signals + BEC detection |
+
+Each row: Tabler icon · stage label · status text · colored dot.
+
+### Status visual treatment
+
+Each of the six status values has a distinct look:
+
+| Status | Dot color | Text color | Notes |
+|---|---|---|---|
+| `pending` | Slate grey | Muted grey | Not yet started |
+| `running` | Blue | Blue | Static `›` prefix — no animation |
+| `done` | Green | Green | — |
+| `skipped` | Light grey | Light grey, italic | Feature disabled (no API key) |
+| `failed` | Red | Red | Hard pipeline error |
+| `timeout` | Amber | Amber | Distinct from failed — polling did not finish in time |
+
+All colors come from new `stage_*` tokens in `tokens.py` (Light and Dark
+classes). No inline hex values in widget code.
+
+### NULL pipeline_stages handling
+
+- `NULL` (pre-Phase-B row or pipeline not yet written to DB): shows
+  "Queued — waiting for pipeline to start" text. No stage rows shown.
+- Non-NULL: stage rows shown and updated in-place on every 2 s poll tick.
+
+### Completed analyses — Overview pipeline card
+
+A compact "Analysis Pipeline" card is added to the Overview tab for analyses
+that have non-NULL `pipeline_stages`. It shows the final status of all five
+stages and explains a zero score (e.g. enrichment `skipped` means no VT/AbuseIPDB
+data, not a computed-clean result). The card is hidden for pre-Phase-B analyses
+where `pipeline_stages` is NULL.
+
+### In-place updates
+
+`PipelineStagesWidget.set_stages()` diffs the new status map against the current
+state and only touches rows that changed — scroll position and selection are
+preserved across poll ticks. Colors are re-applied in `showEvent` to survive
+Qt's re-polish cycle after widget insertion.
+
+### Backend fixes (also in this step)
+
+- **Sandbox `submitted` → TIMEOUT**: `"submitted"` from the sandbox provider
+  means the quick-scan path had no `job_id` so behavioral polling never ran.
+  It now maps to `STATUS_TIMEOUT` (not `STATUS_DONE`).
+- **Enrichment comment corrected**: the source comment now accurately states
+  that a single provider `"error"` → `FAILED` even when other providers
+  succeeded. The old comment incorrectly said partial failure → DONE.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `backend/services/analysis_service.py` | Fix (a): `submitted` → TIMEOUT; Fix (b): corrected enrichment comment |
+| `frontend/services/tokens.py` | 12 new `stage_*` tokens (Light + Dark) + `stage_colors()` helper |
+| `frontend/widgets/pipeline_stages_widget.py` | **New file** — `PipelineStagesWidget` with `_StageRow` |
+| `frontend/views/report_page.py` | `_build_loading_widget` → instance method; `update_pipeline_stages()`; pipeline card on Overview |
+| `frontend/controllers/report_controller.py` | Poll tick and `show_detail` call `update_pipeline_stages()` |
+
+### Run the Phase B Step 1 tests (covers backend; no new UI tests needed — UI requires a running app)
+
+```bash
+pytest tests/test_phase_b_step1_pipeline_stages.py -v
+```
+
+Expected: **73 passed**
+
+---
+
+
+
+A `pipeline_stages` JSON column tracks the status of each pipeline stage in
+real time. The frontend polls `GET /analyses/{id}` every 2 s (already
+working) and can render a live per-stage status list instead of a single
+spinner.
+
+### Stage keys and status values
+
+| Stage key | UI label | Covers |
+|---|---|---|
+| `static` | Parsing & static analysis | EML parse, MIME, headers, body, attachment static scan, threat signals |
+| `enrichment` | Threat intel | VT URLs + hashes, AbuseIPDB, Shodan |
+| `urlscan` | URL detonation | urlscan.io — shown as `skipped` when no key configured |
+| `sandbox` | Sandbox detonation | Hybrid Analysis — shown as `skipped` when no key configured |
+| `behavioral` | Behavioral & BEC | Behavioral signals + BEC signals |
+
+Status values: `pending` · `running` · `done` · `failed` · `timeout` · `skipped`
+
+`failed` and `timeout` are distinct values — the frontend renders them
+differently.  `skipped` means the feature is disabled (no API key), not that
+it failed.  `pending` means not yet started.
+
+### Concurrency guarantee
+
+`urlscan` and `enrichment` run concurrently inside `asyncio.gather`. Both
+update `pipeline_stages` through a single `_PipelineStages` writer that holds
+an `asyncio.Lock` during each write — no stage update can overwrite another.
+
+### NULL vs empty dict
+
+`pipeline_stages` is **NULL** for analyses that predate this migration. The
+frontend must render NULL as "no stage data available", never as "all stages
+pending". A non-NULL value is always a live status dict.
+
+### New Alembic migration
+
+Migration `h5c6d7e8f9a0` adds one nullable JSON column to `email_analyses`
+with no server default (preserving NULL for old rows). Downgrade drops the
+column. Run after upgrading:
+
+```bash
+alembic upgrade head
+```
+
+### API response
+
+`GET /analyses/{id}` returns `pipeline_stages` as part of `EmailDetail`:
+
+```json
+{
+  "pipeline_stages": {
+    "static":     "done",
+    "enrichment": "done",
+    "urlscan":    "skipped",
+    "sandbox":    "skipped",
+    "behavioral": "done"
+  }
+}
+```
+
+Returns `null` for pre-Phase-B analyses.
+
+### Run the Phase B Step 1 tests
+
+```bash
+pytest tests/test_phase_b_step1_pipeline_stages.py -v
+```
+
+**Step 2 (UI) is pending sign-off on Step 1.**  No scoring or detection logic
+was changed in this step.
+
+---
+
 ## Phase 3 — BEC (Business Email Compromise) detection (2026-10-02)
 
 A fourth independent signal category — `bec_score` — built specifically for attacks that have

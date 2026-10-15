@@ -138,6 +138,10 @@ class AnalysesTableWidget(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(40)
         self.table.setFrameShape(QFrame.Shape.NoFrame)
+        # Suppress the platform-native white focus rectangle on individual cells.
+        # We use row-level selection highlight instead; cell focus outlines are
+        # visually confusing (white box appears on the filename cell on Windows).
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.doubleClicked.connect(self._on_row_activated)
         self.table.verticalScrollBar().valueChanged.connect(self._maybe_fetch_more)
         self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)

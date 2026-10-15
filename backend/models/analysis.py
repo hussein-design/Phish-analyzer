@@ -110,6 +110,13 @@ class EmailAnalysis(Base):
     sig_reply_chain_break: Mapped[bool | None] = mapped_column(Boolean, default=None)
     sig_send_time_anomaly: Mapped[bool | None] = mapped_column(Boolean, default=None)
 
+    # Phase B: per-stage pipeline progress tracking.
+    # NULL = analysis predates Phase B (never render as "pending").
+    # Non-NULL = dict of stage_key → status written at each phase boundary.
+    # Stage keys: "static", "enrichment", "urlscan", "sandbox", "behavioral"
+    # Status values: "pending" | "running" | "done" | "failed" | "timeout" | "skipped"
+    pipeline_stages: Mapped[dict | None] = mapped_column(JSON, default=None)
+
     # Phase 3 BEC detection: independent bec_score and signal flags.
     bec_score: Mapped[int | None] = mapped_column(Integer, default=None)
     bec_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)

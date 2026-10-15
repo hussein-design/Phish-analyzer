@@ -19,7 +19,7 @@
 #define MyAppName      "Phish Analyzer Desktop"
 #define MyAppVersion   GetEnv("APP_VERSION")
 #define MyAppPublisher "PhishAnalyzer"
-#define MyAppURL       "https://github.com/your-username/phish-analyzer"
+#define MyAppURL       "https://github.com/hussein-design/Phish-analyzer"
 #define MyAppExeName   "PhishAnalyzerDesktop.exe"
 #define MyAppIconFile  "assets\icons\app.ico"
 #define SourceDir      "dist\PhishAnalyzerDesktop"

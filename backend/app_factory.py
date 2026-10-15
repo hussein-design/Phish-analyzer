@@ -65,6 +65,21 @@ def create_app() -> FastAPI:
             abuseipdb_api_key=app_settings.abuseipdb_api_key,
         )
 
+        # ── Startup cleanup: mark stale RUNNING/PENDING rows as FAILED ────
+        # If the app was closed (or crashed) while an analysis was in flight,
+        # that row stays in RUNNING/PENDING forever — the pipeline asyncio task
+        # died with the process.  On the next startup we mark those rows FAILED
+        # so the UI shows "Failed" rather than a permanent "Analyzing…" spinner.
+        # This runs before any new analysis tasks start so there is no race.
+        async with session_factory() as _startup_session:
+            from backend.repositories.analysis_repository import AnalysisRepository as _AR
+            _interrupted = await _AR(_startup_session).mark_interrupted()
+            if _interrupted:
+                logger.info(
+                    "Startup cleanup: marked %d interrupted analysis(es) as FAILED",
+                    _interrupted,
+                )
+
         app.state.analysis_service = AnalysisService(
             session_factory=session_factory,
             vt_api_key_env=app_settings.vt_api_key,

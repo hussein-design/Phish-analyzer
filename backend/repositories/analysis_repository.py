@@ -25,6 +25,29 @@ class AnalysisRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    async def mark_interrupted(self) -> int:
+        """Mark every PENDING or RUNNING analysis as FAILED.
+
+        Called once at startup so rows left in an incomplete state by a
+        previous process (e.g. a crash, a forced-quit, or a machine restart)
+        never stay stuck as "Analyzing…" in the UI.
+
+        Returns the number of rows updated.
+        """
+        from sqlalchemy import update as _update
+
+        stmt = (
+            _update(EmailAnalysis)
+            .where(EmailAnalysis.status.in_(("PENDING", "RUNNING")))
+            .values(
+                status="FAILED",
+                error_message="Analysis interrupted — the app was closed before it could finish.",
+            )
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return result.rowcount  # type: ignore[return-value]
+
     async def create_pending(self, *, filename: str, stored_path: str) -> EmailAnalysis:
         analysis = EmailAnalysis(filename=filename, stored_path=stored_path, status="PENDING")
         self.session.add(analysis)

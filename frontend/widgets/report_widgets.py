@@ -1,7 +1,6 @@
 """Reusable visual components for the Report page.
 
-All colors use CSS variables resolved at paint time so they work in both
-light and dark themes without hardcoding hex values.
+All colors are sourced from frontend.services.tokens — no inline hex values.
 """
 
 from __future__ import annotations
@@ -17,23 +16,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from frontend.services.tokens import RADIUS_CARD, arc_color, chip_colors
+
 
 # ── Card ──────────────────────────────────────────────────────────────────────
 
 class Card(QWidget):
-    """Rounded card that inherits surface color from the active QSS theme."""
+    """Rounded card that inherits surface color from the active QSS theme.
+
+    The #Card and #CardTitleBar rules in light.qss / dark.qss control all colors;
+    this widget sets only the structural geometry/radius properties inline.
+    """
 
     def __init__(self, title: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("Card")
-        # Let the QSS theme control background/border via QGroupBox-style rule.
-        # We use a plain border + radius here; QSS dark.qss / light.qss can
-        # override #Card if needed, but the fallback already looks correct.
+        # Structural geometry only — no hardcoded colors. Color is in QSS.
         self.setStyleSheet(
-            "#Card {"
-            "  border: 1px solid #E2E8F0;"
-            "  border-radius: 10px;"
-            "}"
+            "#Card { border-radius: %dpx; }" % RADIUS_CARD
         )
 
         outer = QVBoxLayout(self)
@@ -43,23 +43,21 @@ class Card(QWidget):
         if title:
             title_bar = QWidget()
             title_bar.setObjectName("CardTitleBar")
+            # Structural only — QSS controls bg, border, color.
             title_bar.setStyleSheet(
                 "#CardTitleBar {"
-                "  border-bottom: 1px solid #E2E8F0;"
-                "  border-top-left-radius: 10px;"
-                "  border-top-right-radius: 10px;"
-                "}"
+                "  border-top-left-radius: %dpx;"
+                "  border-top-right-radius: %dpx;"
+                "}" % (RADIUS_CARD, RADIUS_CARD)
             )
             tb_layout = QHBoxLayout(title_bar)
             tb_layout.setContentsMargins(16, 10, 16, 10)
             lbl = QLabel(title)
-            # Color will be overridden by the active QSS theme's QLabel rule,
-            # but we set a sensible default anyway.
+            # font properties only — color is driven by QSS #CardTitleBar QLabel rule
             lbl.setStyleSheet(
                 "font-size: 11px; font-weight: 700;"
                 "text-transform: uppercase; letter-spacing: 0.5px;"
                 "background: transparent; border: none;"
-                "color: #2563EB;"          # blue title in light; dark QSS inherits #60A5FA
             )
             tb_layout.addWidget(lbl)
             tb_layout.addStretch()
@@ -81,22 +79,8 @@ class Card(QWidget):
 
 # ── Chip ──────────────────────────────────────────────────────────────────────
 
-# Both light and dark variants per preset: (light_bg, light_fg, dark_bg, dark_fg, border)
-_CHIP_PRESETS = {
-    "pass":     ("#F0FDF4", "#16A34A", "#052E16", "#86EFAC", "#BBF7D0"),
-    "fail":     ("#FEF2F2", "#DC2626", "#450A0A", "#FCA5A5", "#FECACA"),
-    "softfail": ("#FFF7ED", "#C2410C", "#431407", "#FDBA74", "#FED7AA"),
-    "neutral":  ("#F1F5F9", "#475569", "#1E293B", "#94A3B8", "#334155"),
-    "unknown":  ("#F1F5F9", "#64748B", "#1E293B", "#64748B", "#334155"),
-    "warn":     ("#FFFBEB", "#B45309", "#451A03", "#FCD34D", "#78350F"),
-    "info":     ("#EFF6FF", "#2563EB", "#172554", "#93C5FD", "#1E40AF"),
-    "ok":       ("#F0FDF4", "#16A34A", "#052E16", "#86EFAC", "#BBF7D0"),
-    "none":     ("#F1F5F9", "#64748B", "#1E293B", "#64748B", "#334155"),
-}
-
-
 class Chip(QLabel):
-    """Small colored pill — theme-aware."""
+    """Small colored pill — theme-aware via tokens module."""
 
     def __init__(
         self,
@@ -111,16 +95,12 @@ class Chip(QLabel):
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
 
     def _apply_style(self) -> None:
-        vals = _CHIP_PRESETS.get(self._preset, _CHIP_PRESETS["neutral"])
-        l_bg, l_fg, d_bg, d_fg, border = vals
-        # Detect theme from palette
         bg_color = self.palette().window().color()
         is_dark = bg_color.lightness() < 128
-        bg = d_bg if is_dark else l_bg
-        fg = d_fg if is_dark else l_fg
+        bg, fg, border = chip_colors(self._preset, is_dark)
         self.setStyleSheet(
             f"background:{bg}; color:{fg}; border:1px solid {border};"
-            "border-radius:8px; padding:2px 10px;"
+            f"border-radius:8px; padding:2px 10px;"
             "font-size:11px; font-weight:700;"
         )
 
@@ -157,7 +137,7 @@ def auth_chip(label: str, value: str) -> QWidget:
 # ── ScoreRing ─────────────────────────────────────────────────────────────────
 
 class ScoreRing(QWidget):
-    """Custom-painted circular score dial."""
+    """Custom-painted circular score dial. All colors from tokens module."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -171,6 +151,8 @@ class ScoreRing(QWidget):
         self.update()
 
     def paintEvent(self, _event) -> None:
+        from frontend.services.tokens import Dark, Light
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -178,13 +160,11 @@ class ScoreRing(QWidget):
         m = 10
         rect = QRectF(m, m, w - m * 2, h - m * 2)
 
-        # Detect dark mode
         bg = self.palette().window().color()
         is_dark = bg.lightness() < 128
-        track_color = "#334155" if is_dark else "#E2E8F0"
-        text_sub_color = "#64748B"
+        t = Dark if is_dark else Light
 
-        track_pen = QPen(QColor(track_color))
+        track_pen = QPen(QColor(t.arc_track))
         track_pen.setWidth(8)
         track_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(track_pen)
@@ -195,20 +175,16 @@ class ScoreRing(QWidget):
         pct = min(score / max_score, 1.0)
         span = int(pct * 270)
 
-        arc_color = (
-            "#EF4444" if self._verdict == "phishing"   else
-            "#F59E0B" if self._verdict == "suspicious" else
-            "#22C55E"
-        )
+        color_str = arc_color(self._verdict, is_dark)
 
         if span > 0:
-            arc_pen = QPen(QColor(arc_color))
+            arc_pen = QPen(QColor(color_str))
             arc_pen.setWidth(8)
             arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(arc_pen)
             painter.drawArc(rect, 225 * 16, -span * 16)
 
-        painter.setPen(QColor(arc_color))
+        painter.setPen(QColor(color_str))
         font = QFont("Segoe UI", 18, QFont.Weight.Bold)
         painter.setFont(font)
         painter.drawText(
@@ -217,7 +193,7 @@ class ScoreRing(QWidget):
             str(score) if self._score is not None else "—",
         )
 
-        painter.setPen(QColor(text_sub_color))
+        painter.setPen(QColor(t.text_muted))
         font2 = QFont("Segoe UI", 8)
         painter.setFont(font2)
         painter.drawText(
@@ -231,9 +207,13 @@ class ScoreRing(QWidget):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def h_separator() -> QFrame:
+    """Horizontal divider — color is driven by QSS (border/divider token)."""
     sep = QFrame()
     sep.setFrameShape(QFrame.Shape.HLine)
-    sep.setStyleSheet("border: none; background: #E2E8F0;")
+    sep.setObjectName("HSeparator")
+    # No hardcoded color — the QSS #HSeparator rule (or QFrame default) handles it.
+    # Fallback transparent keeps it from looking wrong if QSS doesn't match.
+    sep.setStyleSheet("QFrame#HSeparator { background: transparent; border: none; border-top: 1px solid; }")
     sep.setFixedHeight(1)
     return sep
 
@@ -250,7 +230,10 @@ def body_label(text: str = "") -> QLabel:
     lbl.setWordWrap(True)
     lbl.setTextFormat(Qt.TextFormat.PlainText)  # SECURITY: never render attacker HTML
     lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-    # No hardcoded color — let QSS QLabel rule set the correct light/dark color.
+    # Expanding horizontal so it always fills the card width and word-wraps
+    # rather than extending beyond the card edge and being clipped.
+    lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+    # Font/spacing only — color inherits from QSS QLabel rule.
     lbl.setStyleSheet(
         "font-size:13px; background:transparent; border:none; padding:2px 0;"
     )
@@ -258,9 +241,13 @@ def body_label(text: str = "") -> QLabel:
 
 
 def muted_label(text: str) -> QLabel:
+    """Muted-color label. Uses the QSS class selector .MutedLabel for color."""
     lbl = QLabel(text)
     lbl.setWordWrap(True)
+    lbl.setProperty("muted", "true")
+    # font-size only; color is set by QSS QPushButton[muted="true"] or
+    # the .MutedLabel selector. Fallback set here for safety.
     lbl.setStyleSheet(
-        "font-size:12px; color:#64748B; background:transparent; border:none;"
+        "font-size:12px; background:transparent; border:none;"
     )
     return lbl

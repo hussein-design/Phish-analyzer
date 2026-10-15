@@ -190,6 +190,12 @@ class EmailDetail(EmailSummary):
     sig_financial_request: bool | None = None
     sig_vendor_fraud: bool | None = None
     sig_authority_pressure: bool | None = None
+    # Phase B: per-stage pipeline progress tracking.
+    # NULL means the analysis predates Phase B — render as no stage data,
+    # never as perpetual "pending".
+    # Stage keys: "static", "enrichment", "urlscan", "sandbox", "behavioral"
+    # Status values: "pending" | "running" | "done" | "failed" | "timeout" | "skipped"
+    pipeline_stages: dict | None = None
 
 
 class UploadAccepted(BaseModel):

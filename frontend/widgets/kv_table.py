@@ -1,6 +1,8 @@
 """Reusable key→value grid used by the Report page sections.
 Renders each row as a muted label on the left and a readable value on the
 right, with a subtle separator between rows.
+
+All colors sourced from frontend.services.tokens — no inline hex values.
 """
 
 from __future__ import annotations
@@ -34,10 +36,11 @@ class KeyValueTable(QWidget):
     def set_rows(self, rows: list[tuple[str, str | None]]) -> None:
         self.clear()
         for i, (label_text, value_text) in enumerate(rows):
-            # Muted label
+            # Muted key label — objectName drives the QSS color rule
             lbl = QLabel(label_text)
+            lbl.setObjectName("KVKey")
             lbl.setStyleSheet(
-                "color: #64748B; font-size: 12px; font-weight: 600; "
+                "font-size: 12px; font-weight: 600; "
                 "text-transform: uppercase; letter-spacing: 0.4px; "
                 "padding: 8px 0 8px 12px; background: transparent;"
             )
@@ -51,6 +54,7 @@ class KeyValueTable(QWidget):
             val.setWordWrap(True)
             val.setTextFormat(Qt.TextFormat.PlainText)
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            val.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             val.setStyleSheet(
                 "font-size: 13px; padding: 8px 12px 8px 0; background: transparent;"
             )
@@ -60,11 +64,11 @@ class KeyValueTable(QWidget):
             self._grid.addWidget(val, i * 2, 1)
             self._rows.extend([lbl, val])
 
-            # Separator line (skip after last row)
+            # Separator line — QSS #KVSeparator rule controls color
             if i < len(rows) - 1:
                 sep = QFrame()
+                sep.setObjectName("KVSeparator")
                 sep.setFrameShape(QFrame.Shape.HLine)
-                sep.setStyleSheet("color: #F1F5F9; background-color: #F1F5F9; margin: 0 12px;")
                 sep.setFixedHeight(1)
                 self._grid.addWidget(sep, i * 2 + 1, 0, 1, 2)
                 self._rows.append(sep)

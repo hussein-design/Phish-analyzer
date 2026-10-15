@@ -195,14 +195,14 @@ QPushButton[secondary="true"]:hover {
 QPushButton#DangerButton,
 QPushButton[danger="true"] {
     background-color: transparent;
-    color: #F87171;
-    border: 1.5px solid #7F1D1D;
+    color: #E8726A;
+    border: 1.5px solid #7A2E28;
 }
 
 QPushButton#DangerButton:hover,
 QPushButton[danger="true"]:hover {
-    background-color: #1F0E0E;
-    border-color: #EF4444;
+    background-color: #3D1210;
+    border-color: #C2493D;
 }
 
 /* ── Table view ──────────────────────────────────────── */
@@ -230,6 +230,12 @@ QTableView::item:selected {
 
 QTableView::item:hover {
     background-color: #1A2540;
+}
+
+/* Suppress the platform-native white focus rectangle. */
+QTableView::item:focus {
+    outline: none;
+    border: none;
 }
 
 QHeaderView {
@@ -404,6 +410,28 @@ QProgressBar::chunk {
     border-radius: 4px;
 }
 
+/* ── Back button (report view top bar) ───────────────── */
+QPushButton#BackButton {
+    background-color: transparent;
+    color: #60A5FA;
+    border: 1.5px solid #1E3A5F;
+    border-radius: 6px;
+    padding: 5px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    min-width: 72px;
+}
+
+QPushButton#BackButton:hover {
+    background-color: #1A2540;
+    border-color: #3B82F6;
+}
+
+QPushButton#BackButton:pressed {
+    background-color: #162032;
+    border-color: #2563EB;
+}
+
 /* ── Report page cards ───────────────────────────────── */
 #Card {
     background-color: #1E293B;
@@ -422,6 +450,199 @@ QProgressBar::chunk {
     color: #60A5FA;
     background: transparent;
     border: none;
+}
+
+/* ── Left pane — email queue ─────────────────────────── */
+#QueuePanel {
+    background-color: #162032;
+    border-right: 1px solid #334155;
+}
+
+#QueueDivider {
+    background-color: #334155;
+    border: none;
+}
+
+#QueueScrollContent {
+    background-color: transparent;
+}
+
+QLineEdit#QueueSearch {
+    background-color: #1E293B;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    color: #F1F5F9;
+}
+
+QLineEdit#QueueSearch:focus {
+    border-color: #3B82F6;
+}
+
+QLabel#QueueItemSub {
+    color: #64748B;
+}
+
+QLabel#QueueItemTitle {
+    color: #F1F5F9;
+}
+
+/* ── Right pane — metadata panel ─────────────────────── */
+#MetaPanel {
+    background-color: #162032;
+    border-left: 1px solid #334155;
+}
+
+#MetaSectionHeader {
+    color: #64748B;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    background: transparent;
+    border: none;
+    padding-top: 4px;
+}
+
+#MetaDivider {
+    background-color: #334155;
+    border: none;
+}
+
+#SHA256Value {
+    color: #64748B;
+}
+
+#ScoreBarLabel {
+    color: #64748B;
+}
+
+/* ── Center pane — anchor-nav tab row ────────────────── */
+#AnchorBar {
+    background-color: #162032;
+}
+
+#AnchorDivider {
+    background-color: #334155;
+    border: none;
+}
+
+QPushButton#AnchorTab {
+    color: #64748B;
+    background-color: transparent;
+    border-bottom: 2px solid transparent;
+}
+
+QPushButton#AnchorTab:hover {
+    color: #94A3B8;
+    background-color: #1E293B;
+}
+
+QPushButton#AnchorTab:checked {
+    color: #60A5FA;
+    font-weight: 700;
+    border-bottom: 2px solid #3B82F6;
+    background-color: transparent;
+}
+
+/* ── Section content background ──────────────────────── */
+#SectionContent {
+    background: transparent;
+}
+
+/* ── Top bar — report title & status ─────────────────── */
+#ReportTitle {
+    color: #CBD5E1;
+    background: transparent;
+}
+
+#ReportStatus {
+    color: #64748B;
+    background: transparent;
+    font-size: 12px;
+    padding: 0 4px;
+}
+
+#TopDivider {
+    background-color: #334155;
+    border: none;
+}
+
+/* ── Loading view ────────────────────────────────────── */
+#LoadingTitle {
+    color: #64748B;
+}
+
+#LoadingSubtitle {
+    color: #475569;
+}
+
+/* ── Body preview monospace block ────────────────────── */
+#BodyPreview {
+    border: 1px solid #334155;
+    border-radius: 6px;
+}
+
+/* ── Toolbar brand ───────────────────────────────────── */
+#ToolbarBrand {
+    color: #94A3B8;
+}
+
+/* ── Status bar ──────────────────────────────────────── */
+#StatusBarLabel {
+    color: #475569;
+    background: transparent;
+}
+
+#StatusBarVersion {
+    color: #334155;
+    background: transparent;
+}
+
+/* ── Upload page ─────────────────────────────────────── */
+#SectionHeading {
+    color: #CBD5E1;
+    background: transparent;
+}
+
+#CountBadge {
+    background-color: #1A2F52;
+    color: #60A5FA;
+    border: 1px solid #1E3A5F;
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+/* ── KV table ────────────────────────────────────────── */
+#KVKey {
+    color: #64748B;
+}
+
+QFrame#KVSeparator {
+    background-color: #1E293B;
+    border: none;
+}
+
+/* ── H-separator ─────────────────────────────────────── */
+QFrame#HSeparator {
+    background-color: #334155;
+    border: none;
+}
+
+/* ── Muted labels ────────────────────────────────────── */
+QLabel[muted="true"] {
+    color: #64748B;
+}
+
+/* ── Re-enrich inline error label ───────────────────────── */
+QLabel#ReEnrichError {
+    color: #E8726A;
+    background: transparent;
+    border: none;
+    font-size: 11px;
 }
 
 /* ── Tooltip ─────────────────────────────────────────── */

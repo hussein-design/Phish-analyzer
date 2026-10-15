@@ -1,33 +1,36 @@
-"""Drives UploadPage's drop zone: validate -> upload -> poll status ->
-signal MainWindow to navigate to ReportPage. Polling uses a QTimer, reusing
-the same run_async plumbing on every tick.
+"""Drives UploadPage's drop zone: validate -> upload -> navigate to ReportPage
+immediately after the upload is accepted -> poll status in ReportPage context
+(report_controller handles that).
+
+The blocking dim overlay is shown ONLY during the upload HTTP request itself
+(the POST /analyses call).  Once the server has accepted the upload and
+returned 202, the overlay is dismissed and the UI switches to the report view.
+The report view shows the live pipeline stage rows while the analysis runs —
+there is no reason to keep the upload page blocked during analysis.
 """
 
 from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import Signal
 
 from frontend.controllers.base_controller import BaseController
 from frontend.services.eml_sniff import looks_like_eml
-from shared.schemas import EmailDetail
+from shared.schemas import EmailDetail, AnalysisStatus
 
 logger = logging.getLogger(__name__)
 
-_POLL_INTERVAL_MS = 1500
-_POLL_MAX_ATTEMPTS = 80  # ~2 minutes at 1.5s each
-
 
 class UploadController(BaseController):
+    # Emitted as soon as the upload is accepted (202 received).
+    # Carries the initial EmailDetail (status=PENDING) so the report view can
+    # display the stage list immediately and start its own poll cycle.
     analysisReady = Signal(object)  # EmailDetail
 
     def __init__(self, api_client, notification_center, upload_page, parent=None) -> None:
         super().__init__(api_client, notification_center, parent)
         self.upload_page = upload_page
-        self._poll_timer: QTimer | None = None
-        self._poll_attempts = 0
-        self._current_analysis_id: int | None = None
 
         upload_page.drop_zone.filesDropped.connect(self._on_files_dropped)
         upload_page.drop_zone.fileSelected.connect(self._on_file_selected)
@@ -45,62 +48,33 @@ class UploadController(BaseController):
             self.notification_center.show_toast(reason or "Invalid file", level="error")
             return
 
+        # Show the overlay only for the upload request itself.
         self.upload_page.set_uploading(True, "Uploading…")
         self.run_async(
             self.api_client.upload_email,
             path,
             on_success=self._on_uploaded,
-            on_finished=self._on_upload_request_finished,
+            on_error=self._on_upload_error,
+            on_finished=lambda: self.upload_page.set_uploading(False),
         )
 
-    def _on_upload_request_finished(self) -> None:
-        # Leave the overlay up if a poll cycle is about to start; only clear
-        # it here if the upload itself failed before a poll could begin.
-        if self._poll_timer is None and self._current_analysis_id is None:
-            self.upload_page.set_uploading(False)
+    def _on_upload_error(self, err) -> None:
+        self.notification_center.show_toast(str(err), level="error")
 
     def _on_uploaded(self, response: dict) -> None:
-        self._current_analysis_id = response["id"]
+        # The overlay is cleared by on_finished (which runs after on_success).
+        # Immediately navigate to the report view with PENDING detail so
+        # the pipeline stage rows appear right away.
         self.notification_center.show_toast(
             f"Uploaded {response['filename']} — analyzing…", level="info"
         )
-        self.upload_page.set_uploading(True, f"Analyzing {response['filename']}…")
-        self._poll_attempts = 0
-        self._poll_timer = QTimer(self)
-        self._poll_timer.timeout.connect(self._poll_status)
-        self._poll_timer.start(_POLL_INTERVAL_MS)
-
-    def _poll_status(self) -> None:
-        self._poll_attempts += 1
-        if self._poll_attempts > _POLL_MAX_ATTEMPTS:
-            self._stop_polling()
-            self.upload_page.set_uploading(False)
-            self.notification_center.show_toast(
-                "Still processing — check it later in the history list.", level="warning"
-            )
-            return
-
-        self.run_async(
-            self.api_client.get_email, self._current_analysis_id, on_success=self._on_poll_result
+        # Build a minimal EmailDetail from the UploadAccepted response.
+        # status=PENDING triggers the report view's loading screen + polling.
+        detail = EmailDetail(
+            id=response["id"],
+            filename=response["filename"],
+            status=AnalysisStatus.PENDING,
+            created_at=response["created_at"],
+            updated_at=response.get("created_at", response["created_at"]),
         )
-
-    def _on_poll_result(self, data: dict) -> None:
-        status = data.get("status")
-        if status == "DONE":
-            self._stop_polling()
-            self.upload_page.set_uploading(False)
-            self.notification_center.show_toast("Analysis complete", level="success")
-            self.analysisReady.emit(EmailDetail.model_validate(data))
-        elif status == "FAILED":
-            self._stop_polling()
-            self.upload_page.set_uploading(False)
-            reason = data.get("error_message") or "Analysis failed"
-            self.notification_center.show_toast(reason, level="error")
-        # else: still PENDING/RUNNING -- keep polling
-
-    def _stop_polling(self) -> None:
-        if self._poll_timer is not None:
-            self._poll_timer.stop()
-            self._poll_timer.deleteLater()
-            self._poll_timer = None
-        self._current_analysis_id = None
+        self.analysisReady.emit(detail)

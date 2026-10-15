@@ -16,9 +16,9 @@ DARK = "dark"
 
 PALETTES = {
     LIGHT: {
-        "phishing":   "#DC2626",
-        "suspicious": "#B45309",
-        "benign":     "#16A34A",
+        "phishing":   "#C2493D",
+        "suspicious": "#D4A24C",
+        "benign":     "#4C9A82",
         "surface":    "#FFFFFF",
         "surface_alt": "#F8FAFC",
         "text":       "#0F172A",
@@ -27,9 +27,9 @@ PALETTES = {
         "primary":    "#2563EB",
     },
     DARK: {
-        "phishing":   "#FCA5A5",
-        "suspicious": "#FCD34D",
-        "benign":     "#86EFAC",
+        "phishing":   "#E8726A",
+        "suspicious": "#E8C06A",
+        "benign":     "#7CC4AE",
         "surface":    "#1E293B",
         "surface_alt": "#162032",
         "text":       "#F1F5F9",

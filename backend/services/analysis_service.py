@@ -36,6 +36,95 @@ from shared.paths import analysis_upload_dir
 
 logger = logging.getLogger(__name__)
 
+# ── Stage keys and valid status values ───────────────────────────────────────
+# These constants are the single source of truth for the stage dict shape.
+# The UI reads these keys directly from the JSON column — never infer them.
+STAGE_STATIC     = "static"
+STAGE_ENRICHMENT = "enrichment"
+STAGE_URLSCAN    = "urlscan"
+STAGE_SANDBOX    = "sandbox"
+STAGE_BEHAVIORAL = "behavioral"
+
+# All valid status strings.  "skipped" = feature disabled (no API key).
+# "timeout" and "failed" are visually distinct from "pending" and "skipped".
+STATUS_PENDING  = "pending"
+STATUS_RUNNING  = "running"
+STATUS_DONE     = "done"
+STATUS_FAILED   = "failed"
+STATUS_TIMEOUT  = "timeout"
+STATUS_SKIPPED  = "skipped"
+
+_STAGE_KEYS = (
+    STAGE_STATIC, STAGE_ENRICHMENT, STAGE_URLSCAN,
+    STAGE_SANDBOX, STAGE_BEHAVIORAL,
+)
+
+
+class _PipelineStages:
+    """Thread-safe in-memory store for per-stage status, with a DB flush helper.
+
+    Parallel pipeline stages (enrichment + urlscan run inside asyncio.gather)
+    may try to update the shared dict at the same time.  An asyncio.Lock
+    serializes all mutations so no stage update overwrites another.
+
+    Usage
+    -----
+    stages = _PipelineStages(analysis_id, session_factory)
+    await stages.init()                        # writes all-pending row to DB
+    await stages.update(STAGE_STATIC, STATUS_RUNNING)   # short critical section
+    await stages.update(STAGE_URLSCAN, STATUS_SKIPPED)  # safe from gather tasks
+    """
+
+    def __init__(
+        self,
+        analysis_id: int,
+        session_factory: async_sessionmaker,
+    ) -> None:
+        self._id = analysis_id
+        self._factory = session_factory
+        self._lock = asyncio.Lock()
+        self._stages: dict[str, str] = {k: STATUS_PENDING for k in _STAGE_KEYS}
+
+    async def init(self) -> None:
+        """Write the all-pending dict to the DB as the initial state."""
+        await self._flush()
+
+    async def update(self, stage: str, status: str) -> None:
+        """Atomically update one stage and persist the full dict."""
+        async with self._lock:
+            self._stages[stage] = status
+            await self._flush()
+
+    async def update_many(self, updates: dict[str, str]) -> None:
+        """Atomically update several stages in a single DB write."""
+        async with self._lock:
+            self._stages.update(updates)
+            await self._flush()
+
+    def snapshot(self) -> dict[str, str]:
+        """Return a shallow copy of the current stage dict (no lock needed for reads)."""
+        return dict(self._stages)
+
+    async def _flush(self) -> None:
+        """Write the current stage dict to pipeline_stages on the analysis row.
+
+        Called inside the lock — do NOT acquire the lock again here.
+        DB errors are caught and logged; a failed write does not abort the pipeline.
+        """
+        try:
+            async with self._factory() as session:
+                repo = AnalysisRepository(session)
+                analysis = await repo.get_by_id(self._id)
+                if analysis is None:
+                    return
+                analysis.pipeline_stages = dict(self._stages)
+                await repo.save(analysis)
+        except Exception as _exc:
+            logger.warning(
+                "pipeline_stages flush failed for id=%s (%s) — continuing",
+                self._id, type(_exc).__name__,
+            )
+
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024   # 25 MB — enforced again here as a server-side guard
 _MAX_BODY_TEXT_CHARS = 200_000          # ~200 KB of plain text stored in the DB
 _SAFE_FILENAME_RE = re.compile(r"[^\w\-. ]")  # strip everything except word chars, dash, dot, space
@@ -213,8 +302,17 @@ class AnalysisService:
 
     async def _run_pipeline(self, analysis_id: int, raw_bytes: bytes) -> None:
         async with _ANALYSIS_CONCURRENCY:
+            # ── Phase B: initialise all stages as pending ─────────────────
+            # Written to the DB immediately so the frontend sees a live dict
+            # (not NULL) from the moment the pipeline starts.
+            stages = _PipelineStages(analysis_id, self.session_factory)
+            await stages.init()
+
             try:
                 await self._mark_status(analysis_id, "RUNNING")
+
+                # ── Phase B: static stage starts ──────────────────────────
+                await stages.update(STAGE_STATIC, STATUS_RUNNING)
 
                 loop = asyncio.get_running_loop()
                 parsed = await loop.run_in_executor(None, eml.parse_eml_bytes, raw_bytes)
@@ -268,6 +366,18 @@ class AnalysisService:
                     url_shorteners = list(settings.url_shorteners)
                     urgency_keywords = list(settings.urgency_keywords)
 
+                # ── Phase B: static stage done; mark enrichment stages ────
+                # Determine up-front whether urlscan and sandbox will run so
+                # we can set skipped immediately rather than after the gather.
+                _urlscan_will_run = bool(urlscan_key and urls)
+                _sandbox_will_run = bool(_sandbox_provider and _sandbox_key)
+                await stages.update_many({
+                    STAGE_STATIC:     STATUS_DONE,
+                    STAGE_ENRICHMENT: STATUS_RUNNING,
+                    STAGE_URLSCAN:    STATUS_RUNNING if _urlscan_will_run else STATUS_SKIPPED,
+                    STAGE_SANDBOX:    STATUS_RUNNING if _sandbox_will_run else STATUS_SKIPPED,
+                })
+
                 # ── Threat intel enrichment ───────────────────────────────
                 # Both providers now return a structured dict:
                 #   {"status": "no_key"|"ok"|"no_data"|"rate_limit"|"error",
@@ -297,6 +407,7 @@ class AnalysisService:
 
                 async def _run_urlscan() -> dict:
                     if not _urlscan_url or not urlscan_key:
+                        # Phase B: already marked skipped before the gather
                         return {
                             "status": "no_key", "error": None, "scan_uuid": None,
                             "report_url": None, "screenshot_url": None,
@@ -311,12 +422,21 @@ class AnalysisService:
                         # and response parsing — so the inner timeout always fires
                         # first and returns a clean "timeout" status rather than
                         # having asyncio.CancelledError propagate to the pipeline.
-                        return await asyncio.wait_for(
+                        result = await asyncio.wait_for(
                             urlscan_provider.detonate_url(_urlscan_url, urlscan_key),
                             timeout=135,
                         )
+                        # Phase B: urlscan completed — map provider status → stage status
+                        _stage_status = STATUS_DONE
+                        if result.get("status") in ("timeout",):
+                            _stage_status = STATUS_TIMEOUT
+                        elif result.get("status") in ("error",):
+                            _stage_status = STATUS_FAILED
+                        await stages.update(STAGE_URLSCAN, _stage_status)
+                        return result
                     except asyncio.TimeoutError:
                         logger.warning("urlscan.io: pipeline timeout exceeded for %s", _urlscan_url)
+                        await stages.update(STAGE_URLSCAN, STATUS_TIMEOUT)
                         return {
                             "status": "timeout", "error": "Pipeline timeout exceeded",
                             "scan_uuid": None, "report_url": None,
@@ -326,6 +446,7 @@ class AnalysisService:
                         }
                     except Exception as exc:
                         logger.warning("urlscan.io: unexpected error: %s", type(exc).__name__)
+                        await stages.update(STAGE_URLSCAN, STATUS_FAILED)
                         return {
                             "status": "error",
                             "error": f"urlscan.io: {type(exc).__name__}",
@@ -335,13 +456,104 @@ class AnalysisService:
                             "tags": [], "score": None, "raw": None,
                         }
 
-                vt_enrichment, abuse_enrichment, shodan_enrichment, url_intel_results, urlscan_result = await asyncio.gather(
-                    virustotal_provider.enrich_urls(urls, vt_key),
-                    abuseipdb_provider.enrich_ip(header_info["sender_ip"], abuse_key),
-                    shodan_provider.enrich_ip(header_info["sender_ip"], shodan_key),
-                    url_intel.expand_urls(urls),
-                    _run_urlscan(),
+                # ── Overall enrichment deadline ───────────────────────────
+                # Each individual provider already has its own HTTP timeout
+                # (VT=120s/URL, AbuseIPDB=15s, Shodan=10s).  Those per-call
+                # caps guard against a single slow provider call, but the
+                # gather can still block for many minutes when VT exhausts
+                # quota and retries across multiple uncached URLs — each
+                # waiting up to 120s.
+                #
+                # This outer deadline caps the ENTIRE gather at
+                # _ENRICHMENT_DEADLINE seconds (300s = 5 min).  We use
+                # asyncio.wait() instead of wait_for() so that tasks that
+                # finish BEFORE the deadline can still contribute their
+                # results to the pipeline.  Tasks that are still pending
+                # when the deadline fires are cancelled; they receive a
+                # synthetic "timeout" no-data response.
+                #
+                # Crucially, on deadline expiry the pipeline does NOT fail —
+                # it continues with whatever results arrived in time, marks
+                # the enrichment stage as TIMEOUT, and proceeds to behavioral
+                # and BEC scoring.  The analyst sees partial intel rather
+                # than a stuck "Analyzing…" row.
+                _ENRICHMENT_DEADLINE = 300  # seconds
+
+                _vt_task   = asyncio.ensure_future(virustotal_provider.enrich_urls(urls, vt_key))
+                _ab_task   = asyncio.ensure_future(abuseipdb_provider.enrich_ip(header_info["sender_ip"], abuse_key))
+                _sh_task   = asyncio.ensure_future(shodan_provider.enrich_ip(header_info["sender_ip"], shodan_key))
+                _ui_task   = asyncio.ensure_future(url_intel.expand_urls(urls))
+                _us_task   = asyncio.ensure_future(_run_urlscan())
+
+                _all_tasks = {_vt_task, _ab_task, _sh_task, _ui_task, _us_task}
+                _done, _pending = await asyncio.wait(
+                    _all_tasks, timeout=_ENRICHMENT_DEADLINE
                 )
+
+                _enrichment_timed_out = bool(_pending)
+                if _enrichment_timed_out:
+                    logger.warning(
+                        "Enrichment deadline exceeded (%ds) for analysis_id=%d — "
+                        "%d task(s) cancelled; continuing with partial results.",
+                        _ENRICHMENT_DEADLINE, analysis_id, len(_pending),
+                    )
+                    for _t in _pending:
+                        _t.cancel()
+                    # Await cancellation to suppress CancelledError
+                    await asyncio.gather(*_pending, return_exceptions=True)
+
+                def _task_result(task, fallback):
+                    """Return the task result if done without error, else fallback."""
+                    if task in _done and not task.cancelled():
+                        try:
+                            return task.result()
+                        except Exception:
+                            pass
+                    return fallback
+
+                # Synthetic no-data responses for timed-out tasks
+                _VT_TIMEOUT    = {"status": "timeout", "error": "Enrichment deadline exceeded", "results": {}}
+                _ABUSE_TIMEOUT = {"status": "timeout", "error": "Enrichment deadline exceeded", "data": None}
+                _SHODAN_TIMEOUT= {"status": "timeout", "error": "Enrichment deadline exceeded", "data": None}
+                _UI_TIMEOUT: list = []
+                _US_TIMEOUT    = {
+                    "status": "timeout", "error": "Enrichment deadline exceeded",
+                    "scan_uuid": None, "report_url": None, "screenshot_url": None,
+                    "verdict": None, "malicious": False, "redirect_chain": [],
+                    "final_url": None, "page_title": None, "tags": [], "score": None, "raw": None,
+                }
+
+                vt_enrichment     = _task_result(_vt_task,   _VT_TIMEOUT)
+                abuse_enrichment  = _task_result(_ab_task,   _ABUSE_TIMEOUT)
+                shodan_enrichment = _task_result(_sh_task,   _SHODAN_TIMEOUT)
+                url_intel_results = _task_result(_ui_task,   _UI_TIMEOUT)
+                urlscan_result    = _task_result(_us_task,   _US_TIMEOUT)
+
+                # Phase B: enrichment gather complete — mark enrichment done/failed/skipped.
+                # urlscan was already updated inside _run_urlscan() above.
+                # Rules:
+                #   overall deadline fired (any task cancelled)   → TIMEOUT
+                #   all three providers returned "no_key"         → SKIPPED
+                #   any provider returned "error"                 → FAILED
+                #   otherwise (ok/no_data/rate_limit/timeout/mixed no_key) → DONE
+                # "no_key" alone is not an error — it means the feature is disabled.
+                # A single provider error → FAILED because DONE would suggest enrichment
+                # produced data, which is misleading when one provider hard-failed.
+                # rate_limit, no_data, and timeout are not errors; they count as DONE.
+                _enrich_statuses = (
+                    vt_enrichment.get("status"),
+                    abuse_enrichment.get("status"),
+                    shodan_enrichment.get("status"),
+                )
+                if _enrichment_timed_out:
+                    _enrich_stage_status = STATUS_TIMEOUT
+                elif all(s == "no_key" for s in _enrich_statuses):
+                    _enrich_stage_status = STATUS_SKIPPED
+                elif any(s == "error" for s in _enrich_statuses):
+                    _enrich_stage_status = STATUS_FAILED
+                else:
+                    _enrich_stage_status = STATUS_DONE
+                await stages.update(STAGE_ENRICHMENT, _enrich_stage_status)
 
                 vt_status  = vt_enrichment["status"]
                 vt_error   = vt_enrichment.get("error")
@@ -569,6 +781,44 @@ class AnalysisService:
                                 sandbox_result["status"] = "error"
                                 sandbox_result["error"] = f"Submission error: {type(exc).__name__}"
 
+                # Phase B: sandbox stage complete — map result status to stage status.
+                # Sandbox was already marked running/skipped before the gather;
+                # here we update with the final outcome.
+                #
+                # "submitted" means the quick-scan path had no job_id so behavioral
+                # polling never happened — the analysis is incomplete.  It is NOT
+                # equivalent to "done"; map it to TIMEOUT so the UI shows the analyst
+                # that sandbox data is missing because polling did not finish.
+                #
+                # "file payload required" error: Hybrid Analysis only supports file
+                # detonation.  When the email has no qualifying attachment (no
+                # macro/executable) AND URL submission is not supported, the provider
+                # returns status="error" with this specific message.  This is NOT a
+                # tool failure — there was simply nothing to submit.  Map to SKIPPED
+                # so the stage row correctly shows "Skipped" rather than "Failed".
+                _NOTHING_TO_DETONATE_PHRASES = (
+                    "file payload required",
+                    "url submission not supported",
+                )
+                if _sandbox_will_run:
+                    _sb_status = sandbox_result.get("status", "error")
+                    _sb_error_lower = (sandbox_result.get("error") or "").lower()
+                    _nothing_to_detonate = any(
+                        phrase in _sb_error_lower
+                        for phrase in _NOTHING_TO_DETONATE_PHRASES
+                    )
+                    if _sb_status in ("done", "ok"):
+                        _sb_stage = STATUS_DONE
+                    elif _sb_status in ("timeout", "submitted"):
+                        _sb_stage = STATUS_TIMEOUT
+                    elif _nothing_to_detonate:
+                        # Provider rejected the submission because there was nothing
+                        # suitable to detonate — not a pipeline error, just no input.
+                        _sb_stage = STATUS_SKIPPED
+                    else:
+                        _sb_stage = STATUS_FAILED
+                    await stages.update(STAGE_SANDBOX, _sb_stage)
+
                 # ── Phase 1: Dynamic attachment detonation (behavioral report) ──
                 # The dynamic_attachment_* columns capture the full behavioral
                 # result separately from the legacy sandbox_* columns so both
@@ -592,6 +842,9 @@ class AnalysisService:
                 # Re-score with dynamic attachment findings (scored once after sandbox)
 
                 # ── Phase 2: Behavioral signals ───────────────────────────
+                # Phase B: behavioral stage starts (covers behavioral + BEC)
+                await stages.update(STAGE_BEHAVIORAL, STATUS_RUNNING)
+
                 # Computed here, before compute_score, so the result can be
                 # passed in as behavioral_result.  History is written AFTER
                 # scoring (record_observation call below) so the current email
@@ -659,6 +912,9 @@ class AnalysisService:
                             analysis_id, type(_bec_exc).__name__,
                         )
                         bec_result_obj = None
+
+                # Phase B: behavioral + BEC done
+                await stages.update(STAGE_BEHAVIORAL, STATUS_DONE)
 
                 score_info = scoring_service.compute_score(
                     from_addr=header_info["from_addr"],
@@ -783,6 +1039,10 @@ class AnalysisService:
                     analysis.status = "DONE"
                     analysis.error_message = None
 
+                    # Phase B: persist the final stage dict in the same DB write
+                    # as all other results — a single atomic save, not an extra flush.
+                    analysis.pipeline_stages = stages.snapshot()
+
                     header_flags = score_info["header_flags"]
                     analysis.is_lookalike_domain = header_flags["is_lookalike_domain"]
                     analysis.lookalike_of = header_flags["lookalike_of"]
@@ -824,6 +1084,17 @@ class AnalysisService:
 
             except Exception as exc:
                 logger.exception("Analysis pipeline failed for id=%s", analysis_id)
+                # Phase B: mark all still-running/pending stages as failed
+                try:
+                    _failed_updates = {
+                        k: STATUS_FAILED
+                        for k, v in stages.snapshot().items()
+                        if v in (STATUS_PENDING, STATUS_RUNNING)
+                    }
+                    if _failed_updates:
+                        await stages.update_many(_failed_updates)
+                except Exception:
+                    pass  # stage flush failure must never mask the original exception
                 # CRIT-03: never expose raw exception strings to callers —
                 # str(exc) can contain SQL, filesystem paths, or API key fragments.
                 safe_msg = f"Analysis pipeline error: {type(exc).__name__}"

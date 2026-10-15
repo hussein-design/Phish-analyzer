@@ -1,4 +1,7 @@
-"""Route 1 of 2: drop zone + browse + the embedded analyses history table."""
+"""Route 1 of 2: drop zone + browse + the embedded analyses history table.
+
+Inline colors removed — all coloring now driven by QSS theme rules.
+"""
 
 from __future__ import annotations
 
@@ -30,14 +33,12 @@ class UploadPage(QWidget):
         history_font.setPointSize(12)
         history_font.setWeight(QFont.Weight.DemiBold)
         self._history_label.setFont(history_font)
-        self._history_label.setStyleSheet("color: #1E3A5F;")
+        # objectName drives QSS color — no inline hex
+        self._history_label.setObjectName("SectionHeading")
 
         self._count_badge = QLabel()
-        self._count_badge.setStyleSheet(
-            "background-color: #EFF6FF; color: #2563EB; "
-            "border: 1px solid #BFDBFE; border-radius: 10px; "
-            "padding: 1px 8px; font-size: 11px; font-weight: 700;"
-        )
+        # objectName drives QSS color — no inline hex
+        self._count_badge.setObjectName("CountBadge")
         self._count_badge.setVisible(False)
 
         header_row = QHBoxLayout()
@@ -48,7 +49,6 @@ class UploadPage(QWidget):
 
         # ── Analyses table ─────────────────────────────────────────────────
         self.table = AnalysesTableWidget(theme_manager, self)
-        # Forward total-count updates to the badge
         self.table.model.totalCountChanged.connect(self._update_count_badge)
 
         # ── Page layout ────────────────────────────────────────────────────

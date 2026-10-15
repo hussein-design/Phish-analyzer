@@ -1,5 +1,7 @@
 """Snackbar-style toast notifications with icon prefixes.
 Constructed once in MainWindow and injected into every controller.
+
+All colors sourced from frontend.services.tokens.TOAST_STYLES.
 """
 
 from __future__ import annotations
@@ -7,20 +9,7 @@ from __future__ import annotations
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
-# (background, text color, left-accent color, icon)
-_STYLES: dict[str, tuple[str, str, str, str]] = {
-    "info":    ("#EFF6FF", "#1E40AF", "#2563EB", "ℹ"),
-    "success": ("#F0FDF4", "#14532D", "#16A34A", "✓"),
-    "error":   ("#FEF2F2", "#7F1D1D", "#DC2626", "✕"),
-    "warning": ("#FFFBEB", "#78350F", "#D97706", "⚠"),
-}
-
-_DARK_STYLES: dict[str, tuple[str, str, str, str]] = {
-    "info":    ("#1E293B", "#93C5FD", "#3B82F6", "ℹ"),
-    "success": ("#052E16", "#86EFAC", "#22C55E", "✓"),
-    "error":   ("#450A0A", "#FCA5A5", "#EF4444", "✕"),
-    "warning": ("#451A03", "#FCD34D", "#F59E0B", "⚠"),
-}
+from frontend.services.tokens import TOAST_STYLES
 
 
 class Toast(QLabel):
@@ -30,7 +19,8 @@ class Toast(QLabel):
         # Pick style based on parent window brightness
         bg = parent.palette().window().color()
         is_dark = bg.lightness() < 128
-        styles = _DARK_STYLES if is_dark else _STYLES
+        style_key = "dark" if is_dark else "light"
+        styles = TOAST_STYLES[style_key]
 
         bg_col, fg_col, accent_col, icon = styles.get(level, styles["info"])
 

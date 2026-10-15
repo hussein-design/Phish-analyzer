@@ -1,11 +1,13 @@
 """Drag/drop .eml widget — also clickable to open the standard file picker.
 Custom-painted so it looks polished in both themes without relying on
 platform-native widget chrome.
+
+All colors sourced from frontend.services.tokens — no inline hex values.
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPropertyAnimation, Qt, QTimer, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -18,6 +20,8 @@ from PySide6.QtGui import (
     QPen,
 )
 from PySide6.QtWidgets import QFileDialog, QSizePolicy, QWidget
+
+from frontend.services.tokens import Dark, Light
 
 
 class DropZone(QWidget):
@@ -36,7 +40,6 @@ class DropZone(QWidget):
         self._hovered = False       # drag-hover state
         self._mouse_hover = False   # mouse-over state
 
-        # Track mouse to paint hover effect on mouse-over (not just drag-over)
         self.setMouseTracking(True)
 
     # ── Painting ──────────────────────────────────────────────────────────────
@@ -48,74 +51,61 @@ class DropZone(QWidget):
         rect = self.rect().adjusted(2, 2, -2, -2)
         radius = 14.0
 
-        # Detect theme from parent window background
         bg = self.palette().window().color()
         is_dark = bg.lightness() < 128
-
-        if is_dark:
-            base_bg      = QColor("#1E293B")
-            hover_bg     = QColor("#1A2F52")
-            border_idle  = QColor("#334155")
-            border_hover = QColor("#3B82F6")
-            title_color  = QColor("#CBD5E1")
-            sub_color    = QColor("#64748B")
-            icon_color   = QColor("#3B82F6")
-        else:
-            base_bg      = QColor("#FFFFFF")
-            hover_bg     = QColor("#EFF6FF")
-            border_idle  = QColor("#CBD5E1")
-            border_hover = QColor("#2563EB")
-            title_color  = QColor("#1E3A5F")
-            sub_color    = QColor("#64748B")
-            icon_color   = QColor("#2563EB")
+        t = Dark if is_dark else Light
 
         active = self._hovered or self._mouse_hover
 
         # Background fill
         path = QPainterPath()
-        path.addRoundedRect(rect.toRectF() if hasattr(rect, "toRectF") else rect.__class__(rect), radius, radius)
-        painter.fillPath(path, hover_bg if active else base_bg)
+        path.addRoundedRect(
+            rect.toRectF() if hasattr(rect, "toRectF") else rect.__class__(rect),
+            radius, radius
+        )
+        bg_fill = QColor(t.dropzone_bg_hover if active else t.dropzone_bg)
+        painter.fillPath(path, bg_fill)
 
         # Dashed border
-        pen = QPen(border_hover if active else border_idle)
+        pen = QPen(QColor(t.dropzone_border_hover if active else t.dropzone_border))
         pen.setWidth(2)
         pen.setStyle(Qt.PenStyle.DashLine)
         pen.setDashPattern([6, 4])
         painter.setPen(pen)
         painter.drawRoundedRect(rect, radius, radius)
 
-        # Center content
+        # Center content — all offsets are relative to cy so the layout is
+        # consistent at any widget height and nothing overlaps.
         cx = rect.center().x()
         cy = rect.center().y()
 
-        # Upload cloud icon (drawn as simple shapes)
-        self._draw_upload_icon(painter, cx, cy - 28, icon_color)
+        # Icon:  top of arrow at cy-30, bottom of base at cy+6  (36px total)
+        self._draw_upload_icon(painter, cx, cy - 18, QColor(t.dropzone_icon))
 
-        # Primary text
+        # Primary text: 14px gap below icon base
         font = QFont("Segoe UI", 13, QFont.Weight.DemiBold)
         painter.setFont(font)
-        painter.setPen(title_color)
+        painter.setPen(QColor(t.dropzone_title))
         title = "Drop a .eml file here  or  click to browse"
-        painter.drawText(
-            rect.adjusted(0, 30, 0, 0),
-            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter,
-            title,
-        )
+        from PySide6.QtCore import QRect as _QRect
+        title_rect = _QRect(rect.left(), cy + 16, rect.width(), 24)
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter, title)
 
-        # Subtitle text
+        # Subtitle: 6px below title
         font2 = QFont("Segoe UI", 11)
         painter.setFont(font2)
-        painter.setPen(sub_color)
-        painter.drawText(
-            rect.adjusted(0, 56, 0, 0),
-            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter,
-            "Supported format: RFC 822 .eml  •  Max 25 MB",
-        )
+        painter.setPen(QColor(t.dropzone_subtitle))
+        sub_rect = _QRect(rect.left(), cy + 42, rect.width(), 20)
+        painter.drawText(sub_rect, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter,
+                         "Supported format: RFC 822 .eml  •  Max 25 MB")
 
         painter.end()
 
     def _draw_upload_icon(self, painter: QPainter, cx: int, cy: int, color: QColor) -> None:
-        """Draw a simple upward-arrow-with-base upload icon."""
+        """Draw a simple upward-arrow-with-base upload icon centered at (cx, cy).
+
+        Total height: arrow tip at cy-12 to tray bottom at cy+12  (24px).
+        """
         painter.save()
         pen = QPen(color)
         pen.setWidth(2)
@@ -124,16 +114,16 @@ class DropZone(QWidget):
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
-        # Arrow shaft + head
-        painter.drawLine(cx, cy + 14, cx, cy - 8)                  # shaft
-        painter.drawLine(cx - 10, cy + 2, cx, cy - 10)             # left arrow head
-        painter.drawLine(cx + 10, cy + 2, cx, cy - 10)             # right arrow head
-
-        # Base tray
-        painter.drawLine(cx - 16, cy + 14, cx + 16, cy + 14)       # tray top
-        painter.drawLine(cx - 16, cy + 14, cx - 16, cy + 20)       # tray left
-        painter.drawLine(cx + 16, cy + 14, cx + 16, cy + 20)       # tray right
-        painter.drawLine(cx - 16, cy + 20, cx + 16, cy + 20)       # tray bottom
+        # Arrow shaft
+        painter.drawLine(cx, cy + 6, cx, cy - 8)
+        # Arrow head
+        painter.drawLine(cx - 8, cy - 2, cx, cy - 10)
+        painter.drawLine(cx + 8, cy - 2, cx, cy - 10)
+        # Tray (horizontal base with two short side walls)
+        painter.drawLine(cx - 12, cy + 6, cx + 12, cy + 6)
+        painter.drawLine(cx - 12, cy + 6, cx - 12, cy + 12)
+        painter.drawLine(cx + 12, cy + 6, cx + 12, cy + 12)
+        painter.drawLine(cx - 12, cy + 12, cx + 12, cy + 12)
 
         painter.restore()
 

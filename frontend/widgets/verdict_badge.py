@@ -1,6 +1,8 @@
 """Verdict colored pill — standalone widget for the Report page + a
 QStyledItemDelegate reusing the same color logic for the table, so the
 badge appearance only exists in one place.
+
+All colors sourced from frontend.services.tokens — no inline hex values.
 """
 
 from __future__ import annotations
@@ -10,33 +12,13 @@ from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QLabel, QStyledItemDelegate, QStyleOptionViewItem, QWidget
 
 from frontend.services.theme_manager import ThemeManager
+from frontend.services.tokens import verdict_colors
 
 _LABELS = {
     "phishing":   "⚠  Phishing",
     "suspicious": "⚡  Suspicious",
     "benign":     "✓  Benign",
 }
-
-# (bg, text, border)
-_LIGHT_COLORS: dict[str, tuple[str, str, str]] = {
-    "phishing":   ("#FEF2F2", "#DC2626", "#FECACA"),
-    "suspicious": ("#FFFBEB", "#B45309", "#FDE68A"),
-    "benign":     ("#F0FDF4", "#16A34A", "#BBF7D0"),
-    "pending":    ("#F8FAFC", "#64748B", "#CBD5E1"),
-}
-
-_DARK_COLORS: dict[str, tuple[str, str, str]] = {
-    "phishing":   ("#450A0A", "#FCA5A5", "#7F1D1D"),
-    "suspicious": ("#451A03", "#FCD34D", "#78350F"),
-    "benign":     ("#052E16", "#86EFAC", "#14532D"),
-    "pending":    ("#0F172A", "#64748B", "#1E293B"),
-}
-
-
-def _get_colors(verdict: str | None, is_dark: bool) -> tuple[str, str, str]:
-    key = (verdict or "pending").lower()
-    palette = _DARK_COLORS if is_dark else _LIGHT_COLORS
-    return palette.get(key, palette["pending"])
 
 
 def verdict_label(verdict: str | None) -> str:
@@ -68,7 +50,7 @@ class VerdictBadge(QLabel):
     def set_verdict(self, verdict: str | None) -> None:
         self._verdict = verdict
         is_dark = self._theme_manager.current == "dark"
-        bg, fg, border = _get_colors(verdict, is_dark)
+        bg, fg, border = verdict_colors(verdict, is_dark)
         self.setText(verdict_label(verdict))
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet(
@@ -89,7 +71,7 @@ class VerdictColorDelegate(QStyledItemDelegate):
             return
 
         is_dark = self._theme_manager.current == "dark"
-        bg_str, fg_str, border_str = _get_colors(verdict, is_dark)
+        bg_str, fg_str, border_str = verdict_colors(verdict, is_dark)
 
         # Draw row background/selection first
         super().paint(painter, option, index)
