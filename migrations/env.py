@@ -11,7 +11,8 @@ from alembic import context
 # CLI (`alembic upgrade head`) from the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import backend.models  # noqa: E402  (registers all model classes on Base.metadata)
+import backend.models as _models  # noqa: E402  (registers all model classes on Base.metadata)
+_ = _models  # ensure the import is not tree-shaken; it side-effects Base.metadata registration
 from backend.database.base import Base  # noqa: E402
 from shared.paths import db_path  # noqa: E402
 
@@ -21,7 +22,16 @@ config = context.config
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
-if config.config_file_name is not None:
+# When invoked from backend.database.init_db.run_migrations the caller sets
+# config.attributes["configure_logging"] = False to prevent this fileConfig()
+# call from calling logging.config.fileConfig(disable_existing_loggers=True),
+# which would replace all existing root handlers (including the app's own
+# RotatingFileHandler) with just the StreamHandler defined in alembic.ini.
+# When invoked from the CLI (`alembic upgrade head`) the attribute is absent
+# so the standard fileConfig() behaviour applies.
+if config.config_file_name is not None and config.attributes.get(
+    "configure_logging", True
+):
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata

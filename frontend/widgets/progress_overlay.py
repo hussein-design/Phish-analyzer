@@ -12,7 +12,7 @@ All colors sourced from frontend.services.tokens — no inline hex values.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
@@ -96,12 +96,15 @@ class ProgressOverlay(QWidget):
     # ── Geometry ──────────────────────────────────────────────────────────
 
     def _reposition(self) -> None:
-        """Center the overlay widget over the parent's drop zone area.
+        """Center the card just below the drop-zone widget's real bottom edge.
 
-        The overlay widget fills the parent so it intercepts clicks during
-        upload.  The inner card is centered horizontally and positioned in
-        the upper-center area (above the table) so it sits on top of the
-        drop zone visually without covering the history table.
+        The overlay is parented to the UploadPage which exposes its DropZone
+        as ``self.drop_zone``.  We map the drop zone's bottom-right corner to
+        the parent's coordinate space to get the real pixel position regardless
+        of layout margins, window size, or DPI — no hardcoded height constants.
+
+        Falls back to a 220 px estimate if the parent has no ``drop_zone``
+        attribute (e.g. during unit tests that construct the overlay standalone).
         """
         parent = self.parent()
         if parent is None:
@@ -110,15 +113,20 @@ class ProgressOverlay(QWidget):
         # Fill the entire parent so the outer widget can intercept mouse events
         self.setGeometry(pr)
 
-        # Center the card in the upper quarter of the parent (drop-zone area)
-        # so it appears above the table.  drop zone is typically the top 180-220 px.
         card_h = self._card.sizeHint().height()
         if card_h <= 0:
             card_h = 80  # fallback before first layout pass
-        # Place the card vertically centered in the top 200 px
-        zone_center_y = min(100, pr.height() // 4)
+
+        # Use the drop zone's real bottom edge when available.
+        drop_zone = getattr(parent, "drop_zone", None)
+        if drop_zone is not None:
+            # mapTo converts drop_zone-local (0, bottom) to parent coordinates.
+            dz_bottom = drop_zone.mapTo(parent, drop_zone.rect().bottomLeft()).y()
+        else:
+            dz_bottom = 220  # fallback constant (DropZone.maximumHeight)
+
         x = (pr.width() - self._CARD_WIDTH) // 2
-        y = max(8, zone_center_y - card_h // 2)
+        y = min(dz_bottom + 8, max(8, pr.height() // 2 - card_h // 2))
         self._card.move(x, y)
         self._card.adjustSize()
 

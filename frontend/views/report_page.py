@@ -28,7 +28,7 @@ Design rules respected:
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -47,12 +47,9 @@ from frontend.services.theme_manager import ThemeManager
 from frontend.services.tokens import (
     Dark,
     Light,
-    arc_color,
     score_bar_color,
-    stage_colors,
     status_dot_color,
     svg_icon,
-    verdict_colors,
 )
 from frontend.widgets.kv_table import KeyValueTable
 from frontend.widgets.pipeline_stages_widget import PipelineStagesWidget
@@ -60,7 +57,6 @@ from frontend.widgets.report_widgets import (
     Card,
     Chip,
     ScoreRing,
-    auth_chip,
     body_label,
     h_separator,
 )
@@ -424,6 +420,27 @@ def _build_stage_reasons(detail: EmailDetail) -> dict[str, str | None]:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Elapsed-time helpers (loading view)
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Number of seconds before the loading view shows "Taking longer than expected".
+_SLOW_ANALYSIS_THRESHOLD_S: int = 300   # 5 minutes
+
+
+def _format_elapsed(seconds: float) -> str:
+    """Format an elapsed duration as ``M:SS``.
+
+    Examples::
+        _format_elapsed(45)   → "0:45"
+        _format_elapsed(60)   → "1:00"
+        _format_elapsed(125)  → "2:05"
+    """
+    total = int(seconds)
+    mins, secs = divmod(total, 60)
+    return f"{mins}:{secs:02d}"
+
+
 # Phrases from sandbox_error that indicate there was simply nothing to
 # detonate (no qualifying attachment and URL submission not supported).
 # When these appear on a "failed" stage row we reclassify it to "skipped"
@@ -477,8 +494,6 @@ class ReportPage(QWidget):
         self._current_status: AnalysisStatus | None = None
         self._current_section: str = "overview"
         self._queue_items: dict[int, _QueueItem] = {}   # analysis_id → widget
-
-        is_dark = theme_manager.current == "dark"
 
         # ── Top bar ───────────────────────────────────────────────────────
         self._title_label = QLabel("—")
@@ -840,8 +855,14 @@ class ReportPage(QWidget):
           - If pipeline_stages is NULL (pre-Phase-B row or not yet written)
             and the analysis is still running, we show "Queued" text only.
           - The PipelineStagesWidget is hidden until real stage data arrives.
+
+        Phase B hotfix additions:
+          - ``_elapsed_lbl``    — live "Elapsed: 0:45" label, updated every tick.
+          - ``_slow_lbl``       — amber "Taking longer than expected" after 5 min.
+          - ``_poll_error_lbl`` — red note shown after repeated poll failures.
         """
         is_dark = self._theme.current == "dark"
+        t = Dark if is_dark else Light
 
         container = QWidget()
         container.setObjectName("LoadingView")
@@ -857,6 +878,42 @@ class ReportPage(QWidget):
         msg_font.setWeight(QFont.Weight.DemiBold)
         msg_lbl.setFont(msg_font)
         msg_lbl.setStyleSheet("background: transparent; border: none;")
+
+        # ── Elapsed time label ─────────────────────────────────────────────
+        # Updated by update_elapsed_time() on every poll tick.
+        self._elapsed_lbl = QLabel("Elapsed: 0:00")
+        self._elapsed_lbl.setObjectName("LoadingElapsed")
+        self._elapsed_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._elapsed_lbl.setStyleSheet(
+            f"background: transparent; border: none; font-size: 11px; "
+            f"color: {t.text_muted};"
+        )
+
+        # ── "Taking longer than expected" warning ──────────────────────────
+        # Hidden until elapsed >= _SLOW_ANALYSIS_THRESHOLD_S (300 s / 5 min).
+        # Uses amber token color to mirror the "timeout" stage dot treatment.
+        self._slow_lbl = QLabel("Taking longer than expected")
+        self._slow_lbl.setObjectName("LoadingSlowWarning")
+        self._slow_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._slow_lbl.setWordWrap(True)
+        self._slow_lbl.setStyleSheet(
+            f"background: transparent; border: none; font-size: 11px; "
+            f"color: {t.stage_timeout_text};"
+        )
+        self._slow_lbl.hide()
+
+        # ── Poll error note ────────────────────────────────────────────────
+        # Shown when _POLL_FAIL_THRESHOLD consecutive exceptions occur in
+        # _on_poll_result.  Cleared automatically on the next successful poll.
+        self._poll_error_lbl = QLabel("")
+        self._poll_error_lbl.setObjectName("LoadingPollError")
+        self._poll_error_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._poll_error_lbl.setWordWrap(True)
+        self._poll_error_lbl.setStyleSheet(
+            f"background: transparent; border: none; font-size: 11px; "
+            f"color: {t.stage_failed_text};"
+        )
+        self._poll_error_lbl.hide()
 
         # Queued fallback label — visible only when pipeline_stages is NULL
         self._queued_lbl = QLabel("Queued — waiting for pipeline to start")
@@ -882,7 +939,11 @@ class ReportPage(QWidget):
 
         lyt.addStretch(1)
         lyt.addWidget(msg_lbl)
-        lyt.addSpacing(12)
+        lyt.addSpacing(6)
+        lyt.addWidget(self._elapsed_lbl, 0, Qt.AlignmentFlag.AlignCenter)
+        lyt.addWidget(self._slow_lbl, 0, Qt.AlignmentFlag.AlignCenter)
+        lyt.addWidget(self._poll_error_lbl, 0, Qt.AlignmentFlag.AlignCenter)
+        lyt.addSpacing(8)
         lyt.addWidget(self._queued_lbl, 0, Qt.AlignmentFlag.AlignCenter)
         lyt.addWidget(self._pipeline_widget, 0, Qt.AlignmentFlag.AlignCenter)
         lyt.addSpacing(12)
@@ -919,6 +980,47 @@ class ReportPage(QWidget):
             self._queued_lbl.hide()
             self._pipeline_widget.set_stages(stages, is_dark=is_dark, reasons=reasons)
             self._pipeline_widget.show()
+
+    def update_elapsed_time(self, elapsed_s: float) -> None:
+        """Update the elapsed-time label on the loading view.
+
+        Called by the report_controller on every PENDING/RUNNING poll tick.
+        Also shows the "Taking longer than expected" warning once the analysis
+        exceeds ``_SLOW_ANALYSIS_THRESHOLD_S`` (5 minutes).
+
+        Parameters
+        ----------
+        elapsed_s:
+            Seconds since polling started (monotonic wall-clock difference).
+        """
+        if not hasattr(self, "_elapsed_lbl"):
+            return
+        formatted = _format_elapsed(elapsed_s)
+        self._elapsed_lbl.setText(f"Elapsed: {formatted}")
+        if elapsed_s >= _SLOW_ANALYSIS_THRESHOLD_S:
+            self._slow_lbl.show()
+        else:
+            self._slow_lbl.hide()
+
+    def show_poll_error(self, message: str) -> None:
+        """Show a visible poll-error note in the loading view.
+
+        Called by the report_controller after ``_POLL_FAIL_THRESHOLD``
+        consecutive exceptions in ``_on_poll_result``.  The controller
+        clears this note by calling it with an empty string (or by calling
+        ``update_status`` on a successful tick which rebuilds the label state).
+
+        Delete and Re-enrich remain available while this note is shown — the
+        analyst can still act on a stuck-looking analysis.
+        """
+        if not hasattr(self, "_poll_error_lbl"):
+            return
+        if message:
+            self._poll_error_lbl.setText(message)
+            self._poll_error_lbl.show()
+        else:
+            self._poll_error_lbl.hide()
+            self._poll_error_lbl.setText("")
 
     # ─────────────────────────────────────────────────────────────────────
     # Section widget construction

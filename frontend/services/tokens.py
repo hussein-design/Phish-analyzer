@@ -509,22 +509,37 @@ def _icons_dir() -> _Path:
     return _Path(__file__).parent.parent.parent / "assets" / "icons"
 
 
+_svg_icon_warned: set[str] = set()  # tracks names that have already logged a warning
+
+
 def svg_icon(name: str, color: str = "#64748B", size: int = 16):
     """Load a Tabler SVG by filename stem, tint it with `color`, return QIcon.
 
     The SVGs use stroke="currentColor" — we substitute the actual hex value
     so Qt's SVG renderer honours it at the requested pixel size.
 
-    Returns None if the SVG file is not found (graceful degradation).
+    Returns None if the SVG file is not found or any Qt call fails
+    (graceful degradation: missing icons never crash the UI).
+
+    On failure a WARNING with the full traceback is logged exactly once per
+    icon name so silent failures are visible in the log file without flooding
+    it on every repaint.
     """
+    import logging as _logging
+    import traceback as _traceback
+
     try:
-        from PySide6.QtCore import QByteArray
-        from PySide6.QtGui import QIcon
+        from PySide6.QtCore import QByteArray, Qt          # Qt added here — was missing
+        from PySide6.QtGui import QIcon, QPixmap, QPainter
         from PySide6.QtSvg import QSvgRenderer
-        from PySide6.QtGui import QPixmap, QPainter
 
         svg_path = _icons_dir() / f"{name}.svg"
         if not svg_path.exists():
+            if name not in _svg_icon_warned:
+                _svg_icon_warned.add(name)
+                _logging.getLogger(__name__).warning(
+                    "svg_icon(%r): SVG file not found at %s", name, svg_path
+                )
             return None
 
         raw = svg_path.read_text(encoding="utf-8")
@@ -534,15 +549,26 @@ def svg_icon(name: str, color: str = "#64748B", size: int = 16):
 
         renderer = QSvgRenderer(data)
         if not renderer.isValid():
+            if name not in _svg_icon_warned:
+                _svg_icon_warned.add(name)
+                _logging.getLogger(__name__).warning(
+                    "svg_icon(%r): QSvgRenderer reported invalid SVG", name
+                )
             return None
 
         pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)  # must use the enum, not int 0 — on Windows,
-        # fill(0x00000000) creates an opaque black pixmap instead of a transparent one.
+        pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
         renderer.render(painter)
         painter.end()
 
         return QIcon(pixmap)
     except Exception:
+        if name not in _svg_icon_warned:
+            _svg_icon_warned.add(name)
+            _logging.getLogger(__name__).warning(
+                "svg_icon(%r): unexpected exception (logged once):\n%s",
+                name,
+                _traceback.format_exc(),
+            )
         return None

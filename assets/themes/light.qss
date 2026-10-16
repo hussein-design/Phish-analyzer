@@ -598,6 +598,10 @@ QPushButton#AnchorTab:checked {
     color: #E2E8F0;
 }
 
+#ToolbarSpacer {
+    background: transparent;
+}
+
 /* ── Status bar ──────────────────────────────────────── */
 #StatusBarLabel {
     color: #64748B;

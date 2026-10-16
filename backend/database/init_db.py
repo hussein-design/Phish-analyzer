@@ -33,6 +33,13 @@ def _run_migrations_sync(sync_database_url: str) -> None:
     cfg = Config(str(alembic_ini_path()))
     cfg.set_main_option("script_location", str(migrations_dir()))
     cfg.set_main_option("sqlalchemy.url", sync_database_url)
+    # Prevent Alembic from calling logging.config.fileConfig() on the
+    # [loggers] section of alembic.ini.  fileConfig() uses
+    # disable_existing_loggers=True by default, which silently replaces all
+    # root handlers (including our RotatingFileHandler and any test recorders)
+    # with only the StreamHandler defined in [handler_console].  The app's own
+    # configure_logging() owns logging setup; Alembic must not override it.
+    cfg.attributes["configure_logging"] = False
     command.upgrade(cfg, "head")
 
 

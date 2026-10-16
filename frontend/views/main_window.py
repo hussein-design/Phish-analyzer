@@ -103,6 +103,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(brand)
 
         spacer = QWidget()
+        spacer.setObjectName("ToolbarSpacer")
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         spacer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         toolbar.addWidget(spacer)
@@ -139,13 +140,11 @@ class MainWindow(QMainWindow):
         settings_icon = svg_icon("settings", color, size=16)
         if settings_icon:
             self._settings_action.setIcon(settings_icon)
-            self._settings_action.setText("")
 
         theme_icon_name = "sun" if self.theme_manager.current == "dark" else "moon"
         theme_icon = svg_icon(theme_icon_name, color, size=16)
         if theme_icon:
             self._theme_action.setIcon(theme_icon)
-            self._theme_action.setText("")
 
     def _build_status_bar(self) -> None:
         sb = QStatusBar(self)

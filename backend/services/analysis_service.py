@@ -189,6 +189,65 @@ _ANALYSIS_CONCURRENCY = asyncio.Semaphore(3)
 # this dict keeps a live reference until each task finishes.
 _in_flight_tasks: dict[int, asyncio.Task] = {}
 
+# ── Runtime reaper ────────────────────────────────────────────────────────────
+# Rows that are PENDING or RUNNING but have no live asyncio task (their Task
+# was garbage-collected, the process was killed mid-run, or they somehow
+# escaped the startup mark_interrupted pass) can stay stuck forever.  The
+# reaper runs every minute and marks any such row FAILED if it has been in a
+# non-terminal state for more than _REAPER_STALE_MINUTES minutes.
+_REAPER_INTERVAL_S = 60          # check every 60 seconds
+_REAPER_STALE_MINUTES = 15       # rows older than 15 min with no task → FAILED
+
+
+async def _reaper_loop(session_factory: "async_sessionmaker") -> None:
+    """Periodic background coroutine that marks stale PENDING/RUNNING rows FAILED.
+
+    Stale = PENDING or RUNNING with an updated_at timestamp older than
+    _REAPER_STALE_MINUTES AND no live asyncio task in _in_flight_tasks.
+
+    Runs forever until cancelled (e.g. on app shutdown).
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from sqlalchemy import select as _select
+
+    while True:
+        await asyncio.sleep(_REAPER_INTERVAL_S)
+        try:
+            cutoff = _dt.now(tz=_tz.utc) - _td(minutes=_REAPER_STALE_MINUTES)
+            async with session_factory() as session:
+                # Find PENDING/RUNNING rows older than the cutoff
+                stmt = _select(EmailAnalysis).where(
+                    EmailAnalysis.status.in_(("PENDING", "RUNNING")),
+                    EmailAnalysis.updated_at <= cutoff,
+                )
+                rows = (await session.execute(stmt)).scalars().all()
+                reaped = 0
+                for row in rows:
+                    if row.id in _in_flight_tasks:
+                        # Task is still alive — leave it alone
+                        continue
+                    row.status = "FAILED"
+                    row.error_message = (
+                        f"Analysis abandoned — no active task found after "
+                        f"{_REAPER_STALE_MINUTES} minutes."
+                    )
+                    session.add(row)
+                    reaped += 1
+                if reaped:
+                    await session.commit()
+                    logger.warning(
+                        "Runtime reaper: marked %d stale analysis(es) as FAILED", reaped
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as _reap_exc:
+            import traceback as _tb
+            logger.warning(
+                "Runtime reaper iteration failed: %s\n%s",
+                type(_reap_exc).__name__,
+                _tb.format_exc(),
+            )
+
 
 def _is_safe_for_external_submission(url: str) -> bool:
     """Return True only when url is safe to submit to an external cloud service.
@@ -300,805 +359,850 @@ class AnalysisService:
 
         return analysis
 
+    # ── Pipeline watchdog ─────────────────────────────────────────────────────
+    # 10-minute hard deadline on the entire pipeline body.  On expiry every
+    # still-running/pending stage is marked "timeout" and the analysis row is
+    # set to FAILED with a clear reason.  The concurrency slot is always
+    # released in a finally block so a stuck pipeline never permanently holds
+    # a semaphore slot.
+    _PIPELINE_DEADLINE = 600  # 10 minutes
+
     async def _run_pipeline(self, analysis_id: int, raw_bytes: bytes) -> None:
-        async with _ANALYSIS_CONCURRENCY:
-            # ── Phase B: initialise all stages as pending ─────────────────
-            # Written to the DB immediately so the frontend sees a live dict
-            # (not NULL) from the moment the pipeline starts.
+        await _ANALYSIS_CONCURRENCY.acquire()
+        stages: _PipelineStages | None = None
+        try:
             stages = _PipelineStages(analysis_id, self.session_factory)
             await stages.init()
 
             try:
-                await self._mark_status(analysis_id, "RUNNING")
-
-                # ── Phase B: static stage starts ──────────────────────────
-                await stages.update(STAGE_STATIC, STATUS_RUNNING)
-
-                loop = asyncio.get_running_loop()
-                parsed = await loop.run_in_executor(None, eml.parse_eml_bytes, raw_bytes)
-
-                body_text = eml.extract_text_from_body(parsed.get("body", {}))
-                attachments_raw = parsed.get("attachment", []) or []
-                headers = parsed.get("header", {}) or {}
-                header_info = eml.analyze_headers(parsed)
-                global_hashes = eml.extract_global_hashes(parsed)
-                urls = eml.extract_urls_from_body(parsed.get("body", {}), body_text)
-                message_id = eml.get_message_id(parsed, headers)
-                subject = eml.get_subject(parsed, headers)
-                in_reply_to = eml.get_in_reply_to(parsed, headers)
-
-                # ── Phase 1: MIME structure + social engineering signals ───────
-                mime_parts = eml.extract_mime_parts(parsed)
-                html_bodies = threat_signals.extract_html_bodies(parsed)
-                anchor_mismatches_raw = []
-                for html in html_bodies:
-                    anchor_mismatches_raw.extend(threat_signals.detect_anchor_mismatches(html))
-                # Deduplicate by (display, href) key
-                seen_anchors: set[tuple[str, str]] = set()
-                anchor_mismatches: list[dict] = []
-                for am in anchor_mismatches_raw:
-                    key = (am.display_text[:80], am.href[:120])
-                    if key not in seen_anchors:
-                        seen_anchors.add(key)
-                        anchor_mismatches.append({
-                            "display_text": am.display_text,
-                            "href": am.href,
-                            "reason": am.reason,
-                        })
-                lure_matches = threat_signals.detect_lure_categories(body_text)
-                lure_categories = [
-                    {"category": lm.category, "matched_keywords": lm.matched_keywords}
-                    for lm in lure_matches
-                ]
-
-                async with self.session_factory() as session:
-                    settings = await SettingsRepository(session).get()
-                    vt_key = settings.virustotal_key or self._vt_api_key_env
-                    abuse_key = settings.abuseipdb_key or self._abuseipdb_key_env
-                    shodan_key = getattr(settings, "shodan_key", None)
-                    urlscan_key = getattr(settings, "urlscan_key", None)
-                    _sandbox_provider = getattr(settings, "sandbox_provider", None)
-                    _sandbox_key = getattr(settings, "sandbox_api_key", None)
-                    scoring_weights = dict(settings.scoring_weights)
-                    brand_domains = dict(settings.brand_domains)
-                    suspicious_keywords = list(settings.url_suspicious_keywords)
-                    suspicious_tlds = list(settings.suspicious_tlds)
-                    url_shorteners = list(settings.url_shorteners)
-                    urgency_keywords = list(settings.urgency_keywords)
-
-                # ── Phase B: static stage done; mark enrichment stages ────
-                # Determine up-front whether urlscan and sandbox will run so
-                # we can set skipped immediately rather than after the gather.
-                _urlscan_will_run = bool(urlscan_key and urls)
-                _sandbox_will_run = bool(_sandbox_provider and _sandbox_key)
-                await stages.update_many({
-                    STAGE_STATIC:     STATUS_DONE,
-                    STAGE_ENRICHMENT: STATUS_RUNNING,
-                    STAGE_URLSCAN:    STATUS_RUNNING if _urlscan_will_run else STATUS_SKIPPED,
-                    STAGE_SANDBOX:    STATUS_RUNNING if _sandbox_will_run else STATUS_SKIPPED,
-                })
-
-                # ── Threat intel enrichment ───────────────────────────────
-                # Both providers now return a structured dict:
-                #   {"status": "no_key"|"ok"|"no_data"|"rate_limit"|"error",
-                #    "error": str|None, "results"/"data": ...}
-                # We log the status and store it on the analysis row so the
-                # UI can show a clear explanation instead of just "no data".
-
-                # urlscan.io: pick the most suspicious URL to detonate.
-                # A fast-fail no_key result is returned immediately when the
-                # key is absent, so this never adds latency in that case.
-                # The call is wrapped in wait_for with a 100 s cap so a slow
-                # urlscan scan cannot block the pipeline even when a key IS set.
-                _urlscan_url: str | None = None
-                if urlscan_key and urls:
-                    # Prefer a URL that already looks suspicious from static analysis
-                    # (we don't have url_rows yet, so use a heuristic on raw strings).
-                    # SSRF guard: only submit URLs that resolve to public addresses.
-                    # An attacker can embed http://192.168.1.1/ in an email body and
-                    # trick the tool into submitting internal addresses to urlscan.io,
-                    # leaking network topology to a third-party cloud service.
-                    for _candidate in urls:
-                        if _is_safe_for_external_submission(_candidate):
-                            _urlscan_url = _candidate
-                            break
-                    # If no URL passes the guard, _urlscan_url remains None and
-                    # _run_urlscan() returns status="no_key" (intentional no-op).
-
-                async def _run_urlscan() -> dict:
-                    if not _urlscan_url or not urlscan_key:
-                        # Phase B: already marked skipped before the gather
-                        return {
-                            "status": "no_key", "error": None, "scan_uuid": None,
-                            "report_url": None, "screenshot_url": None,
-                            "verdict": None, "malicious": False, "redirect_chain": [],
-                            "final_url": None, "page_title": None, "tags": [], "score": None,
-                            "raw": None,
-                        }
-                    try:
-                        # Outer cap: urlscan provider polls internally up to 120 s
-                        # (_MAX_WAIT=120, _POLL_INTERVAL=10).  We allow 135 s here —
-                        # 120 s inner cap + 15 s grace for the final HTTP round-trip
-                        # and response parsing — so the inner timeout always fires
-                        # first and returns a clean "timeout" status rather than
-                        # having asyncio.CancelledError propagate to the pipeline.
-                        result = await asyncio.wait_for(
-                            urlscan_provider.detonate_url(_urlscan_url, urlscan_key),
-                            timeout=135,
-                        )
-                        # Phase B: urlscan completed — map provider status → stage status
-                        _stage_status = STATUS_DONE
-                        if result.get("status") in ("timeout",):
-                            _stage_status = STATUS_TIMEOUT
-                        elif result.get("status") in ("error",):
-                            _stage_status = STATUS_FAILED
-                        await stages.update(STAGE_URLSCAN, _stage_status)
-                        return result
-                    except asyncio.TimeoutError:
-                        logger.warning("urlscan.io: pipeline timeout exceeded for %s", _urlscan_url)
-                        await stages.update(STAGE_URLSCAN, STATUS_TIMEOUT)
-                        return {
-                            "status": "timeout", "error": "Pipeline timeout exceeded",
-                            "scan_uuid": None, "report_url": None,
-                            "screenshot_url": None, "verdict": None, "malicious": False,
-                            "redirect_chain": [], "final_url": None, "page_title": None,
-                            "tags": [], "score": None, "raw": None,
-                        }
-                    except Exception as exc:
-                        logger.warning("urlscan.io: unexpected error: %s", type(exc).__name__)
-                        await stages.update(STAGE_URLSCAN, STATUS_FAILED)
-                        return {
-                            "status": "error",
-                            "error": f"urlscan.io: {type(exc).__name__}",
-                            "scan_uuid": None, "report_url": None,
-                            "screenshot_url": None, "verdict": None, "malicious": False,
-                            "redirect_chain": [], "final_url": None, "page_title": None,
-                            "tags": [], "score": None, "raw": None,
-                        }
-
-                # ── Overall enrichment deadline ───────────────────────────
-                # Each individual provider already has its own HTTP timeout
-                # (VT=120s/URL, AbuseIPDB=15s, Shodan=10s).  Those per-call
-                # caps guard against a single slow provider call, but the
-                # gather can still block for many minutes when VT exhausts
-                # quota and retries across multiple uncached URLs — each
-                # waiting up to 120s.
-                #
-                # This outer deadline caps the ENTIRE gather at
-                # _ENRICHMENT_DEADLINE seconds (300s = 5 min).  We use
-                # asyncio.wait() instead of wait_for() so that tasks that
-                # finish BEFORE the deadline can still contribute their
-                # results to the pipeline.  Tasks that are still pending
-                # when the deadline fires are cancelled; they receive a
-                # synthetic "timeout" no-data response.
-                #
-                # Crucially, on deadline expiry the pipeline does NOT fail —
-                # it continues with whatever results arrived in time, marks
-                # the enrichment stage as TIMEOUT, and proceeds to behavioral
-                # and BEC scoring.  The analyst sees partial intel rather
-                # than a stuck "Analyzing…" row.
-                _ENRICHMENT_DEADLINE = 300  # seconds
-
-                _vt_task   = asyncio.ensure_future(virustotal_provider.enrich_urls(urls, vt_key))
-                _ab_task   = asyncio.ensure_future(abuseipdb_provider.enrich_ip(header_info["sender_ip"], abuse_key))
-                _sh_task   = asyncio.ensure_future(shodan_provider.enrich_ip(header_info["sender_ip"], shodan_key))
-                _ui_task   = asyncio.ensure_future(url_intel.expand_urls(urls))
-                _us_task   = asyncio.ensure_future(_run_urlscan())
-
-                _all_tasks = {_vt_task, _ab_task, _sh_task, _ui_task, _us_task}
-                _done, _pending = await asyncio.wait(
-                    _all_tasks, timeout=_ENRICHMENT_DEADLINE
+                await asyncio.wait_for(
+                    self._pipeline_body(analysis_id, raw_bytes, stages),
+                    timeout=self._PIPELINE_DEADLINE,
                 )
-
-                _enrichment_timed_out = bool(_pending)
-                if _enrichment_timed_out:
-                    logger.warning(
-                        "Enrichment deadline exceeded (%ds) for analysis_id=%d — "
-                        "%d task(s) cancelled; continuing with partial results.",
-                        _ENRICHMENT_DEADLINE, analysis_id, len(_pending),
-                    )
-                    for _t in _pending:
-                        _t.cancel()
-                    # Await cancellation to suppress CancelledError
-                    await asyncio.gather(*_pending, return_exceptions=True)
-
-                def _task_result(task, fallback):
-                    """Return the task result if done without error, else fallback."""
-                    if task in _done and not task.cancelled():
-                        try:
-                            return task.result()
-                        except Exception:
-                            pass
-                    return fallback
-
-                # Synthetic no-data responses for timed-out tasks
-                _VT_TIMEOUT    = {"status": "timeout", "error": "Enrichment deadline exceeded", "results": {}}
-                _ABUSE_TIMEOUT = {"status": "timeout", "error": "Enrichment deadline exceeded", "data": None}
-                _SHODAN_TIMEOUT= {"status": "timeout", "error": "Enrichment deadline exceeded", "data": None}
-                _UI_TIMEOUT: list = []
-                _US_TIMEOUT    = {
-                    "status": "timeout", "error": "Enrichment deadline exceeded",
-                    "scan_uuid": None, "report_url": None, "screenshot_url": None,
-                    "verdict": None, "malicious": False, "redirect_chain": [],
-                    "final_url": None, "page_title": None, "tags": [], "score": None, "raw": None,
-                }
-
-                vt_enrichment     = _task_result(_vt_task,   _VT_TIMEOUT)
-                abuse_enrichment  = _task_result(_ab_task,   _ABUSE_TIMEOUT)
-                shodan_enrichment = _task_result(_sh_task,   _SHODAN_TIMEOUT)
-                url_intel_results = _task_result(_ui_task,   _UI_TIMEOUT)
-                urlscan_result    = _task_result(_us_task,   _US_TIMEOUT)
-
-                # Phase B: enrichment gather complete — mark enrichment done/failed/skipped.
-                # urlscan was already updated inside _run_urlscan() above.
-                # Rules:
-                #   overall deadline fired (any task cancelled)   → TIMEOUT
-                #   all three providers returned "no_key"         → SKIPPED
-                #   any provider returned "error"                 → FAILED
-                #   otherwise (ok/no_data/rate_limit/timeout/mixed no_key) → DONE
-                # "no_key" alone is not an error — it means the feature is disabled.
-                # A single provider error → FAILED because DONE would suggest enrichment
-                # produced data, which is misleading when one provider hard-failed.
-                # rate_limit, no_data, and timeout are not errors; they count as DONE.
-                _enrich_statuses = (
-                    vt_enrichment.get("status"),
-                    abuse_enrichment.get("status"),
-                    shodan_enrichment.get("status"),
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Analysis pipeline watchdog fired for id=%d — exceeded %ds deadline",
+                    analysis_id, self._PIPELINE_DEADLINE,
                 )
-                if _enrichment_timed_out:
-                    _enrich_stage_status = STATUS_TIMEOUT
-                elif all(s == "no_key" for s in _enrich_statuses):
-                    _enrich_stage_status = STATUS_SKIPPED
-                elif any(s == "error" for s in _enrich_statuses):
-                    _enrich_stage_status = STATUS_FAILED
-                else:
-                    _enrich_stage_status = STATUS_DONE
-                await stages.update(STAGE_ENRICHMENT, _enrich_stage_status)
-
-                vt_status  = vt_enrichment["status"]
-                vt_error   = vt_enrichment.get("error")
-                vt_results = vt_enrichment.get("results", {})
-
-                if vt_status == "no_key":
-                    logger.info("VirusTotal: skipped — no API key configured")
-                elif vt_status == "rate_limit":
-                    logger.warning("VirusTotal: rate limit / quota exceeded: %s", vt_error)
-                elif vt_status == "error":
-                    logger.error("VirusTotal: enrichment error: %s", vt_error)
-                else:
-                    logger.info("VirusTotal: status=%s, urls_enriched=%d", vt_status, len(vt_results))
-
-                abuse_status = abuse_enrichment["status"]
-                abuse_error  = abuse_enrichment.get("error")
-                abuse_data   = abuse_enrichment.get("data") or {}
-
-                if abuse_status == "no_key":
-                    logger.info("AbuseIPDB: skipped — no API key configured")
-                elif abuse_status == "rate_limit":
-                    logger.warning("AbuseIPDB: rate limit / quota exceeded: %s", abuse_error)
-                elif abuse_status == "error":
-                    logger.error("AbuseIPDB: enrichment error: %s", abuse_error)
-                else:
-                    logger.info("AbuseIPDB: status=%s", abuse_status)
-
-                shodan_status = shodan_enrichment["status"]
-                shodan_error  = shodan_enrichment.get("error")
-                shodan_data   = shodan_enrichment.get("data")
-
-                if shodan_status not in ("ok", "no_data", "no_key"):
-                    logger.warning("Shodan: status=%s error=%s", shodan_status, shodan_error)
-                else:
-                    logger.info("Shodan: status=%s", shodan_status)
-
-                urlscan_status = urlscan_result.get("status")
-                urlscan_error  = urlscan_result.get("error")
-                if urlscan_status == "no_key":
-                    logger.info("urlscan.io: skipped — no API key configured")
-                elif urlscan_status in ("timeout", "error"):
-                    logger.warning(
-                        "urlscan.io: status=%s error=%s", urlscan_status, urlscan_error
-                    )
-                else:
-                    logger.info(
-                        "urlscan.io: status=%s verdict=%s",
-                        urlscan_status, urlscan_result.get("verdict"),
-                    )
-
-                # ── Phase 3: Static attachment analysis ───────────────────
-                # Run in executor so zipfile / OLE2 scanning stays off the loop.
-                att_intel_results = []
-                decoded_payloads: list[bytes] = []
-                for att in attachments_raw:
-                    payload = att.get("payload") or b""
-                    if isinstance(payload, str):
-                        # BUG-04 fix: eml_parser returns base64-encoded strings
-                        # for certain MIME configurations.  The old code replaced
-                        # any string payload with b"", dropping all static analysis
-                        # and hash computation for those attachments.  Decode first.
-                        import base64 as _b64
-                        try:
-                            payload = _b64.b64decode(payload, validate=False)
-                        except Exception:
-                            payload = b""
-                    decoded_payloads.append(payload)
-                    fname = att.get("filename")
-                    declared_ct = eml.get_attachment_content_type(att)
-                    intel = await loop.run_in_executor(
-                        None,
-                        att_intel.analyse_attachment,
-                        payload,
-                        fname,
-                        declared_ct,
-                    )
-                    att_intel_results.append(intel)
-
-                # ── Phase 2: VT hash reputation for attachments ────────────
-                # BUG-13 fix: build sha256_list AFTER Phase 3 decodes payloads.
-                # For attachments where eml_parser returned a base64 string,
-                # hash_attachment_content() would previously return None because
-                # att["payload"] was a string.  Now we compute the hash from the
-                # decoded bytes in decoded_payloads when the att dict has no bytes.
-                sha256_list: list[str | None] = []
-                for att, decoded in zip(attachments_raw, decoded_payloads):
-                    h = eml.hash_attachment_content(att)
-                    if h is None and decoded:
-                        import hashlib as _hl
-                        h = _hl.sha256(decoded).hexdigest()
-                    sha256_list.append(h)
-                vt_hash_enrichment = await virustotal_provider.enrich_hashes(
-                    [h for h in sha256_list if h], vt_key
-                )
-                vt_hash_results = vt_hash_enrichment.get("results", {})
-
-                attachment_rows = []
-                for att, intel in zip(attachments_raw, att_intel_results):
-                    sha = eml.hash_attachment_content(att)
-                    vt_hash_stats = vt_hash_results.get(sha, {}) if sha else {}
-                    attachment_rows.append({
-                        "filename":          att.get("filename"),
-                        "content_type":      eml.get_attachment_content_type(att),
-                        "sha256":            sha,
-                        "is_executable_like":  False,
-                        "is_double_extension": False,
-                        # Phase 2: VT hash reputation
-                        "vt_hash_malicious":  vt_hash_stats.get("malicious", 0),
-                        "vt_hash_suspicious": vt_hash_stats.get("suspicious", 0),
-                        "vt_hash_status":     vt_hash_enrichment.get("status"),
-                        # Phase 3: static analysis
-                        "is_macro_enabled":          intel.is_macro_enabled,
-                        "has_embedded_executable":   intel.has_embedded_executable,
-                        "is_archive":                intel.is_archive,
-                        "mime_magic_mismatch":       intel.mime_magic_mismatch,
-                        "file_metadata":             intel.to_dict() if (
-                            intel.is_macro_enabled or intel.mime_magic_mismatch
-                            or intel.has_embedded_executable or intel.file_metadata
-                        ) else None,
-                    })
-
-                # ── Phase 4: Build URL rows with intelligence data ─────────
-                url_intel_map = {r.original_url: r for r in url_intel_results}
-
-                url_rows = [
-                    {
-                        "url": u,
-                        "vt_malicious":  vt_results.get(u, {}).get("malicious", 0),
-                        "vt_harmless":   vt_results.get(u, {}).get("harmless", 0),
-                        "vt_suspicious": vt_results.get(u, {}).get("suspicious", 0),
-                        "is_suspicious_keyword": False,
-                        "is_ip_host":            False,
-                        "is_shortener":          False,
-                        "is_suspicious_tld":     False,
-                        "is_punycode":           False,
-                        # Phase 4: URL intelligence
-                        "expanded_url":          url_intel_map[u].expanded_url if u in url_intel_map else None,
-                        "page_title":            url_intel_map[u].page_title if u in url_intel_map else None,
-                        "redirect_count":        url_intel_map[u].redirect_count if u in url_intel_map else 0,
-                        "final_status_code":     url_intel_map[u].final_status_code if u in url_intel_map else None,
-                        "is_redirect_suspicious": url_intel_map[u].is_redirect_suspicious if u in url_intel_map else False,
-                    }
-                    for u in urls
-                ]
-
-                score_info = None  # will be computed after sandbox detonation below
-
-                # ── Phase 5: Sandbox detonation ───────────────────────────
-                # Pick the most suspicious attachment (macro/executable first),
-                # or the most suspicious URL if no qualifying attachment.
-                sandbox_result: dict = {"status": "no_key", "provider": _sandbox_provider,
-                                        "error": None, "report_url": None,
-                                        "verdict": None, "score": None, "tags": [], "raw": None,
-                                        "processes": [], "network_calls": [], "iocs": []}
-                if _sandbox_provider and _sandbox_key:
-                    # Prefer macro-enabled or embedded-exe attachments
-                    sandbox_att = next(
-                        (
-                            (att, raw)
-                            for att, raw in zip(attachment_rows, attachments_raw)
-                            if att.get("is_macro_enabled") or att.get("has_embedded_executable")
-                               or att.get("is_executable_like")
-                        ),
-                        None,
-                    )
-                    if sandbox_att:
-                        att_row, att_raw = sandbox_att
-                        payload = att_raw.get("payload") or b""
-                        if isinstance(payload, str):
-                            # BUG-04 fix (sandbox path): same base64-decode fallback
-                            import base64 as _b64s
-                            try:
-                                payload = _b64s.b64decode(payload, validate=False)
-                            except Exception:
-                                payload = b""
-                        if payload:
-                            try:
-                                sandbox_result = await sandbox_prov.submit_for_sandbox(
-                                    provider=_sandbox_provider,
-                                    api_key=_sandbox_key,
-                                    file_payload=payload,
-                                    filename=att_row.get("filename"),
-                                    sha256=att_row.get("sha256"),
-                                )
-                                logger.info(
-                                    "Sandbox (%s): status=%s verdict=%s",
-                                    _sandbox_provider,
-                                    sandbox_result.get("status"),
-                                    sandbox_result.get("verdict"),
-                                )
-                            except Exception as exc:
-                                logger.warning("Sandbox submission failed: %s", type(exc).__name__)
-                                sandbox_result["status"] = "error"
-                                sandbox_result["error"] = f"Submission error: {type(exc).__name__}"
-                    elif urls:
-                        # Fall back to detonating the first suspicious URL
-                        # MED-07: validate URL scheme before submission
-                        suspicious_url = next(
-                            (r["url"] for r in url_rows if r.get("is_redirect_suspicious")
-                             or r.get("vt_malicious", 0) > 0),
-                            urls[0] if urls else None,
-                        )
-                        # SSRF guard: verify the URL resolves to a public address
-                        # before submitting to the sandbox. An attacker-controlled
-                        # email body could contain http://10.0.0.1/admin and cause
-                        # an on-premises sandbox agent to actually connect to it.
-                        if (suspicious_url
-                                and suspicious_url.startswith(("http://", "https://"))
-                                and _is_safe_for_external_submission(suspicious_url)):
-                            try:
-                                sandbox_result = await sandbox_prov.submit_for_sandbox(
-                                    provider=_sandbox_provider,
-                                    api_key=_sandbox_key,
-                                    url=suspicious_url,
-                                )
-                                logger.info(
-                                    "Sandbox URL (%s): status=%s verdict=%s",
-                                    _sandbox_provider,
-                                    sandbox_result.get("status"),
-                                    sandbox_result.get("verdict"),
-                                )
-                            except Exception as exc:
-                                # HIGH-03: log type only — str(exc) may include API key fragments
-                                logger.warning("Sandbox URL submission failed: %s", type(exc).__name__)
-                                sandbox_result["status"] = "error"
-                                sandbox_result["error"] = f"Submission error: {type(exc).__name__}"
-
-                # Phase B: sandbox stage complete — map result status to stage status.
-                # Sandbox was already marked running/skipped before the gather;
-                # here we update with the final outcome.
-                #
-                # "submitted" means the quick-scan path had no job_id so behavioral
-                # polling never happened — the analysis is incomplete.  It is NOT
-                # equivalent to "done"; map it to TIMEOUT so the UI shows the analyst
-                # that sandbox data is missing because polling did not finish.
-                #
-                # "file payload required" error: Hybrid Analysis only supports file
-                # detonation.  When the email has no qualifying attachment (no
-                # macro/executable) AND URL submission is not supported, the provider
-                # returns status="error" with this specific message.  This is NOT a
-                # tool failure — there was simply nothing to submit.  Map to SKIPPED
-                # so the stage row correctly shows "Skipped" rather than "Failed".
-                _NOTHING_TO_DETONATE_PHRASES = (
-                    "file payload required",
-                    "url submission not supported",
-                )
-                if _sandbox_will_run:
-                    _sb_status = sandbox_result.get("status", "error")
-                    _sb_error_lower = (sandbox_result.get("error") or "").lower()
-                    _nothing_to_detonate = any(
-                        phrase in _sb_error_lower
-                        for phrase in _NOTHING_TO_DETONATE_PHRASES
-                    )
-                    if _sb_status in ("done", "ok"):
-                        _sb_stage = STATUS_DONE
-                    elif _sb_status in ("timeout", "submitted"):
-                        _sb_stage = STATUS_TIMEOUT
-                    elif _nothing_to_detonate:
-                        # Provider rejected the submission because there was nothing
-                        # suitable to detonate — not a pipeline error, just no input.
-                        _sb_stage = STATUS_SKIPPED
-                    else:
-                        _sb_stage = STATUS_FAILED
-                    await stages.update(STAGE_SANDBOX, _sb_stage)
-
-                # ── Phase 1: Dynamic attachment detonation (behavioral report) ──
-                # The dynamic_attachment_* columns capture the full behavioral
-                # result separately from the legacy sandbox_* columns so both
-                # data sets are independently queryable.
-                # When the sandbox already ran (status done/submitted), we reuse
-                # that result directly.  The behavioral fields (processes,
-                # network_calls, iocs) are only populated for Hybrid Analysis
-                # status=done; for other providers/statuses they remain empty.
-                dynamic_attachment_result: dict = {
-                    "status": sandbox_result.get("status", "no_key"),
-                    "verdict": sandbox_result.get("verdict"),
-                    "score": sandbox_result.get("score"),
-                    "report_url": sandbox_result.get("report_url"),
-                    "tags": sandbox_result.get("tags") or [],
-                    "error": sandbox_result.get("error"),
-                    "processes": sandbox_result.get("processes") or [],
-                    "network_calls": sandbox_result.get("network_calls") or [],
-                    "iocs": sandbox_result.get("iocs") or [],
-                }
-
-                # Re-score with dynamic attachment findings (scored once after sandbox)
-
-                # ── Phase 2: Behavioral signals ───────────────────────────
-                # Phase B: behavioral stage starts (covers behavioral + BEC)
-                await stages.update(STAGE_BEHAVIORAL, STATUS_RUNNING)
-
-                # Computed here, before compute_score, so the result can be
-                # passed in as behavioral_result.  History is written AFTER
-                # scoring (record_observation call below) so the current email
-                # does not influence its own behavioral scores.
-                # Recipient is derived from the To header if available,
-                # falling back to a synthetic placeholder so the service
-                # always has a non-empty recipient key.
-                _recipient = (
-                    eml.get_recipient(parsed, headers)
-                    or "unknown@local"
-                )
-                behavioral_result_obj = None
-                async with self.session_factory() as _beh_session:
-                    try:
-                        behavioral_result_obj = await behavioral_svc.compute_behavioral_signals(
-                            session=_beh_session,
-                            from_addr=header_info["from_addr"],
-                            from_domain=header_info["from_domain"],
-                            subject=subject,
-                            message_id=message_id,
-                            in_reply_to=in_reply_to,
-                            email_date=eml.get_email_date(parsed, headers),
-                            recipient=_recipient,
-                            brand_domains=brand_domains,
-                            scoring_weights=scoring_weights,
-                            lookalike_threshold=scoring_weights.get(
-                                "brand_domain_lookalike_threshold", 82
-                            ),
-                        )
-                    except Exception as _beh_exc:
-                        logger.warning(
-                            "Behavioral signals computation failed for id=%s: %s",
-                            analysis_id, type(_beh_exc).__name__,
-                        )
-                        behavioral_result_obj = None
-
-                # ── Phase 3: BEC signals ──────────────────────────────────
-                # Computed here, after behavioral_result_obj, so we can pass
-                # first_time_sender directly without a second DB query.
-                # Like behavioral signals, BEC signals are computed before
-                # compute_score() and passed in — they are NOT added to the
-                # combined score inline here.
-                bec_result_obj = None
-                async with self.session_factory() as _bec_session:
-                    try:
-                        _first_time_sender = (
-                            behavioral_result_obj.sig_first_time_sender
-                            if behavioral_result_obj is not None else None
-                        )
-                        bec_result_obj = await bec_svc.compute_bec_signals(
-                            session=_bec_session,
-                            from_addr=header_info["from_addr"],
-                            from_domain=header_info["from_domain"],
-                            subject=subject,
-                            message_id=message_id,
-                            in_reply_to=in_reply_to,
-                            body_text=body_text or "",
-                            recipient=_recipient,
-                            first_time_sender=_first_time_sender,
-                            scoring_weights=scoring_weights,
-                        )
-                    except Exception as _bec_exc:
-                        logger.warning(
-                            "BEC signals computation failed for id=%s: %s",
-                            analysis_id, type(_bec_exc).__name__,
-                        )
-                        bec_result_obj = None
-
-                # Phase B: behavioral + BEC done
-                await stages.update(STAGE_BEHAVIORAL, STATUS_DONE)
-
-                score_info = scoring_service.compute_score(
-                    from_addr=header_info["from_addr"],
-                    from_domain=header_info["from_domain"],
-                    auth=header_info["auth"],
-                    header_issues=header_info["issues"],
-                    urls=url_rows,
-                    attachments=attachment_rows,
-                    abuse_result=abuse_data,
-                    sender_ip=header_info["sender_ip"],
-                    body_text=body_text,
-                    scoring_weights=scoring_weights,
-                    brand_domains=brand_domains,
-                    url_suspicious_keywords=suspicious_keywords,
-                    suspicious_tlds=suspicious_tlds,
-                    url_shorteners=url_shorteners,
-                    urgency_keywords=urgency_keywords,
-                    lure_categories=lure_categories,
-                    anchor_mismatches=anchor_mismatches,
-                    url_detonation_result=urlscan_result if urlscan_result.get("status") == "done" else None,
-                    attachment_detonation_result=(
-                        dynamic_attachment_result
-                        if dynamic_attachment_result.get("status") == "done" else None
-                    ),
-                    # Phase 2: behavioral result (computed above, before this call)
-                    behavioral_result=behavioral_result_obj,
-                    # Phase 3: BEC result (computed above, before this call)
-                    bec_result=bec_result_obj,
-                )
-
-                async with self.session_factory() as session:
-                    repo = AnalysisRepository(session)
-                    analysis = await repo.get_by_id(analysis_id)
-
-                    analysis.message_id = message_id
-                    analysis.subject = subject
-                    analysis.from_addr = header_info["from_addr"]
-                    analysis.from_domain = header_info["from_domain"]
-                    analysis.reply_to = header_info["reply_to"]
-                    analysis.reply_domain = header_info["reply_domain"]
-                    analysis.return_path = header_info["return_path"]
-                    analysis.return_domain = header_info["return_domain"]
-                    analysis.sender_ip = header_info["sender_ip"]
-                    analysis.spf = header_info["auth"]["spf"]
-                    analysis.dkim = header_info["auth"]["dkim"]
-                    analysis.dmarc = header_info["auth"]["dmarc"]
-                    analysis.auth_headers_raw = header_info["auth_headers"]
-                    analysis.header_issues = header_info["issues"]
-
-                    # Per-provider enrichment status — persisted so the UI
-                    # can show exactly why enrichment data is absent.
-                    # HIGH-08 / CRIT-03: truncate and sanitize error strings —
-                    # raw exception messages may contain API key fragments,
-                    # internal hostnames, or SQL schema details.
-                    analysis.vt_enrichment_status  = vt_status
-                    analysis.vt_enrichment_error   = _safe_error(vt_error)
-                    analysis.abuse_enrichment_status = abuse_status
-                    analysis.abuse_enrichment_error  = _safe_error(abuse_error)
-                    analysis.shodan_enrichment_status = shodan_status
-                    analysis.shodan_enrichment_error  = _safe_error(shodan_error)
-                    analysis.shodan_data = shodan_data
-
-                    # Phase 5: sandbox
-                    analysis.sandbox_status     = sandbox_result.get("status")
-                    analysis.sandbox_provider   = sandbox_result.get("provider")
-                    analysis.sandbox_verdict    = sandbox_result.get("verdict")
-                    analysis.sandbox_score      = sandbox_result.get("score")
-                    analysis.sandbox_report_url = sandbox_result.get("report_url")
-                    analysis.sandbox_tags       = sandbox_result.get("tags") or []
-                    analysis.sandbox_error      = _safe_error(sandbox_result.get("error"))
-
-                    # Phase 1 dynamic analysis: urlscan.io URL detonation
-                    analysis.urlscan_status         = urlscan_result.get("status")
-                    analysis.urlscan_error          = _safe_error(urlscan_result.get("error"))
-                    analysis.urlscan_screenshot_url = urlscan_result.get("screenshot_url")
-                    analysis.urlscan_verdict        = urlscan_result.get("verdict")
-                    analysis.urlscan_redirect_chain = urlscan_result.get("redirect_chain") or []
-
-                    # Phase 1 dynamic analysis: attachment behavioral detonation
-                    analysis.dynamic_attachment_status     = dynamic_attachment_result.get("status")
-                    analysis.dynamic_attachment_verdict    = dynamic_attachment_result.get("verdict")
-                    analysis.dynamic_attachment_score      = dynamic_attachment_result.get("score")
-                    analysis.dynamic_attachment_report_url = dynamic_attachment_result.get("report_url")
-                    analysis.dynamic_attachment_tags       = dynamic_attachment_result.get("tags") or []
-                    analysis.dynamic_attachment_error      = _safe_error(dynamic_attachment_result.get("error"))
-
-                    # Phase 1 dynamic analysis: static vs dynamic score split
-                    analysis.static_score  = score_info.get("static_score")
-                    analysis.dynamic_score = score_info.get("dynamic_score")
-
-                    # Phase 2 behavioral analysis: independent behavioral score
-                    analysis.behavioral_score          = score_info.get("behavioral_score")
-                    analysis.behavioral_reasons        = score_info.get("behavioral_reasons") or []
-                    analysis.sig_first_time_sender     = score_info.get("sig_first_time_sender")
-                    analysis.sig_domain_age_anomaly    = score_info.get("sig_domain_age_anomaly")
-                    analysis.sig_display_name_mismatch = score_info.get("sig_display_name_mismatch")
-                    analysis.sig_reply_chain_break     = score_info.get("sig_reply_chain_break")
-                    analysis.sig_send_time_anomaly     = score_info.get("sig_send_time_anomaly")
-
-                    # Phase 3 BEC detection: independent BEC score
-                    analysis.bec_score              = score_info.get("bec_score")
-                    analysis.bec_reasons            = score_info.get("bec_reasons") or []
-                    analysis.sig_vip_impersonation  = score_info.get("sig_vip_impersonation")
-                    analysis.sig_financial_request  = score_info.get("sig_financial_request")
-                    analysis.sig_vendor_fraud       = score_info.get("sig_vendor_fraud")
-                    analysis.sig_authority_pressure = score_info.get("sig_authority_pressure")
-
-                    analysis.abuse_score         = abuse_data.get("abuse_score")
-                    analysis.abuse_total_reports = abuse_data.get("total_reports")
-                    analysis.abuse_country       = abuse_data.get("country_code")
-                    analysis.abuse_isp           = abuse_data.get("isp")
-                    analysis.global_hashes = global_hashes
-                    # Truncate body text to prevent unbounded SQLite row growth.
-                    # 200 000 chars (~200 KB) is more than enough for scoring/preview.
-                    analysis.body_text = body_text[:_MAX_BODY_TEXT_CHARS] if body_text else None
-                    # Phase 1: MIME structure + social engineering
-                    analysis.mime_parts = mime_parts
-                    analysis.lure_categories = lure_categories
-                    analysis.anchor_mismatches = anchor_mismatches
-                    analysis.score = score_info["score"]
-                    analysis.verdict = score_info["verdict"]
-                    analysis.status = "DONE"
-                    analysis.error_message = None
-
-                    # Phase B: persist the final stage dict in the same DB write
-                    # as all other results — a single atomic save, not an extra flush.
-                    analysis.pipeline_stages = stages.snapshot()
-
-                    header_flags = score_info["header_flags"]
-                    analysis.is_lookalike_domain = header_flags["is_lookalike_domain"]
-                    analysis.lookalike_of = header_flags["lookalike_of"]
-                    analysis.is_punycode_domain = header_flags["is_punycode_domain"]
-                    analysis.is_suspicious_sender_tld = header_flags["is_suspicious_sender_tld"]
-                    analysis.urgency_keywords_found = score_info["urgency_keywords_found"]
-
-                    analysis.urls = [UrlIndicator(**row) for row in url_rows]
-                    analysis.attachments = [
-                        AttachmentIndicator(**row) for row in attachment_rows
-                    ]
-                    analysis.reasons = [
-                        ScoreReason(reason_text=text, order_index=i)
-                        for i, text in enumerate(score_info["reasons"])
-                    ]
-
-                    await repo.save(analysis)
-
-                # ── Phase 2: Record behavioral observation AFTER scoring ────
-                # History is written after the analysis row is saved so the
-                # current email never influences its own behavioral scores.
-                async with self.session_factory() as _obs_session:
-                    try:
-                        await behavioral_svc.record_observation(
-                            session=_obs_session,
-                            from_addr=header_info["from_addr"],
-                            subject=subject,
-                            message_id=message_id,
-                            in_reply_to=in_reply_to,
-                            email_date=eml.get_email_date(parsed, headers),
-                            recipient=_recipient,
-                        )
-                        await _obs_session.commit()
-                    except Exception as _obs_exc:
-                        logger.warning(
-                            "Behavioral observation recording failed for id=%s: %s",
-                            analysis_id, type(_obs_exc).__name__,
-                        )
-
-            except Exception as exc:
-                logger.exception("Analysis pipeline failed for id=%s", analysis_id)
-                # Phase B: mark all still-running/pending stages as failed
                 try:
-                    _failed_updates = {
-                        k: STATUS_FAILED
+                    _timeout_updates = {
+                        k: STATUS_TIMEOUT
                         for k, v in stages.snapshot().items()
                         if v in (STATUS_PENDING, STATUS_RUNNING)
                     }
-                    if _failed_updates:
-                        await stages.update_many(_failed_updates)
+                    if _timeout_updates:
+                        await stages.update_many(_timeout_updates)
                 except Exception:
-                    pass  # stage flush failure must never mask the original exception
-                # CRIT-03: never expose raw exception strings to callers —
-                # str(exc) can contain SQL, filesystem paths, or API key fragments.
-                safe_msg = f"Analysis pipeline error: {type(exc).__name__}"
-                await self._mark_status(analysis_id, "FAILED", error_message=safe_msg)
+                    pass
+                await self._mark_status(
+                    analysis_id, "FAILED",
+                    error_message=(
+                        f"Analysis pipeline exceeded the "
+                        f"{self._PIPELINE_DEADLINE // 60}-minute deadline and was cancelled."
+                    ),
+                )
+        finally:
+            _ANALYSIS_CONCURRENCY.release()
+
+    async def _pipeline_body(
+        self, analysis_id: int, raw_bytes: bytes, stages: "_PipelineStages"
+    ) -> None:
+        """Inner pipeline — called by _run_pipeline under a watchdog timer.
+
+        All exceptions propagate up to _run_pipeline's except/finally so the
+        concurrency slot is always released.
+        """
+        try:
+            await self._mark_status(analysis_id, "RUNNING")
+
+            # ── Phase B: static stage starts ──────────────────────────
+            await stages.update(STAGE_STATIC, STATUS_RUNNING)
+
+            loop = asyncio.get_running_loop()
+            parsed = await loop.run_in_executor(None, eml.parse_eml_bytes, raw_bytes)
+
+            body_text = eml.extract_text_from_body(parsed.get("body", {}))
+            attachments_raw = parsed.get("attachment", []) or []
+            headers = parsed.get("header", {}) or {}
+            header_info = eml.analyze_headers(parsed)
+            global_hashes = eml.extract_global_hashes(parsed)
+            urls = eml.extract_urls_from_body(parsed.get("body", {}), body_text)
+            message_id = eml.get_message_id(parsed, headers)
+            subject = eml.get_subject(parsed, headers)
+            in_reply_to = eml.get_in_reply_to(parsed, headers)
+
+            # ── Phase 1: MIME structure + social engineering signals ───────
+            mime_parts = eml.extract_mime_parts(parsed)
+            html_bodies = threat_signals.extract_html_bodies(parsed)
+            anchor_mismatches_raw = []
+            for html in html_bodies:
+                anchor_mismatches_raw.extend(threat_signals.detect_anchor_mismatches(html))
+            # Deduplicate by (display, href) key
+            seen_anchors: set[tuple[str, str]] = set()
+            anchor_mismatches: list[dict] = []
+            for am in anchor_mismatches_raw:
+                key = (am.display_text[:80], am.href[:120])
+                if key not in seen_anchors:
+                    seen_anchors.add(key)
+                    anchor_mismatches.append({
+                        "display_text": am.display_text,
+                        "href": am.href,
+                        "reason": am.reason,
+                    })
+            lure_matches = threat_signals.detect_lure_categories(body_text)
+            lure_categories = [
+                {"category": lm.category, "matched_keywords": lm.matched_keywords}
+                for lm in lure_matches
+            ]
+
+            async with self.session_factory() as session:
+                settings = await SettingsRepository(session).get()
+                vt_key = settings.virustotal_key or self._vt_api_key_env
+                abuse_key = settings.abuseipdb_key or self._abuseipdb_key_env
+                shodan_key = getattr(settings, "shodan_key", None)
+                urlscan_key = getattr(settings, "urlscan_key", None)
+                _sandbox_provider = getattr(settings, "sandbox_provider", None)
+                _sandbox_key = getattr(settings, "sandbox_api_key", None)
+                scoring_weights = dict(settings.scoring_weights)
+                brand_domains = dict(settings.brand_domains)
+                suspicious_keywords = list(settings.url_suspicious_keywords)
+                suspicious_tlds = list(settings.suspicious_tlds)
+                url_shorteners = list(settings.url_shorteners)
+                urgency_keywords = list(settings.urgency_keywords)
+
+            # ── Phase B: static stage done; mark enrichment stages ────
+            # Determine up-front whether urlscan and sandbox will run so
+            # we can set skipped immediately rather than after the gather.
+            _urlscan_will_run = bool(urlscan_key and urls)
+            _sandbox_will_run = bool(_sandbox_provider and _sandbox_key)
+            await stages.update_many({
+                STAGE_STATIC:     STATUS_DONE,
+                STAGE_ENRICHMENT: STATUS_RUNNING,
+                STAGE_URLSCAN:    STATUS_RUNNING if _urlscan_will_run else STATUS_SKIPPED,
+                STAGE_SANDBOX:    STATUS_RUNNING if _sandbox_will_run else STATUS_SKIPPED,
+            })
+
+            # ── Threat intel enrichment ───────────────────────────────
+            # Both providers now return a structured dict:
+            #   {"status": "no_key"|"ok"|"no_data"|"rate_limit"|"error",
+            #    "error": str|None, "results"/"data": ...}
+            # We log the status and store it on the analysis row so the
+            # UI can show a clear explanation instead of just "no data".
+
+            # urlscan.io: pick the most suspicious URL to detonate.
+            # A fast-fail no_key result is returned immediately when the
+            # key is absent, so this never adds latency in that case.
+            # The call is wrapped in wait_for with a 100 s cap so a slow
+            # urlscan scan cannot block the pipeline even when a key IS set.
+            _urlscan_url: str | None = None
+            if urlscan_key and urls:
+                # Prefer a URL that already looks suspicious from static analysis
+                # (we don't have url_rows yet, so use a heuristic on raw strings).
+                # SSRF guard: only submit URLs that resolve to public addresses.
+                # An attacker can embed http://192.168.1.1/ in an email body and
+                # trick the tool into submitting internal addresses to urlscan.io,
+                # leaking network topology to a third-party cloud service.
+                for _candidate in urls:
+                    if _is_safe_for_external_submission(_candidate):
+                        _urlscan_url = _candidate
+                        break
+                # If no URL passes the guard, _urlscan_url remains None and
+                # _run_urlscan() returns status="no_key" (intentional no-op).
+
+            async def _run_urlscan() -> dict:
+                if not _urlscan_url or not urlscan_key:
+                    # Phase B: already marked skipped before the gather
+                    return {
+                        "status": "no_key", "error": None, "scan_uuid": None,
+                        "report_url": None, "screenshot_url": None,
+                        "verdict": None, "malicious": False, "redirect_chain": [],
+                        "final_url": None, "page_title": None, "tags": [], "score": None,
+                        "raw": None,
+                    }
+                try:
+                    # Outer cap: urlscan provider polls internally up to 120 s
+                    # (_MAX_WAIT=120, _POLL_INTERVAL=10).  We allow 135 s here —
+                    # 120 s inner cap + 15 s grace for the final HTTP round-trip
+                    # and response parsing — so the inner timeout always fires
+                    # first and returns a clean "timeout" status rather than
+                    # having asyncio.CancelledError propagate to the pipeline.
+                    result = await asyncio.wait_for(
+                        urlscan_provider.detonate_url(_urlscan_url, urlscan_key),
+                        timeout=135,
+                    )
+                    # Phase B: urlscan completed — map provider status → stage status
+                    _stage_status = STATUS_DONE
+                    if result.get("status") in ("timeout",):
+                        _stage_status = STATUS_TIMEOUT
+                    elif result.get("status") in ("error",):
+                        _stage_status = STATUS_FAILED
+                    await stages.update(STAGE_URLSCAN, _stage_status)
+                    return result
+                except asyncio.TimeoutError:
+                    logger.warning("urlscan.io: pipeline timeout exceeded for %s", _urlscan_url)
+                    await stages.update(STAGE_URLSCAN, STATUS_TIMEOUT)
+                    return {
+                        "status": "timeout", "error": "Pipeline timeout exceeded",
+                        "scan_uuid": None, "report_url": None,
+                        "screenshot_url": None, "verdict": None, "malicious": False,
+                        "redirect_chain": [], "final_url": None, "page_title": None,
+                        "tags": [], "score": None, "raw": None,
+                    }
+                except Exception as exc:
+                    logger.warning("urlscan.io: unexpected error: %s", type(exc).__name__)
+                    await stages.update(STAGE_URLSCAN, STATUS_FAILED)
+                    return {
+                        "status": "error",
+                        "error": f"urlscan.io: {type(exc).__name__}",
+                        "scan_uuid": None, "report_url": None,
+                        "screenshot_url": None, "verdict": None, "malicious": False,
+                        "redirect_chain": [], "final_url": None, "page_title": None,
+                        "tags": [], "score": None, "raw": None,
+                    }
+
+            # ── Overall enrichment deadline ───────────────────────────
+            # Each individual provider already has its own HTTP timeout
+            # (VT=120s/URL, AbuseIPDB=15s, Shodan=10s).  Those per-call
+            # caps guard against a single slow provider call, but the
+            # gather can still block for many minutes when VT exhausts
+            # quota and retries across multiple uncached URLs — each
+            # waiting up to 120s.
+            #
+            # This outer deadline caps the ENTIRE gather at
+            # _ENRICHMENT_DEADLINE seconds (300s = 5 min).  We use
+            # asyncio.wait() instead of wait_for() so that tasks that
+            # finish BEFORE the deadline can still contribute their
+            # results to the pipeline.  Tasks that are still pending
+            # when the deadline fires are cancelled; they receive a
+            # synthetic "timeout" no-data response.
+            #
+            # Crucially, on deadline expiry the pipeline does NOT fail —
+            # it continues with whatever results arrived in time, marks
+            # the enrichment stage as TIMEOUT, and proceeds to behavioral
+            # and BEC scoring.  The analyst sees partial intel rather
+            # than a stuck "Analyzing…" row.
+            _ENRICHMENT_DEADLINE = 300  # seconds
+
+            _vt_task   = asyncio.ensure_future(virustotal_provider.enrich_urls(urls, vt_key))
+            _ab_task   = asyncio.ensure_future(abuseipdb_provider.enrich_ip(header_info["sender_ip"], abuse_key))
+            _sh_task   = asyncio.ensure_future(shodan_provider.enrich_ip(header_info["sender_ip"], shodan_key))
+            _ui_task   = asyncio.ensure_future(url_intel.expand_urls(urls))
+            _us_task   = asyncio.ensure_future(_run_urlscan())
+
+            _all_tasks = {_vt_task, _ab_task, _sh_task, _ui_task, _us_task}
+            _done, _pending = await asyncio.wait(
+                _all_tasks, timeout=_ENRICHMENT_DEADLINE
+            )
+
+            _enrichment_timed_out = bool(_pending)
+            if _enrichment_timed_out:
+                logger.warning(
+                    "Enrichment deadline exceeded (%ds) for analysis_id=%d — "
+                    "%d task(s) cancelled; continuing with partial results.",
+                    _ENRICHMENT_DEADLINE, analysis_id, len(_pending),
+                )
+                for _t in _pending:
+                    _t.cancel()
+                # Await cancellation to suppress CancelledError
+                await asyncio.gather(*_pending, return_exceptions=True)
+
+            def _task_result(task, fallback):
+                """Return the task result if done without error, else fallback."""
+                if task in _done and not task.cancelled():
+                    try:
+                        return task.result()
+                    except Exception:
+                        pass
+                return fallback
+
+            # Synthetic no-data responses for timed-out tasks
+            _VT_TIMEOUT    = {"status": "timeout", "error": "Enrichment deadline exceeded", "results": {}}
+            _ABUSE_TIMEOUT = {"status": "timeout", "error": "Enrichment deadline exceeded", "data": None}
+            _SHODAN_TIMEOUT= {"status": "timeout", "error": "Enrichment deadline exceeded", "data": None}
+            _UI_TIMEOUT: list = []
+            _US_TIMEOUT    = {
+                "status": "timeout", "error": "Enrichment deadline exceeded",
+                "scan_uuid": None, "report_url": None, "screenshot_url": None,
+                "verdict": None, "malicious": False, "redirect_chain": [],
+                "final_url": None, "page_title": None, "tags": [], "score": None, "raw": None,
+            }
+
+            vt_enrichment     = _task_result(_vt_task,   _VT_TIMEOUT)
+            abuse_enrichment  = _task_result(_ab_task,   _ABUSE_TIMEOUT)
+            shodan_enrichment = _task_result(_sh_task,   _SHODAN_TIMEOUT)
+            url_intel_results = _task_result(_ui_task,   _UI_TIMEOUT)
+            urlscan_result    = _task_result(_us_task,   _US_TIMEOUT)
+
+            # Phase B: enrichment gather complete — mark enrichment done/failed/skipped.
+            # urlscan was already updated inside _run_urlscan() above.
+            # Rules:
+            #   overall deadline fired (any task cancelled)   → TIMEOUT
+            #   all three providers returned "no_key"         → SKIPPED
+            #   any provider returned "error"                 → FAILED
+            #   otherwise (ok/no_data/rate_limit/timeout/mixed no_key) → DONE
+            # "no_key" alone is not an error — it means the feature is disabled.
+            # A single provider error → FAILED because DONE would suggest enrichment
+            # produced data, which is misleading when one provider hard-failed.
+            # rate_limit, no_data, and timeout are not errors; they count as DONE.
+            _enrich_statuses = (
+                vt_enrichment.get("status"),
+                abuse_enrichment.get("status"),
+                shodan_enrichment.get("status"),
+            )
+            if _enrichment_timed_out:
+                _enrich_stage_status = STATUS_TIMEOUT
+            elif all(s == "no_key" for s in _enrich_statuses):
+                _enrich_stage_status = STATUS_SKIPPED
+            elif any(s == "error" for s in _enrich_statuses):
+                _enrich_stage_status = STATUS_FAILED
+            else:
+                _enrich_stage_status = STATUS_DONE
+            await stages.update(STAGE_ENRICHMENT, _enrich_stage_status)
+
+            vt_status  = vt_enrichment["status"]
+            vt_error   = vt_enrichment.get("error")
+            vt_results = vt_enrichment.get("results", {})
+
+            if vt_status == "no_key":
+                logger.info("VirusTotal: skipped — no API key configured")
+            elif vt_status == "rate_limit":
+                logger.warning("VirusTotal: rate limit / quota exceeded: %s", vt_error)
+            elif vt_status == "error":
+                logger.error("VirusTotal: enrichment error: %s", vt_error)
+            else:
+                logger.info("VirusTotal: status=%s, urls_enriched=%d", vt_status, len(vt_results))
+
+            abuse_status = abuse_enrichment["status"]
+            abuse_error  = abuse_enrichment.get("error")
+            abuse_data   = abuse_enrichment.get("data") or {}
+
+            if abuse_status == "no_key":
+                logger.info("AbuseIPDB: skipped — no API key configured")
+            elif abuse_status == "rate_limit":
+                logger.warning("AbuseIPDB: rate limit / quota exceeded: %s", abuse_error)
+            elif abuse_status == "error":
+                logger.error("AbuseIPDB: enrichment error: %s", abuse_error)
+            else:
+                logger.info("AbuseIPDB: status=%s", abuse_status)
+
+            shodan_status = shodan_enrichment["status"]
+            shodan_error  = shodan_enrichment.get("error")
+            shodan_data   = shodan_enrichment.get("data")
+
+            if shodan_status not in ("ok", "no_data", "no_key"):
+                logger.warning("Shodan: status=%s error=%s", shodan_status, shodan_error)
+            else:
+                logger.info("Shodan: status=%s", shodan_status)
+
+            urlscan_status = urlscan_result.get("status")
+            urlscan_error  = urlscan_result.get("error")
+            if urlscan_status == "no_key":
+                logger.info("urlscan.io: skipped — no API key configured")
+            elif urlscan_status in ("timeout", "error"):
+                logger.warning(
+                    "urlscan.io: status=%s error=%s", urlscan_status, urlscan_error
+                )
+            else:
+                logger.info(
+                    "urlscan.io: status=%s verdict=%s",
+                    urlscan_status, urlscan_result.get("verdict"),
+                )
+
+            # ── Phase 3: Static attachment analysis ───────────────────
+            # Run in executor so zipfile / OLE2 scanning stays off the loop.
+            att_intel_results = []
+            decoded_payloads: list[bytes] = []
+            for att in attachments_raw:
+                payload = att.get("payload") or b""
+                if isinstance(payload, str):
+                    # BUG-04 fix: eml_parser returns base64-encoded strings
+                    # for certain MIME configurations.  The old code replaced
+                    # any string payload with b"", dropping all static analysis
+                    # and hash computation for those attachments.  Decode first.
+                    import base64 as _b64
+                    try:
+                        payload = _b64.b64decode(payload, validate=False)
+                    except Exception:
+                        payload = b""
+                decoded_payloads.append(payload)
+                fname = att.get("filename")
+                declared_ct = eml.get_attachment_content_type(att)
+                intel = await loop.run_in_executor(
+                    None,
+                    att_intel.analyse_attachment,
+                    payload,
+                    fname,
+                    declared_ct,
+                )
+                att_intel_results.append(intel)
+
+            # ── Phase 2: VT hash reputation for attachments ────────────
+            # BUG-13 fix: build sha256_list AFTER Phase 3 decodes payloads.
+            # For attachments where eml_parser returned a base64 string,
+            # hash_attachment_content() would previously return None because
+            # att["payload"] was a string.  Now we compute the hash from the
+            # decoded bytes in decoded_payloads when the att dict has no bytes.
+            sha256_list: list[str | None] = []
+            for att, decoded in zip(attachments_raw, decoded_payloads):
+                h = eml.hash_attachment_content(att)
+                if h is None and decoded:
+                    import hashlib as _hl
+                    h = _hl.sha256(decoded).hexdigest()
+                sha256_list.append(h)
+            vt_hash_enrichment = await virustotal_provider.enrich_hashes(
+                [h for h in sha256_list if h], vt_key
+            )
+            vt_hash_results = vt_hash_enrichment.get("results", {})
+
+            attachment_rows = []
+            for att, intel in zip(attachments_raw, att_intel_results):
+                sha = eml.hash_attachment_content(att)
+                vt_hash_stats = vt_hash_results.get(sha, {}) if sha else {}
+                attachment_rows.append({
+                    "filename":          att.get("filename"),
+                    "content_type":      eml.get_attachment_content_type(att),
+                    "sha256":            sha,
+                    "is_executable_like":  False,
+                    "is_double_extension": False,
+                    # Phase 2: VT hash reputation
+                    "vt_hash_malicious":  vt_hash_stats.get("malicious", 0),
+                    "vt_hash_suspicious": vt_hash_stats.get("suspicious", 0),
+                    "vt_hash_status":     vt_hash_enrichment.get("status"),
+                    # Phase 3: static analysis
+                    "is_macro_enabled":          intel.is_macro_enabled,
+                    "has_embedded_executable":   intel.has_embedded_executable,
+                    "is_archive":                intel.is_archive,
+                    "mime_magic_mismatch":       intel.mime_magic_mismatch,
+                    "file_metadata":             intel.to_dict() if (
+                        intel.is_macro_enabled or intel.mime_magic_mismatch
+                        or intel.has_embedded_executable or intel.file_metadata
+                    ) else None,
+                })
+
+            # ── Phase 4: Build URL rows with intelligence data ─────────
+            url_intel_map = {r.original_url: r for r in url_intel_results}
+
+            url_rows = [
+                {
+                    "url": u,
+                    "vt_malicious":  vt_results.get(u, {}).get("malicious", 0),
+                    "vt_harmless":   vt_results.get(u, {}).get("harmless", 0),
+                    "vt_suspicious": vt_results.get(u, {}).get("suspicious", 0),
+                    "is_suspicious_keyword": False,
+                    "is_ip_host":            False,
+                    "is_shortener":          False,
+                    "is_suspicious_tld":     False,
+                    "is_punycode":           False,
+                    # Phase 4: URL intelligence
+                    "expanded_url":          url_intel_map[u].expanded_url if u in url_intel_map else None,
+                    "page_title":            url_intel_map[u].page_title if u in url_intel_map else None,
+                    "redirect_count":        url_intel_map[u].redirect_count if u in url_intel_map else 0,
+                    "final_status_code":     url_intel_map[u].final_status_code if u in url_intel_map else None,
+                    "is_redirect_suspicious": url_intel_map[u].is_redirect_suspicious if u in url_intel_map else False,
+                }
+                for u in urls
+            ]
+
+            score_info = None  # will be computed after sandbox detonation below
+
+            # ── Phase 5: Sandbox detonation ───────────────────────────
+            # Pick the most suspicious attachment (macro/executable first),
+            # or the most suspicious URL if no qualifying attachment.
+            sandbox_result: dict = {"status": "no_key", "provider": _sandbox_provider,
+                                    "error": None, "report_url": None,
+                                    "verdict": None, "score": None, "tags": [], "raw": None,
+                                    "processes": [], "network_calls": [], "iocs": []}
+            if _sandbox_provider and _sandbox_key:
+                # Prefer macro-enabled or embedded-exe attachments
+                sandbox_att = next(
+                    (
+                        (att, raw)
+                        for att, raw in zip(attachment_rows, attachments_raw)
+                        if att.get("is_macro_enabled") or att.get("has_embedded_executable")
+                           or att.get("is_executable_like")
+                    ),
+                    None,
+                )
+                if sandbox_att:
+                    att_row, att_raw = sandbox_att
+                    payload = att_raw.get("payload") or b""
+                    if isinstance(payload, str):
+                        # BUG-04 fix (sandbox path): same base64-decode fallback
+                        import base64 as _b64s
+                        try:
+                            payload = _b64s.b64decode(payload, validate=False)
+                        except Exception:
+                            payload = b""
+                    if payload:
+                        try:
+                            sandbox_result = await sandbox_prov.submit_for_sandbox(
+                                provider=_sandbox_provider,
+                                api_key=_sandbox_key,
+                                file_payload=payload,
+                                filename=att_row.get("filename"),
+                                sha256=att_row.get("sha256"),
+                            )
+                            logger.info(
+                                "Sandbox (%s): status=%s verdict=%s",
+                                _sandbox_provider,
+                                sandbox_result.get("status"),
+                                sandbox_result.get("verdict"),
+                            )
+                        except Exception as exc:
+                            logger.warning("Sandbox submission failed: %s", type(exc).__name__)
+                            sandbox_result["status"] = "error"
+                            sandbox_result["error"] = f"Submission error: {type(exc).__name__}"
+                elif urls:
+                    # Fall back to detonating the first suspicious URL
+                    # MED-07: validate URL scheme before submission
+                    suspicious_url = next(
+                        (r["url"] for r in url_rows if r.get("is_redirect_suspicious")
+                         or r.get("vt_malicious", 0) > 0),
+                        urls[0] if urls else None,
+                    )
+                    # SSRF guard: verify the URL resolves to a public address
+                    # before submitting to the sandbox. An attacker-controlled
+                    # email body could contain http://10.0.0.1/admin and cause
+                    # an on-premises sandbox agent to actually connect to it.
+                    if (suspicious_url
+                            and suspicious_url.startswith(("http://", "https://"))
+                            and _is_safe_for_external_submission(suspicious_url)):
+                        try:
+                            sandbox_result = await sandbox_prov.submit_for_sandbox(
+                                provider=_sandbox_provider,
+                                api_key=_sandbox_key,
+                                url=suspicious_url,
+                            )
+                            logger.info(
+                                "Sandbox URL (%s): status=%s verdict=%s",
+                                _sandbox_provider,
+                                sandbox_result.get("status"),
+                                sandbox_result.get("verdict"),
+                            )
+                        except Exception as exc:
+                            # HIGH-03: log type only — str(exc) may include API key fragments
+                            logger.warning("Sandbox URL submission failed: %s", type(exc).__name__)
+                            sandbox_result["status"] = "error"
+                            sandbox_result["error"] = f"Submission error: {type(exc).__name__}"
+
+            # Phase B: sandbox stage complete — map result status to stage status.
+            # Sandbox was already marked running/skipped before the gather;
+            # here we update with the final outcome.
+            #
+            # "submitted" means the quick-scan path had no job_id so behavioral
+            # polling never happened — the analysis is incomplete.  It is NOT
+            # equivalent to "done"; map it to TIMEOUT so the UI shows the analyst
+            # that sandbox data is missing because polling did not finish.
+            #
+            # "file payload required" error: Hybrid Analysis only supports file
+            # detonation.  When the email has no qualifying attachment (no
+            # macro/executable) AND URL submission is not supported, the provider
+            # returns status="error" with this specific message.  This is NOT a
+            # tool failure — there was simply nothing to submit.  Map to SKIPPED
+            # so the stage row correctly shows "Skipped" rather than "Failed".
+            _NOTHING_TO_DETONATE_PHRASES = (
+                "file payload required",
+                "url submission not supported",
+            )
+            if _sandbox_will_run:
+                _sb_status = sandbox_result.get("status", "error")
+                _sb_error_lower = (sandbox_result.get("error") or "").lower()
+                _nothing_to_detonate = any(
+                    phrase in _sb_error_lower
+                    for phrase in _NOTHING_TO_DETONATE_PHRASES
+                )
+                if _sb_status in ("done", "ok"):
+                    _sb_stage = STATUS_DONE
+                elif _sb_status in ("timeout", "submitted"):
+                    _sb_stage = STATUS_TIMEOUT
+                elif _nothing_to_detonate:
+                    # Provider rejected the submission because there was nothing
+                    # suitable to detonate — not a pipeline error, just no input.
+                    _sb_stage = STATUS_SKIPPED
+                else:
+                    _sb_stage = STATUS_FAILED
+                await stages.update(STAGE_SANDBOX, _sb_stage)
+
+            # ── Phase 1: Dynamic attachment detonation (behavioral report) ──
+            # The dynamic_attachment_* columns capture the full behavioral
+            # result separately from the legacy sandbox_* columns so both
+            # data sets are independently queryable.
+            # When the sandbox already ran (status done/submitted), we reuse
+            # that result directly.  The behavioral fields (processes,
+            # network_calls, iocs) are only populated for Hybrid Analysis
+            # status=done; for other providers/statuses they remain empty.
+            dynamic_attachment_result: dict = {
+                "status": sandbox_result.get("status", "no_key"),
+                "verdict": sandbox_result.get("verdict"),
+                "score": sandbox_result.get("score"),
+                "report_url": sandbox_result.get("report_url"),
+                "tags": sandbox_result.get("tags") or [],
+                "error": sandbox_result.get("error"),
+                "processes": sandbox_result.get("processes") or [],
+                "network_calls": sandbox_result.get("network_calls") or [],
+                "iocs": sandbox_result.get("iocs") or [],
+            }
+
+            # Re-score with dynamic attachment findings (scored once after sandbox)
+
+            # ── Phase 2: Behavioral signals ───────────────────────────
+            # Phase B: behavioral stage starts (covers behavioral + BEC)
+            await stages.update(STAGE_BEHAVIORAL, STATUS_RUNNING)
+
+            # Computed here, before compute_score, so the result can be
+            # passed in as behavioral_result.  History is written AFTER
+            # scoring (record_observation call below) so the current email
+            # does not influence its own behavioral scores.
+            # Recipient is derived from the To header if available,
+            # falling back to a synthetic placeholder so the service
+            # always has a non-empty recipient key.
+            _recipient = (
+                eml.get_recipient(parsed, headers)
+                or "unknown@local"
+            )
+            behavioral_result_obj = None
+            async with self.session_factory() as _beh_session:
+                try:
+                    behavioral_result_obj = await behavioral_svc.compute_behavioral_signals(
+                        session=_beh_session,
+                        from_addr=header_info["from_addr"],
+                        from_domain=header_info["from_domain"],
+                        subject=subject,
+                        message_id=message_id,
+                        in_reply_to=in_reply_to,
+                        email_date=eml.get_email_date(parsed, headers),
+                        recipient=_recipient,
+                        brand_domains=brand_domains,
+                        scoring_weights=scoring_weights,
+                        lookalike_threshold=scoring_weights.get(
+                            "brand_domain_lookalike_threshold", 82
+                        ),
+                    )
+                except Exception as _beh_exc:
+                    logger.warning(
+                        "Behavioral signals computation failed for id=%s: %s",
+                        analysis_id, type(_beh_exc).__name__,
+                    )
+                    behavioral_result_obj = None
+
+            # ── Phase 3: BEC signals ──────────────────────────────────
+            # Computed here, after behavioral_result_obj, so we can pass
+            # first_time_sender directly without a second DB query.
+            # Like behavioral signals, BEC signals are computed before
+            # compute_score() and passed in — they are NOT added to the
+            # combined score inline here.
+            bec_result_obj = None
+            async with self.session_factory() as _bec_session:
+                try:
+                    _first_time_sender = (
+                        behavioral_result_obj.sig_first_time_sender
+                        if behavioral_result_obj is not None else None
+                    )
+                    bec_result_obj = await bec_svc.compute_bec_signals(
+                        session=_bec_session,
+                        from_addr=header_info["from_addr"],
+                        from_domain=header_info["from_domain"],
+                        subject=subject,
+                        message_id=message_id,
+                        in_reply_to=in_reply_to,
+                        body_text=body_text or "",
+                        recipient=_recipient,
+                        first_time_sender=_first_time_sender,
+                        scoring_weights=scoring_weights,
+                    )
+                except Exception as _bec_exc:
+                    logger.warning(
+                        "BEC signals computation failed for id=%s: %s",
+                        analysis_id, type(_bec_exc).__name__,
+                    )
+                    bec_result_obj = None
+
+            # Phase B: behavioral + BEC done
+            await stages.update(STAGE_BEHAVIORAL, STATUS_DONE)
+
+            score_info = scoring_service.compute_score(
+                from_addr=header_info["from_addr"],
+                from_domain=header_info["from_domain"],
+                auth=header_info["auth"],
+                header_issues=header_info["issues"],
+                urls=url_rows,
+                attachments=attachment_rows,
+                abuse_result=abuse_data,
+                sender_ip=header_info["sender_ip"],
+                body_text=body_text,
+                scoring_weights=scoring_weights,
+                brand_domains=brand_domains,
+                url_suspicious_keywords=suspicious_keywords,
+                suspicious_tlds=suspicious_tlds,
+                url_shorteners=url_shorteners,
+                urgency_keywords=urgency_keywords,
+                lure_categories=lure_categories,
+                anchor_mismatches=anchor_mismatches,
+                url_detonation_result=urlscan_result if urlscan_result.get("status") == "done" else None,
+                attachment_detonation_result=(
+                    dynamic_attachment_result
+                    if dynamic_attachment_result.get("status") == "done" else None
+                ),
+                # Phase 2: behavioral result (computed above, before this call)
+                behavioral_result=behavioral_result_obj,
+                # Phase 3: BEC result (computed above, before this call)
+                bec_result=bec_result_obj,
+            )
+
+            async with self.session_factory() as session:
+                repo = AnalysisRepository(session)
+                analysis = await repo.get_by_id(analysis_id)
+
+                analysis.message_id = message_id
+                analysis.subject = subject
+                analysis.from_addr = header_info["from_addr"]
+                analysis.from_domain = header_info["from_domain"]
+                analysis.reply_to = header_info["reply_to"]
+                analysis.reply_domain = header_info["reply_domain"]
+                analysis.return_path = header_info["return_path"]
+                analysis.return_domain = header_info["return_domain"]
+                analysis.sender_ip = header_info["sender_ip"]
+                analysis.spf = header_info["auth"]["spf"]
+                analysis.dkim = header_info["auth"]["dkim"]
+                analysis.dmarc = header_info["auth"]["dmarc"]
+                analysis.auth_headers_raw = header_info["auth_headers"]
+                analysis.header_issues = header_info["issues"]
+
+                # Per-provider enrichment status — persisted so the UI
+                # can show exactly why enrichment data is absent.
+                # HIGH-08 / CRIT-03: truncate and sanitize error strings —
+                # raw exception messages may contain API key fragments,
+                # internal hostnames, or SQL schema details.
+                analysis.vt_enrichment_status  = vt_status
+                analysis.vt_enrichment_error   = _safe_error(vt_error)
+                analysis.abuse_enrichment_status = abuse_status
+                analysis.abuse_enrichment_error  = _safe_error(abuse_error)
+                analysis.shodan_enrichment_status = shodan_status
+                analysis.shodan_enrichment_error  = _safe_error(shodan_error)
+                analysis.shodan_data = shodan_data
+
+                # Phase 5: sandbox
+                analysis.sandbox_status     = sandbox_result.get("status")
+                analysis.sandbox_provider   = sandbox_result.get("provider")
+                analysis.sandbox_verdict    = sandbox_result.get("verdict")
+                analysis.sandbox_score      = sandbox_result.get("score")
+                analysis.sandbox_report_url = sandbox_result.get("report_url")
+                analysis.sandbox_tags       = sandbox_result.get("tags") or []
+                analysis.sandbox_error      = _safe_error(sandbox_result.get("error"))
+
+                # Phase 1 dynamic analysis: urlscan.io URL detonation
+                analysis.urlscan_status         = urlscan_result.get("status")
+                analysis.urlscan_error          = _safe_error(urlscan_result.get("error"))
+                analysis.urlscan_screenshot_url = urlscan_result.get("screenshot_url")
+                analysis.urlscan_verdict        = urlscan_result.get("verdict")
+                analysis.urlscan_redirect_chain = urlscan_result.get("redirect_chain") or []
+
+                # Phase 1 dynamic analysis: attachment behavioral detonation
+                analysis.dynamic_attachment_status     = dynamic_attachment_result.get("status")
+                analysis.dynamic_attachment_verdict    = dynamic_attachment_result.get("verdict")
+                analysis.dynamic_attachment_score      = dynamic_attachment_result.get("score")
+                analysis.dynamic_attachment_report_url = dynamic_attachment_result.get("report_url")
+                analysis.dynamic_attachment_tags       = dynamic_attachment_result.get("tags") or []
+                analysis.dynamic_attachment_error      = _safe_error(dynamic_attachment_result.get("error"))
+
+                # Phase 1 dynamic analysis: static vs dynamic score split
+                analysis.static_score  = score_info.get("static_score")
+                analysis.dynamic_score = score_info.get("dynamic_score")
+
+                # Phase 2 behavioral analysis: independent behavioral score
+                analysis.behavioral_score          = score_info.get("behavioral_score")
+                analysis.behavioral_reasons        = score_info.get("behavioral_reasons") or []
+                analysis.sig_first_time_sender     = score_info.get("sig_first_time_sender")
+                analysis.sig_domain_age_anomaly    = score_info.get("sig_domain_age_anomaly")
+                analysis.sig_display_name_mismatch = score_info.get("sig_display_name_mismatch")
+                analysis.sig_reply_chain_break     = score_info.get("sig_reply_chain_break")
+                analysis.sig_send_time_anomaly     = score_info.get("sig_send_time_anomaly")
+
+                # Phase 3 BEC detection: independent BEC score
+                analysis.bec_score              = score_info.get("bec_score")
+                analysis.bec_reasons            = score_info.get("bec_reasons") or []
+                analysis.sig_vip_impersonation  = score_info.get("sig_vip_impersonation")
+                analysis.sig_financial_request  = score_info.get("sig_financial_request")
+                analysis.sig_vendor_fraud       = score_info.get("sig_vendor_fraud")
+                analysis.sig_authority_pressure = score_info.get("sig_authority_pressure")
+
+                analysis.abuse_score         = abuse_data.get("abuse_score")
+                analysis.abuse_total_reports = abuse_data.get("total_reports")
+                analysis.abuse_country       = abuse_data.get("country_code")
+                analysis.abuse_isp           = abuse_data.get("isp")
+                analysis.global_hashes = global_hashes
+                # Truncate body text to prevent unbounded SQLite row growth.
+                # 200 000 chars (~200 KB) is more than enough for scoring/preview.
+                analysis.body_text = body_text[:_MAX_BODY_TEXT_CHARS] if body_text else None
+                # Phase 1: MIME structure + social engineering
+                analysis.mime_parts = mime_parts
+                analysis.lure_categories = lure_categories
+                analysis.anchor_mismatches = anchor_mismatches
+                analysis.score = score_info["score"]
+                analysis.verdict = score_info["verdict"]
+                analysis.status = "DONE"
+                analysis.error_message = None
+
+                # Phase B: persist the final stage dict in the same DB write
+                # as all other results — a single atomic save, not an extra flush.
+                analysis.pipeline_stages = stages.snapshot()
+
+                header_flags = score_info["header_flags"]
+                analysis.is_lookalike_domain = header_flags["is_lookalike_domain"]
+                analysis.lookalike_of = header_flags["lookalike_of"]
+                analysis.is_punycode_domain = header_flags["is_punycode_domain"]
+                analysis.is_suspicious_sender_tld = header_flags["is_suspicious_sender_tld"]
+                analysis.urgency_keywords_found = score_info["urgency_keywords_found"]
+
+                analysis.urls = [UrlIndicator(**row) for row in url_rows]
+                analysis.attachments = [
+                    AttachmentIndicator(**row) for row in attachment_rows
+                ]
+                analysis.reasons = [
+                    ScoreReason(reason_text=text, order_index=i)
+                    for i, text in enumerate(score_info["reasons"])
+                ]
+
+                await repo.save(analysis)
+
+            # ── Phase 2: Record behavioral observation AFTER scoring ────
+            # History is written after the analysis row is saved so the
+            # current email never influences its own behavioral scores.
+            async with self.session_factory() as _obs_session:
+                try:
+                    await behavioral_svc.record_observation(
+                        session=_obs_session,
+                        from_addr=header_info["from_addr"],
+                        subject=subject,
+                        message_id=message_id,
+                        in_reply_to=in_reply_to,
+                        email_date=eml.get_email_date(parsed, headers),
+                        recipient=_recipient,
+                    )
+                    await _obs_session.commit()
+                except Exception as _obs_exc:
+                    logger.warning(
+                        "Behavioral observation recording failed for id=%s: %s",
+                        analysis_id, type(_obs_exc).__name__,
+                    )
+
+        except Exception as exc:
+            logger.exception("Analysis pipeline failed for id=%s", analysis_id)
+            # Phase B: mark all still-running/pending stages as failed
+            try:
+                _failed_updates = {
+                    k: STATUS_FAILED
+                    for k, v in stages.snapshot().items()
+                    if v in (STATUS_PENDING, STATUS_RUNNING)
+                }
+                if _failed_updates:
+                    await stages.update_many(_failed_updates)
+            except Exception:
+                pass  # stage flush failure must never mask the original exception
+            # CRIT-03: never expose raw exception strings to callers —
+            # str(exc) can contain SQL, filesystem paths, or API key fragments.
+            safe_msg = f"Analysis pipeline error: {type(exc).__name__}"
+            await self._mark_status(analysis_id, "FAILED", error_message=safe_msg)
 
     async def re_enrich(self, analysis_id: int) -> EmailAnalysis | None:
         """Re-run VT + AbuseIPDB enrichment on an already-completed analysis.
