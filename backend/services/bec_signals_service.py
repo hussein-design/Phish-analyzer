@@ -203,6 +203,12 @@ class BecResult(NamedTuple):
     sig_financial_request: bool | None
     sig_vendor_fraud: bool | None
     sig_authority_pressure: bool | None
+    # Phase C evidence fields — structured data for reason_evidence builder.
+    # vip_evidence: {"matched_vip_name": str, "protected_domain": str,
+    #                "actual_sender": str} or None
+    vip_evidence: dict | None = None
+    # financial_evidence: {"categories": {cat_name: [matched_phrase, ...], ...}}
+    financial_evidence: dict | None = None
 
 
 # ── Signal 1: vip_impersonation ───────────────────────────────────────────────
@@ -211,8 +217,12 @@ async def _check_vip_impersonation(
     session: AsyncSession,
     from_addr: str | None,
     from_domain: str | None,
-) -> tuple[bool, str | None]:
-    """Return (fired, reason_string).
+) -> tuple[bool, str | None, dict | None]:
+    """Return (fired, reason_string, evidence_dict).
+
+    evidence_dict (when fired): {"matched_vip_name": str,
+                                  "protected_domain": str,
+                                  "actual_sender": str}
 
     Loads active VIP entries and checks whether:
     a) The bare From email address exactly matches a protected_email, but the
@@ -220,17 +230,16 @@ async def _check_vip_impersonation(
     b) The From display name contains a VIP's name (case-insensitive substring),
        and the sending domain is NOT protected_domain for that VIP.
 
-    Returns (False, None) if no VIP entries exist (empty table = disabled).
+    Returns (False, None, None) if no VIP entries exist (empty table = disabled).
     """
     from backend.models.vip_identity import VIPIdentity
 
     if not from_addr:
-        return False, None
+        return False, None, None
 
     # Normalise inputs
     display_lower = from_addr.lower()
     # Extract bare address
-    import re as _re
     m = _re_addr.search(from_addr)
     bare_addr = m.group(1).lower() if m else from_addr.lower()
     sending_domain = (from_domain or "").lower()
@@ -242,10 +251,10 @@ async def _check_vip_impersonation(
         vips = result.scalars().all()
     except Exception as exc:
         logger.warning("bec: vip_impersonation DB query failed: %s", type(exc).__name__)
-        return False, None
+        return False, None, None
 
     if not vips:
-        return False, None
+        return False, None, None
 
     for vip in vips:
         prot_domain = (vip.protected_domain or "").lower()
@@ -266,7 +275,12 @@ async def _check_vip_impersonation(
                 f"identity '{vip.name}' ({vip.title or 'VIP'}) but sending domain "
                 f"'{sending_domain}' ≠ legitimate domain '{prot_domain}'"
             )
-            return True, reason
+            evidence = {
+                "matched_vip_name": vip.name,
+                "protected_domain": prot_domain,
+                "actual_sender": bare_addr,
+            }
+            return True, reason, evidence
 
         # Check b: VIP name appears in the display portion of From
         if vip_name and len(vip_name) >= 3:
@@ -282,9 +296,14 @@ async def _check_vip_impersonation(
                     f"'{vip.name}' ({vip.title or 'VIP'}) but sending domain "
                     f"'{sending_domain}' ≠ legitimate domain '{prot_domain}'"
                 )
-                return True, reason
+                evidence = {
+                    "matched_vip_name": vip.name,
+                    "protected_domain": prot_domain,
+                    "actual_sender": bare_addr,
+                }
+                return True, reason, evidence
 
-    return False, None
+    return False, None, None
 
 
 _re_addr = re.compile(r"<([^>]+)>")
@@ -295,8 +314,13 @@ _re_addr = re.compile(r"<([^>]+)>")
 def _check_financial_request_language(
     body_text: str,
     max_pts: int = BEC_FINANCIAL_MAX_PTS,
-) -> tuple[bool, list[str], list[str]]:
-    """Return (fired, fired_categories, reason_strings).
+) -> tuple[bool, list[str], list[str], dict[str, list[str]]]:
+    """Return (fired, fired_categories, reason_strings, category_phrases).
+
+    category_phrases maps each fired category name to the list of matched
+    phrases found in the body (up to 5 per category), for use by the
+    reason_evidence builder:
+        {"wire_transfer": ["wire transfer", "send the money"], ...}
 
     Scans body_text for each of the five financial pattern categories.
     Each category that fires contributes _PTS_FINANCIAL_PER_CATEGORY up to
@@ -307,10 +331,11 @@ def _check_financial_request_language(
     docstring for mitigation guidance and the README for user documentation.
     """
     if not body_text:
-        return False, [], []
+        return False, [], [], {}
 
     fired_categories: list[str] = []
     reasons: list[str] = []
+    category_phrases: dict[str, list[str]] = {}
     lower = body_text.lower()
 
     for cat_name, patterns in _COMPILED_PATTERNS:
@@ -321,13 +346,14 @@ def _check_financial_request_language(
                 hit_keywords.append(m.group(0))
         if hit_keywords:
             fired_categories.append(cat_name)
+            category_phrases[cat_name] = hit_keywords[:5]
             reasons.append(
                 f"BEC financial pattern '{cat_name.replace('_', ' ')}' — "
                 f"keywords: {', '.join(hit_keywords[:3])}"
                 + (" …" if len(hit_keywords) > 3 else "")
             )
 
-    return bool(fired_categories), fired_categories, reasons
+    return bool(fired_categories), fired_categories, reasons, category_phrases
 
 
 # ── Signal 3: vendor_fraud_pattern ────────────────────────────────────────────
@@ -507,8 +533,9 @@ async def compute_bec_signals(
 
     # ── Signal 1: vip_impersonation ───────────────────────────────────────
     sig_vip: bool | None = False
+    _vip_evidence: dict | None = None
     try:
-        sig_vip, vip_reason = await _check_vip_impersonation(
+        sig_vip, vip_reason, _vip_evidence = await _check_vip_impersonation(
             session, from_addr, from_domain
         )
         if sig_vip and vip_reason:
@@ -521,8 +548,9 @@ async def compute_bec_signals(
     # ── Signal 2: financial_request_language ─────────────────────────────
     sig_financial: bool | None = False
     financial_fired = False
+    _financial_evidence: dict | None = None
     try:
-        sig_financial, fired_cats, fin_reasons = _check_financial_request_language(
+        sig_financial, fired_cats, fin_reasons, _cat_phrases = _check_financial_request_language(
             body_text, max_pts=fin_max
         )
         financial_fired = sig_financial
@@ -530,6 +558,7 @@ async def compute_bec_signals(
             cat_pts = min(len(fired_cats) * pts_fin_cat, fin_max)
             bec_score += cat_pts
             bec_reasons.extend(fin_reasons)
+            _financial_evidence = {"categories": _cat_phrases}
     except Exception as exc:
         logger.warning("bec: financial_request_language failed: %s", type(exc).__name__)
         sig_financial = None
@@ -575,4 +604,6 @@ async def compute_bec_signals(
         sig_financial_request=sig_financial,
         sig_vendor_fraud=sig_vendor,
         sig_authority_pressure=sig_authority,
+        vip_evidence=_vip_evidence,
+        financial_evidence=_financial_evidence,
     )

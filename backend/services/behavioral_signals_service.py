@@ -171,6 +171,21 @@ class BehavioralResult(NamedTuple):
     sig_reply_chain_break: bool | None
     sig_send_time_anomaly: bool | None
 
+    # Phase C evidence fields — structured data for reason_evidence builder.
+    # Each is None when the corresponding signal did not fire.
+    # domain_age_evidence: {"domain": str, "registration_date": str,
+    #                        "age_days": int, "threshold_days": int}
+    domain_age_evidence: dict | None = None
+    # first_time_sender_evidence: {"sender": str, "recipient": str,
+    #                               "prior_message_count": int}
+    first_time_sender_evidence: dict | None = None
+    # reply_chain_break_evidence: {"thread_key": str, "sender": str}
+    reply_chain_break_evidence: dict | None = None
+    # send_time_anomaly_evidence: {"send_hour": int, "usual_hours": list[int]}
+    send_time_anomaly_evidence: dict | None = None
+    # display_name_mismatch_evidence: {"display_name": str, "sending_domain": str}
+    display_name_mismatch_evidence: dict | None = None
+
 
 # ── Normalization helpers ──────────────────────────────────────────────────────
 
@@ -356,18 +371,23 @@ async def _check_domain_age_anomaly(
     domain: str | None,
     email_date: datetime | None,
     threshold_days: int = DOMAIN_AGE_THRESHOLD_DAYS,
-) -> bool | None:
-    """Return True if domain was registered within threshold_days before email_date.
+) -> tuple[bool | None, dict | None]:
+    """Return (fired, evidence_dict).
 
-    Returns None if the lookup failed (signal undetermined — treated as False
-    by the caller so it never inflates the score on missing data).
+    fired: True if domain was registered within threshold_days before
+    email_date; False if old enough; None if lookup failed.
+
+    evidence_dict (when fired): {"domain": str, "registration_date": str,
+                                  "age_days": int, "threshold_days": int}
+
+    Returns (None, None) if the lookup failed.
     """
     if not domain:
-        return None
+        return None, None
 
     reg_date = await _lookup_domain_registration_date(domain)
     if reg_date is None:
-        return None  # lookup failed or domain not found — neutral
+        return None, None  # lookup failed or domain not found — neutral
 
     ref_date = email_date or datetime.now(timezone.utc)
     if ref_date.tzinfo is None:
@@ -376,7 +396,17 @@ async def _check_domain_age_anomaly(
         reg_date = reg_date.replace(tzinfo=timezone.utc)
 
     age_days = (ref_date - reg_date).days
-    return 0 <= age_days < threshold_days
+    fired = 0 <= age_days < threshold_days
+    if fired:
+        evidence = {
+            "domain": domain,
+            "registration_date": reg_date.strftime("%Y-%m-%d"),
+            "age_days": age_days,
+            "threshold_days": threshold_days,
+        }
+    else:
+        evidence = None
+    return fired, evidence
 
 
 # ── Signal 3: display_name_mismatch ──────────────────────────────────────────
@@ -636,6 +666,7 @@ async def compute_behavioral_signals(
 
     # ── Signal 1: first_time_sender ───────────────────────────────────────
     sig_first_time: bool | None = False
+    _first_time_evidence: dict | None = None
     try:
         sig_first_time = await _check_first_time_sender(session, recipient_norm, sender)
         if sig_first_time:
@@ -643,14 +674,19 @@ async def compute_behavioral_signals(
             behavioral_reasons.append(
                 f"First-time sender: '{sender}' has never contacted '{recipient_norm}' before"
             )
+            _first_time_evidence = {"sender": sender, "recipient": recipient_norm,
+                                     "prior_message_count": 0}
     except Exception as exc:
         logger.warning("behavioral: first_time_sender check failed: %s", type(exc).__name__)
         sig_first_time = None
 
     # ── Signal 2: domain_age_anomaly ─────────────────────────────────────
     sig_domain_age: bool | None = None
+    _domain_age_evidence: dict | None = None
     try:
-        sig_domain_age = await _check_domain_age_anomaly(from_domain, email_date)
+        sig_domain_age, _domain_age_evidence = await _check_domain_age_anomaly(
+            from_domain, email_date
+        )
         if sig_domain_age is True:
             behavioral_score += pts_domain_age
             behavioral_reasons.append(
@@ -665,6 +701,7 @@ async def compute_behavioral_signals(
 
     # ── Signal 3: display_name_mismatch ──────────────────────────────────
     sig_display_name: bool | None = False
+    _display_name_evidence: dict | None = None
     try:
         sig_display_name = _check_display_name_mismatch(
             from_addr, from_domain, brand_domains, lookalike_threshold
@@ -675,6 +712,10 @@ async def compute_behavioral_signals(
                 f"Display name mismatch: From display implies a trusted brand "
                 f"but sender domain '{from_domain}' is not a legitimate domain for it"
             )
+            _display_name_evidence = {
+                "display_name": (from_addr or "")[:300],
+                "sending_domain": from_domain or "",
+            }
     except Exception as exc:
         logger.warning(
             "behavioral: display_name_mismatch check failed: %s", type(exc).__name__
@@ -683,6 +724,7 @@ async def compute_behavioral_signals(
 
     # ── Signal 4: reply_chain_break ───────────────────────────────────────
     sig_reply_break: bool | None = False
+    _reply_break_evidence: dict | None = None
     try:
         sig_reply_break = await _check_reply_chain_break(
             session, recipient_norm, sender, subject, message_id, in_reply_to
@@ -695,12 +737,14 @@ async def compute_behavioral_signals(
                 f"but sender '{sender}' is not in the known thread history "
                 f"for topic '{thread_key}'"
             )
+            _reply_break_evidence = {"thread_key": thread_key, "sender": sender}
     except Exception as exc:
         logger.warning("behavioral: reply_chain_break check failed: %s", type(exc).__name__)
         sig_reply_break = None
 
     # ── Signal 5: send_time_anomaly ───────────────────────────────────────
     sig_send_time: bool | None = False
+    _send_time_evidence: dict | None = None
     try:
         historical_hours = await _get_send_hour_history(session, recipient_norm, sender)
         send_hour = email_date.hour if email_date else None
@@ -712,6 +756,10 @@ async def compute_behavioral_signals(
                 f"'{sender}' historical send-time window "
                 f"(based on {len(historical_hours)} prior observations)"
             )
+            _send_time_evidence = {
+                "send_hour": send_hour,
+                "usual_hours": sorted(set(historical_hours))[:24],
+            }
     except Exception as exc:
         logger.warning("behavioral: send_time_anomaly check failed: %s", type(exc).__name__)
         sig_send_time = None
@@ -724,6 +772,11 @@ async def compute_behavioral_signals(
         sig_display_name_mismatch=sig_display_name,
         sig_reply_chain_break=sig_reply_break,
         sig_send_time_anomaly=sig_send_time,
+        domain_age_evidence=_domain_age_evidence,
+        first_time_sender_evidence=_first_time_evidence,
+        reply_chain_break_evidence=_reply_break_evidence,
+        send_time_anomaly_evidence=_send_time_evidence,
+        display_name_mismatch_evidence=_display_name_evidence,
     )
 
 

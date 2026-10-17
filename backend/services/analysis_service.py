@@ -132,6 +132,10 @@ _SAFE_FILENAME_RE = re.compile(r"[^\w\-. ]")  # strip everything except word cha
 # by queuing hundreds of 25 MB buffers before they start processing.
 _MAX_PENDING_ANALYSES = 10  # reject uploads when this many tasks are already queued/running
 
+# Phase C: evidence caps — keeps the JSON column small and avoids body text leakage.
+_EVIDENCE_MAX_ITEMS = 30       # maximum items in reason_evidence list
+_EVIDENCE_VAL_MAX  = 300       # maximum chars for any single string value in evidence dicts
+
 
 def _safe_error(msg: str | None, max_len: int = 200) -> str | None:
     """Return a sanitized, length-capped error string safe for DB storage and API responses.
@@ -155,6 +159,184 @@ def _safe_error(msg: str | None, max_len: int = 200) -> str | None:
     if len(cleaned) > max_len:
         cleaned = cleaned[:max_len] + " [truncated]"
     return cleaned
+
+
+def _cap_str(v: object, max_len: int = _EVIDENCE_VAL_MAX) -> object:
+    """Cap a string value to max_len chars.  Non-strings pass through."""
+    if isinstance(v, str) and len(v) > max_len:
+        return v[:max_len] + "…"
+    return v
+
+
+def _cap_evidence(ev: dict) -> dict:
+    """Return a shallow copy of ev with all string values capped to _EVIDENCE_VAL_MAX."""
+    return {k: _cap_str(v) for k, v in ev.items()}
+
+
+def _build_reason_evidence(
+    *,
+    # Header / static signals
+    auth: dict,
+    header_flags: dict,
+    from_addr: str | None,
+    from_domain: str | None,
+    # URL rows (post-scoring, so flag fields are already populated)
+    url_rows: list[dict],
+    # Score reasons list (used to match reason strings to URL evidence)
+    reasons: list[str],
+    # Behavioral result
+    behavioral_result: object | None,
+    # BEC result
+    bec_result: object | None,
+) -> list[dict]:
+    """Build the reason_evidence list from signal data already computed by the pipeline.
+
+    Each item:  {"reason": str, "category": str, "signal": str, "evidence": dict}
+
+    Rules:
+    - No network calls, no body text beyond matched phrases.
+    - max _EVIDENCE_MAX_ITEMS items total.
+    - All string values in evidence dicts capped at _EVIDENCE_VAL_MAX chars.
+    - URL evidence limited to 5 triggering URLs per signal type.
+    """
+    items: list[dict] = []
+
+    def _add(reason: str, category: str, signal: str, evidence: dict) -> None:
+        if len(items) >= _EVIDENCE_MAX_ITEMS:
+            return
+        items.append({
+            "reason": _cap_str(reason),
+            "category": category,
+            "signal": signal,
+            "evidence": _cap_evidence(evidence),
+        })
+
+    # ── Static: SPF / DKIM / DMARC ────────────────────────────────────────
+    spf  = auth.get("spf",  "unknown")
+    dkim = auth.get("dkim", "unknown")
+    dmarc = auth.get("dmarc", "unknown")
+    if spf not in ("pass", "unknown", None):
+        _add(
+            reason=f"SPF {spf}",
+            category="static",
+            signal="spf_fail",
+            evidence={"spf_result": spf, "from_domain": from_domain or ""},
+        )
+    if dkim not in ("pass", "unknown", None):
+        _add(
+            reason=f"DKIM {dkim}",
+            category="static",
+            signal="dkim_fail",
+            evidence={"dkim_result": dkim, "from_addr": (from_addr or "")[:300]},
+        )
+    if dmarc not in ("pass", "unknown", None):
+        _add(
+            reason=f"DMARC {dmarc}",
+            category="static",
+            signal="dmarc_fail",
+            evidence={"dmarc_result": dmarc, "from_domain": from_domain or ""},
+        )
+
+    # ── Static: lookalike / typosquatted domain ───────────────────────────
+    if header_flags.get("is_lookalike_domain"):
+        lookalike_of = header_flags.get("lookalike_of") or ""
+        _add(
+            reason=f"Sender domain resembles '{lookalike_of}'",
+            category="static",
+            signal="lookalike_domain",
+            evidence={"sending_domain": from_domain or "",
+                      "resembles": lookalike_of},
+        )
+
+    # ── Static: URL indicators (up to 5 triggering URLs per signal type) ──
+    _url_evidence_signals = [
+        ("is_ip_host",            "url_ip_host",            "URL uses raw IP address as host"),
+        ("is_shortener",          "url_shortener",          "URL uses a link-shortening service"),
+        ("is_suspicious_keyword", "url_suspicious_keyword", "URL contains suspicious keyword"),
+        ("is_redirect_suspicious","url_redirect_suspicious","Suspicious redirect chain detected"),
+        ("is_suspicious_tld",     "url_suspicious_tld",     "URL uses a commonly abused TLD"),
+    ]
+    for flag_key, signal_id, reason_prefix in _url_evidence_signals:
+        triggered = [u for u in url_rows if u.get(flag_key)][:5]
+        if triggered:
+            _add(
+                reason=f"{reason_prefix}: {triggered[0]['url']}",
+                category="static",
+                signal=signal_id,
+                evidence={"urls": [u["url"] for u in triggered]},
+            )
+
+    # ── Dynamic: VT malicious URLs ────────────────────────────────────────
+    vt_hits = [
+        u for u in url_rows
+        if (u.get("vt_malicious") or 0) > 0
+    ][:5]
+    if vt_hits:
+        _add(
+            reason=f"VirusTotal: URL {vt_hits[0]['url']} flagged malicious "
+                   f"by {vt_hits[0]['vt_malicious']} engines",
+            category="dynamic",
+            signal="vt_malicious_url",
+            evidence={
+                "urls": [
+                    {"url": u["url"], "engines": u.get("vt_malicious", 0)}
+                    for u in vt_hits
+                ]
+            },
+        )
+
+    # ── Behavioral signals ────────────────────────────────────────────────
+    if behavioral_result is not None:
+        b = behavioral_result
+        _behavioral_pairs = [
+            ("sig_first_time_sender",    "first_time_sender",    "first_time_sender_evidence"),
+            ("sig_domain_age_anomaly",   "domain_age_anomaly",   "domain_age_evidence"),
+            ("sig_display_name_mismatch","display_name_mismatch","display_name_mismatch_evidence"),
+            ("sig_reply_chain_break",    "reply_chain_break",    "reply_chain_break_evidence"),
+            ("sig_send_time_anomaly",    "send_time_anomaly",    "send_time_anomaly_evidence"),
+        ]
+        reason_list = getattr(b, "behavioral_reasons", []) or []
+        reason_idx = 0
+        for flag_attr, signal_id, ev_attr in _behavioral_pairs:
+            if getattr(b, flag_attr, None) is True:
+                ev = getattr(b, ev_attr, None) or {}
+                reason_str = reason_list[reason_idx] if reason_idx < len(reason_list) else signal_id
+                _add(
+                    reason=reason_str,
+                    category="behavioral",
+                    signal=signal_id,
+                    evidence=ev,
+                )
+                reason_idx += 1
+
+    # ── BEC signals ───────────────────────────────────────────────────────
+    if bec_result is not None:
+        b = bec_result
+        if getattr(b, "sig_vip_impersonation", None) is True:
+            ev = getattr(b, "vip_evidence", None) or {}
+            reason_list = getattr(b, "bec_reasons", []) or []
+            _add(
+                reason=reason_list[0] if reason_list else "VIP impersonation",
+                category="bec",
+                signal="vip_impersonation",
+                evidence=ev,
+            )
+        if getattr(b, "sig_financial_request", None) is True:
+            ev = getattr(b, "financial_evidence", None) or {}
+            reason_list = getattr(b, "bec_reasons", []) or []
+            # find the first financial reason string
+            fin_reason = next(
+                (r for r in reason_list if "financial pattern" in r.lower()),
+                "BEC financial language",
+            )
+            _add(
+                reason=fin_reason,
+                category="bec",
+                signal="financial_request_language",
+                evidence=ev,
+            )
+
+    return items
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -1242,6 +1424,19 @@ class AnalysisService:
                 analysis.is_punycode_domain = header_flags["is_punycode_domain"]
                 analysis.is_suspicious_sender_tld = header_flags["is_suspicious_sender_tld"]
                 analysis.urgency_keywords_found = score_info["urgency_keywords_found"]
+
+                # Phase C: build and persist per-signal evidence data.
+                # Called after header_flags and url_rows are fully populated.
+                analysis.reason_evidence = _build_reason_evidence(
+                    auth=header_info["auth"],
+                    header_flags=header_flags,
+                    from_addr=header_info["from_addr"],
+                    from_domain=header_info["from_domain"],
+                    url_rows=url_rows,
+                    reasons=score_info.get("reasons") or [],
+                    behavioral_result=behavioral_result_obj,
+                    bec_result=bec_result_obj,
+                )
 
                 analysis.urls = [UrlIndicator(**row) for row in url_rows]
                 analysis.attachments = [

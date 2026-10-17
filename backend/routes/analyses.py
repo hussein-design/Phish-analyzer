@@ -180,6 +180,10 @@ def _to_detail(a: EmailAnalysis) -> EmailDetail:
         # getattr with None default ensures old analyses (no column yet) return
         # None, which the frontend renders as "no stage data" — not "pending".
         pipeline_stages=getattr(a, "pipeline_stages", None),
+        # Phase C: per-signal evidence data.
+        # NULL for pre-Phase-C rows — the frontend must not render NULL as
+        # "no signals fired".
+        reason_evidence=getattr(a, "reason_evidence", None),
     )
 
 

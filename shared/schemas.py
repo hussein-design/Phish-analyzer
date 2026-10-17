@@ -196,6 +196,10 @@ class EmailDetail(EmailSummary):
     # Stage keys: "static", "enrichment", "urlscan", "sandbox", "behavioral"
     # Status values: "pending" | "running" | "done" | "failed" | "timeout" | "skipped"
     pipeline_stages: dict | None = None
+    # Phase C: per-signal evidence data.
+    # NULL = analysis predates Phase C.  Non-NULL = list of evidence dicts:
+    #   [{"reason": str, "category": str, "signal": str, "evidence": dict}, ...]
+    reason_evidence: list | None = None
 
 
 class UploadAccepted(BaseModel):

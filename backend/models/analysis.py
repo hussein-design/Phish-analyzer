@@ -117,6 +117,12 @@ class EmailAnalysis(Base):
     # Status values: "pending" | "running" | "done" | "failed" | "timeout" | "skipped"
     pipeline_stages: Mapped[dict | None] = mapped_column(JSON, default=None)
 
+    # Phase C: per-signal evidence data.
+    # NULL = analysis predates Phase C.  Non-NULL = list of evidence dicts:
+    #   [{"reason": str, "category": str, "signal": str, "evidence": dict}, ...]
+    # Capped at 30 items; individual evidence values capped at 300 chars.
+    reason_evidence: Mapped[list | None] = mapped_column(JSON, default=None)
+
     # Phase 3 BEC detection: independent bec_score and signal flags.
     bec_score: Mapped[int | None] = mapped_column(Integer, default=None)
     bec_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
