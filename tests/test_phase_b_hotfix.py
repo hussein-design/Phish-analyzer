@@ -48,10 +48,9 @@ from __future__ import annotations
 
 import sys
 import logging
-import traceback
 from pathlib import Path
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -503,23 +502,29 @@ class TestElapsedTime:
         ctrl.report_page.update_elapsed_time.assert_called()
 
     def test_elapsed_start_time_set_on_start_polling(self):
-        """_start_polling must record the start time."""
+        """_start_polling must record the start time.
+
+        In the single-reusable-QTimer design the timer already exists on the
+        controller (created in __init__); _start_polling only calls stop()/start()
+        on it.  We give the manually-constructed controller a real QTimer so
+        _start_polling can call .stop() without crashing.
+        """
+        from PySide6.QtCore import QTimer
         from frontend.controllers.report_controller import ReportController
 
         ctrl = ReportController.__new__(ReportController)
         ctrl.api_client = MagicMock()
         ctrl.notification_center = MagicMock()
         ctrl.report_page = MagicMock()
-        ctrl._poll_timer = None
+        # Real QTimer — mirrors what __init__ creates
+        ctrl._poll_timer = QTimer()
+        ctrl._poll_timer.timeout.connect(lambda: None)
         ctrl._poll_analysis_id = None
         ctrl._poll_attempts = 0
         ctrl._poll_fail_count = 0
         ctrl._poll_start_time = None
 
-        with patch("frontend.controllers.report_controller.QTimer") as mock_timer_cls:
-            mock_timer = MagicMock()
-            mock_timer_cls.return_value = mock_timer
-            ctrl._start_polling(42)
+        ctrl._start_polling(42)
 
         assert ctrl._poll_start_time is not None
 

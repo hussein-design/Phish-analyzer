@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QHBoxLayout
 
-from frontend.widgets.report_widgets import Chip, auth_chip, body_label
+from frontend.widgets.report_widgets import Chip, auth_chip
 from shared.schemas import EmailDetail
 
 
@@ -405,8 +405,11 @@ def _populate_intel(page, detail: EmailDetail) -> None:
                 f"   Malicious: {u.vt_malicious}  |  Suspicious: {u.vt_suspicious}  |  Harmless: {u.vt_harmless}"
             )
         vt_text = "\n\n".join(lines)
+        if detail.vt_enrichment_error:
+            vt_text = f"({detail.vt_enrichment_error})\n\n" + vt_text
     elif detail.urls and vt_status == "ok":
-        vt_text = f"✓  All {len(detail.urls)} URL(s) checked — no malicious detections."
+        count_note = detail.vt_enrichment_error or f"{len(detail.urls)} URLs checked"
+        vt_text = f"✓  {count_note} — no malicious detections."
     elif not detail.urls:
         vt_text = "ℹ  No URLs found in this email."
     else:

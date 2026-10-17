@@ -408,6 +408,61 @@ class TestUploadControllerFinally:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Fix 4 — eml_parser_service: datetime import at module level (BUG: pyflakes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEmlParserDatetimeImport:
+    """get_email_date() uses datetime in its return annotation and body.
+    The annotation was quoted ('datetime | None') so Python never evaluated
+    it at runtime, meaning the NameError was silently masked by
+    'from __future__ import annotations'.  The fix adds datetime to the
+    module-level imports so pyflakes is satisfied and the name is available
+    if the annotation is ever evaluated (e.g. via typing.get_type_hints).
+
+    These tests reach line 543 (the function definition) and exercise the
+    function body to confirm the import is correct.
+    """
+
+    def test_get_email_date_importable_no_name_error(self):
+        """Importing the function must not raise NameError."""
+        from backend.services.eml_parser_service import get_email_date
+        assert callable(get_email_date)
+
+    def test_get_email_date_returns_none_on_empty_headers(self):
+        """Empty header dict → None (no crash, no NameError inside body)."""
+        from backend.services.eml_parser_service import get_email_date
+        result = get_email_date({}, {})
+        assert result is None
+
+    def test_get_email_date_parses_iso_string(self):
+        """A valid ISO date string in the outer header dict is returned as
+        a timezone-aware datetime — exercises the fromisoformat branch."""
+        from backend.services.eml_parser_service import get_email_date
+        from datetime import timezone as tz
+        result = get_email_date({}, {"date": "2026-10-17T03:00:00+00:00"})
+        assert result is not None
+        assert result.tzinfo is not None
+        assert result.tzinfo == tz.utc or result.utcoffset().total_seconds() == 0
+
+    def test_get_email_date_passes_through_datetime_object(self):
+        """A datetime object in the outer header dict is returned directly."""
+        from backend.services.eml_parser_service import get_email_date
+        from datetime import datetime, timezone as tz
+        dt_in = datetime(2026, 10, 17, 3, 0, 0, tzinfo=tz.utc)
+        result = get_email_date({}, {"date": dt_in})
+        assert result == dt_in
+
+    def test_datetime_in_module_top_level_imports(self):
+        """datetime must be importable from the module's top-level namespace,
+        not only from inside a function body."""
+        import importlib
+        mod = importlib.import_module("backend.services.eml_parser_service")
+        assert hasattr(mod, "datetime"), (
+            "'datetime' must be imported at the module level in eml_parser_service.py"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Fix 3 — httpx / httpcore log suppression (source-level check)
 # ─────────────────────────────────────────────────────────────────────────────
 

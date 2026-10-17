@@ -365,7 +365,20 @@ class AnalysisService:
     # set to FAILED with a clear reason.  The concurrency slot is always
     # released in a finally block so a stuck pipeline never permanently holds
     # a semaphore slot.
+    #
+    # Implementation note — why not asyncio.wait_for?
+    # wait_for cancels the wrapped coroutine and then awaits it.  If the
+    # pipeline body is blocked deep inside a VT scan_url_async call (up to
+    # 120 s) or a hung HTTP connection, wait_for blocks for that entire
+    # duration before returning — making the watchdog useless.  Instead we:
+    #   1. wrap _pipeline_body in a Task so we can cancel it independently,
+    #   2. use asyncio.wait(timeout=_PIPELINE_DEADLINE) to detect expiry,
+    #   3. cancel the task, then asyncio.wait(timeout=3) for a short grace,
+    #   4. attach a done-callback to swallow any late exception from a
+    #      task that outlives the grace period.
+    # Total worst-case watchdog latency: _PIPELINE_DEADLINE + 3 s.
     _PIPELINE_DEADLINE = 600  # 10 minutes
+    _WATCHDOG_GRACE    = 3    # seconds to wait for the task to acknowledge cancel
 
     async def _run_pipeline(self, analysis_id: int, raw_bytes: bytes) -> None:
         await _ANALYSIS_CONCURRENCY.acquire()
@@ -374,16 +387,38 @@ class AnalysisService:
             stages = _PipelineStages(analysis_id, self.session_factory)
             await stages.init()
 
-            try:
-                await asyncio.wait_for(
-                    self._pipeline_body(analysis_id, raw_bytes, stages),
-                    timeout=self._PIPELINE_DEADLINE,
-                )
-            except asyncio.TimeoutError:
+            _body_task = asyncio.create_task(
+                self._pipeline_body(analysis_id, raw_bytes, stages)
+            )
+            _done_set, _pending_set = await asyncio.wait(
+                {_body_task}, timeout=self._PIPELINE_DEADLINE
+            )
+
+            if _pending_set:
+                # Watchdog fired — the pipeline body is still running.
                 logger.error(
                     "Analysis pipeline watchdog fired for id=%d — exceeded %ds deadline",
                     analysis_id, self._PIPELINE_DEADLINE,
                 )
+                _body_task.cancel()
+
+                # 3 s grace: give the task a chance to finish its current await
+                # before we move on.  If it still hasn't stopped, attach a
+                # done-callback to swallow the eventual result/exception.
+                _grace_done, _grace_pending = await asyncio.wait(
+                    {_body_task}, timeout=self._WATCHDOG_GRACE
+                )
+                if _grace_pending:
+                    logger.warning(
+                        "Analysis %d: pipeline task did not cancel within %ds "
+                        "grace period — abandoning it.",
+                        analysis_id, self._WATCHDOG_GRACE,
+                    )
+                    _body_task.add_done_callback(
+                        lambda fut: fut.exception()
+                        if not fut.cancelled() else None
+                    )
+
                 try:
                     _timeout_updates = {
                         k: STATUS_TIMEOUT
@@ -401,6 +436,13 @@ class AnalysisService:
                         f"{self._PIPELINE_DEADLINE // 60}-minute deadline and was cancelled."
                     ),
                 )
+            else:
+                # Task finished within the deadline — propagate any exception.
+                # (Successful pipelines write DONE themselves; exceptions are
+                # handled inside _pipeline_body's own except block.)
+                exc = _body_task.exception()
+                if exc is not None:
+                    raise exc
         finally:
             _ANALYSIS_CONCURRENCY.release()
 
@@ -583,7 +625,12 @@ class AnalysisService:
             # than a stuck "Analyzing…" row.
             _ENRICHMENT_DEADLINE = 300  # seconds
 
-            _vt_task   = asyncio.ensure_future(virustotal_provider.enrich_urls(urls, vt_key))
+            _vt_task   = asyncio.ensure_future(virustotal_provider.enrich_urls(
+                urls, vt_key,
+                anchor_mismatches=anchor_mismatches,
+                url_shorteners=url_shorteners,
+                suspicious_keywords=suspicious_keywords,
+            ))
             _ab_task   = asyncio.ensure_future(abuseipdb_provider.enrich_ip(header_info["sender_ip"], abuse_key))
             _sh_task   = asyncio.ensure_future(shodan_provider.enrich_ip(header_info["sender_ip"], shodan_key))
             _ui_task   = asyncio.ensure_future(url_intel.expand_urls(urls))
@@ -603,8 +650,28 @@ class AnalysisService:
                 )
                 for _t in _pending:
                     _t.cancel()
-                # Await cancellation to suppress CancelledError
-                await asyncio.gather(*_pending, return_exceptions=True)
+
+                # Give cancelled tasks at most 3 s to honour the cancellation.
+                # Using asyncio.wait() (not gather) means we proceed after the
+                # grace period even if a task refuses to stop — we never block
+                # for the full 120 s VT scan timeout just to clean up.
+                # Any task that outlives the grace period gets a done-callback
+                # that swallows its eventual exception/result so it never
+                # surfaces as an unhandled exception later.
+                _grace_done, _grace_still_pending = await asyncio.wait(
+                    _pending, timeout=3
+                )
+                if _grace_still_pending:
+                    logger.warning(
+                        "Analysis %d: %d enrichment task(s) did not cancel within "
+                        "3 s grace period — abandoning them.",
+                        analysis_id, len(_grace_still_pending),
+                    )
+                    for _t in _grace_still_pending:
+                        _t.add_done_callback(
+                            lambda fut: fut.exception()
+                            if not fut.cancelled() else None
+                        )
 
             def _task_result(task, fallback):
                 """Return the task result if done without error, else fallback."""
@@ -662,6 +729,8 @@ class AnalysisService:
             vt_status  = vt_enrichment["status"]
             vt_error   = vt_enrichment.get("error")
             vt_results = vt_enrichment.get("results", {})
+            vt_urls_checked = vt_enrichment.get("urls_checked", 0)
+            vt_urls_total   = vt_enrichment.get("urls_total", len(urls))
 
             if vt_status == "no_key":
                 logger.info("VirusTotal: skipped — no API key configured")
@@ -670,7 +739,16 @@ class AnalysisService:
             elif vt_status == "error":
                 logger.error("VirusTotal: enrichment error: %s", vt_error)
             else:
-                logger.info("VirusTotal: status=%s, urls_enriched=%d", vt_status, len(vt_results))
+                logger.info(
+                    "VirusTotal: status=%s, urls_checked=%d/%d, results=%d",
+                    vt_status, vt_urls_checked, vt_urls_total, len(vt_results),
+                )
+                # Encode the checked/total counts as a note in vt_error so
+                # the Intel tab can display "15 of 85 URLs checked" without
+                # requiring a new DB column.  Only set when there is no real
+                # error — a real error message takes precedence.
+                if vt_error is None and vt_urls_total > 0:
+                    vt_error = f"{vt_urls_checked} of {vt_urls_total} URLs checked"
 
             abuse_status = abuse_enrichment["status"]
             abuse_error  = abuse_enrichment.get("error")
@@ -853,37 +931,48 @@ class AnalysisService:
                             sandbox_result["status"] = "error"
                             sandbox_result["error"] = f"Submission error: {type(exc).__name__}"
                 elif urls:
-                    # Fall back to detonating the first suspicious URL
-                    # MED-07: validate URL scheme before submission
-                    suspicious_url = next(
-                        (r["url"] for r in url_rows if r.get("is_redirect_suspicious")
-                         or r.get("vt_malicious", 0) > 0),
-                        urls[0] if urls else None,
-                    )
-                    # SSRF guard: verify the URL resolves to a public address
-                    # before submitting to the sandbox. An attacker-controlled
-                    # email body could contain http://10.0.0.1/admin and cause
-                    # an on-premises sandbox agent to actually connect to it.
-                    if (suspicious_url
-                            and suspicious_url.startswith(("http://", "https://"))
-                            and _is_safe_for_external_submission(suspicious_url)):
-                        try:
-                            sandbox_result = await sandbox_prov.submit_for_sandbox(
-                                provider=_sandbox_provider,
-                                api_key=_sandbox_key,
-                                url=suspicious_url,
-                            )
-                            logger.info(
-                                "Sandbox URL (%s): status=%s verdict=%s",
-                                _sandbox_provider,
-                                sandbox_result.get("status"),
-                                sandbox_result.get("verdict"),
-                            )
-                        except Exception as exc:
-                            # HIGH-03: log type only — str(exc) may include API key fragments
-                            logger.warning("Sandbox URL submission failed: %s", type(exc).__name__)
-                            sandbox_result["status"] = "error"
-                            sandbox_result["error"] = f"Submission error: {type(exc).__name__}"
+                    # Fall back to detonating the first suspicious URL.
+                    # Exception: Hybrid Analysis only supports file detonation —
+                    # URL submission always returns "file payload required".
+                    # Skip the call entirely and mark the stage skipped.
+                    if _sandbox_provider == "hybrid_analysis":
+                        logger.info(
+                            "Sandbox (hybrid_analysis): no qualifying file attachment — "
+                            "skipping URL fallback (URL submission not supported)"
+                        )
+                        sandbox_result["status"] = "no_key"  # treated as skipped below
+                    else:
+                        # Fall back to detonating the first suspicious URL
+                        # MED-07: validate URL scheme before submission
+                        suspicious_url = next(
+                            (r["url"] for r in url_rows if r.get("is_redirect_suspicious")
+                             or r.get("vt_malicious", 0) > 0),
+                            urls[0] if urls else None,
+                        )
+                        # SSRF guard: verify the URL resolves to a public address
+                        # before submitting to the sandbox. An attacker-controlled
+                        # email body could contain http://10.0.0.1/admin and cause
+                        # an on-premises sandbox agent to actually connect to it.
+                        if (suspicious_url
+                                and suspicious_url.startswith(("http://", "https://"))
+                                and _is_safe_for_external_submission(suspicious_url)):
+                            try:
+                                sandbox_result = await sandbox_prov.submit_for_sandbox(
+                                    provider=_sandbox_provider,
+                                    api_key=_sandbox_key,
+                                    url=suspicious_url,
+                                )
+                                logger.info(
+                                    "Sandbox URL (%s): status=%s verdict=%s",
+                                    _sandbox_provider,
+                                    sandbox_result.get("status"),
+                                    sandbox_result.get("verdict"),
+                                )
+                            except Exception as exc:
+                                # HIGH-03: log type only — str(exc) may include API key fragments
+                                logger.warning("Sandbox URL submission failed: %s", type(exc).__name__)
+                                sandbox_result["status"] = "error"
+                                sandbox_result["error"] = f"Submission error: {type(exc).__name__}"
 
             # Phase B: sandbox stage complete — map result status to stage status.
             # Sandbox was already marked running/skipped before the gather;

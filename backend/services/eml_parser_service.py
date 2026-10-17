@@ -9,6 +9,7 @@ import email
 import email.policy
 import hashlib
 import re
+from datetime import datetime, timezone
 from email.utils import parseaddr
 
 import eml_parser
@@ -548,8 +549,6 @@ def get_email_date(parsed: dict, headers: dict) -> "datetime | None":
     2. Inner raw header dict 'date' key, parsed via email.utils.
     3. Python email.Message.get('Date') + email.utils.parsedate_to_datetime.
     """
-    from datetime import datetime, timezone
-
     outer_headers = headers  # parsed['header']
 
     # eml_parser outer dict may carry 'date' as an already-decoded datetime
