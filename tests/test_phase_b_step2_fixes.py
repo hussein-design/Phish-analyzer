@@ -58,14 +58,24 @@ def _make_detail_dict(**kw) -> dict:
 
 
 def _make_ctrl():
-    """ReportController with all Qt deps mocked; no Qt event loop needed."""
+    """ReportController with all Qt deps mocked; no Qt event loop needed.
+
+    _poll_timer is NOT mocked — it is the real QTimer created by __init__,
+    which is what we want to exercise.  Tests that previously checked
+    ``ctrl._poll_timer.stop.assert_called()`` have been updated to check
+    ``ctrl._poll_analysis_id`` instead, which is the canonical "poll active"
+    marker.
+    """
+    from PySide6.QtCore import QTimer
     from frontend.controllers.report_controller import ReportController
     ctrl = ReportController.__new__(ReportController)
     ctrl.api_client = MagicMock()
     ctrl.notification_center = MagicMock()
     ctrl.report_page = MagicMock()
     ctrl.report_page._current_status = None
-    ctrl._poll_timer = MagicMock()
+    # Real QTimer — never mocked, never deleted, reused for every poll session
+    ctrl._poll_timer = QTimer()
+    ctrl._poll_timer.timeout.connect(lambda: None)  # dummy slot so connect() works
     ctrl._poll_analysis_id = 42
     ctrl._poll_attempts = 0
     ctrl._poll_fail_count = 0
@@ -186,6 +196,87 @@ class TestPollCapFinalFetch:
         ctrl._on_loaded(data)
 
         assert start_calls == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix 1b — Real QTimer: no crash after repeated start/stop/show cycles
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRealQTimerNoCrash:
+    """Builds a ReportController with a real QTimer and exercises the full
+    _start_polling / _stop_polling / show_analysis cycle ten times without
+    raising RuntimeError or any other exception.
+
+    This is the regression guard for:
+        "RuntimeError: Internal C++ object (QTimer) already deleted"
+    which occurred when _stop_polling called deleteLater() and the next
+    _start_polling tried to re-use the dangling pointer.
+    """
+
+    def _make_real_ctrl(self):
+        """ReportController with a real QTimer but mocked everything else."""
+        from PySide6.QtCore import QTimer
+        from frontend.controllers.report_controller import ReportController
+
+        ctrl = ReportController.__new__(ReportController)
+        ctrl.api_client = MagicMock()
+        ctrl.notification_center = MagicMock()
+        ctrl.report_page = MagicMock()
+        ctrl.report_page._current_status = None
+        # Real QTimer — same as what __init__ creates
+        ctrl._poll_timer = QTimer()
+        ctrl._poll_timer.timeout.connect(lambda: None)
+        ctrl._poll_analysis_id = None
+        ctrl._poll_attempts = 0
+        ctrl._poll_fail_count = 0
+        ctrl._poll_start_time = None
+        return ctrl
+
+    def test_start_stop_ten_times_no_exception(self):
+        """_start_polling then _stop_polling ten times must never raise."""
+        ctrl = self._make_real_ctrl()
+        for i in range(10):
+            ctrl._start_polling(i + 1)
+            ctrl._stop_polling()
+        # If we get here, no RuntimeError was raised.
+        assert ctrl._poll_analysis_id is None
+        assert not ctrl._poll_timer.isActive()
+
+    def test_show_analysis_then_stop_ten_times_no_exception(self):
+        """show_analysis (which calls _stop_polling then run_async) and
+        _stop_polling ten times must never raise.
+
+        run_async is intercepted so no real HTTP call is made.
+        """
+        ctrl = self._make_real_ctrl()
+
+        def fake_run_async(fn, *args, on_success=None, on_error=None, on_finished=None, **kw):
+            # Simulate an immediate DONE response so show_analysis resolves cleanly.
+            if on_success is not None:
+                on_success(_make_detail_dict(status="PENDING"))
+
+        ctrl.run_async = fake_run_async
+
+        for i in range(10):
+            ctrl.show_analysis(i + 1)
+            ctrl._stop_polling()
+
+        assert ctrl._poll_analysis_id is None
+
+    def test_show_detail_pending_then_show_detail_done_no_exception(self):
+        """show_detail with PENDING (starts poll) followed immediately by
+        show_detail with DONE (stops poll) ten times — no exception."""
+        ctrl = self._make_real_ctrl()
+
+        pending_detail = _make_detail(status="PENDING")
+        done_detail = _make_detail(status="DONE")
+
+        for _ in range(10):
+            ctrl.show_detail(pending_detail)  # starts poll
+            ctrl.show_detail(done_detail)      # stops poll
+
+        assert ctrl._poll_analysis_id is None
+        assert not ctrl._poll_timer.isActive()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

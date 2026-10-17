@@ -2,15 +2,23 @@
 manages polling while PENDING/RUNNING, handles download/delete/re-enrich,
 and keeps the left-pane email queue in sync.
 
-Phase B hotfix
-──────────────
+Phase B hotfix — QTimer lifecycle
+──────────────────────────────────
 Root cause: ``self.parent()`` inside ``_on_poll_result`` is a Qt C++ call that
 requires the QObject ``__init__`` chain to have run.  When the call raised
 ``RuntimeError`` (e.g. during tests or if the controller was partially
 initialised), the exception propagated out of the QTimer callback, silently
 killing the timer and leaving the UI stuck on the loading view forever.
 
-Fixes applied:
+Dead timer fix (this version)
+─────────────────────────────
+A single ``QTimer`` is created once in ``__init__`` and reused for every poll
+session via ``start()`` / ``stop()``.  ``deleteLater()`` is never called on it,
+so there is no risk of the "RuntimeError: Internal C++ object (QTimer) already
+deleted" crash that occurred when the previous code called ``deleteLater()`` in
+``_stop_polling`` and then ``_start_polling`` tried to use the same pointer.
+
+Other fixes applied:
   1. Wrap the entire body of ``_on_poll_result`` in try/except so that any
      exception is logged and the timer continues — analysis completion is
      never missed.
@@ -58,7 +66,14 @@ class ReportController(BaseController):
         super().__init__(api_client, notification_center, parent)
         self.report_page = report_page
 
-        self._poll_timer: QTimer | None = None
+        # Single QTimer — created once here and reused for every poll session
+        # via start() / stop().  Never deleted or re-created; avoids the
+        # "RuntimeError: Internal C++ object (QTimer) already deleted" crash
+        # that occurred when deleteLater() was called in _stop_polling and then
+        # the next show_analysis() call tried to use the deleted object.
+        self._poll_timer: QTimer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll_tick)
+
         self._poll_analysis_id: int | None = None
         self._poll_attempts: int = 0
         self._poll_fail_count: int = 0
@@ -113,43 +128,26 @@ class ReportController(BaseController):
     # ── Polling ───────────────────────────────────────────────────────────────
 
     def _start_polling(self, analysis_id: int) -> None:
-        # Free any lingering timer from a previous poll session before starting
-        # a new one.  _stop_polling() does not free the timer to keep the
-        # reference accessible for test assertions; _start_polling() is the
-        # only place we create a new one, so it is the right place to clean up.
-        if self._poll_timer is not None:
-            self._poll_timer.stop()
-            try:
-                self._poll_timer.deleteLater()
-            except RuntimeError:
-                pass
-            self._poll_timer = None
+        # Stop any in-progress poll session, reset counters, then (re)start the
+        # single QTimer that was created in __init__.  The timer is never
+        # deleted or re-created — we just call stop()/start() on the same
+        # object so there is no risk of holding a dangling C++ pointer.
+        self._poll_timer.stop()
         self._poll_analysis_id = analysis_id
         self._poll_attempts = 0
         self._poll_fail_count = 0
         self._poll_start_time = datetime.now(tz=timezone.utc)
-        self._poll_timer = QTimer(self)
-        self._poll_timer.timeout.connect(self._poll_tick)
         self._poll_timer.start(_POLL_INTERVAL_MS)
         logger.debug("ReportController: started polling analysis_id=%d", analysis_id)
 
     def _stop_polling(self) -> None:
         """Stop the poll timer and clear poll state.
 
-        The timer object is stopped but NOT freed here — we set
-        ``_poll_analysis_id = None`` to mark the end of the active poll.
-        Callers that check ``ctrl._poll_timer.stop.assert_called()`` (tests)
-        or the timer's running state can still inspect the object.  The timer
-        will be garbage-collected normally when the controller is destroyed.
+        The single QTimer created in __init__ is stopped but never deleted —
+        it will be reused by the next _start_polling() call.  Clearing
+        _poll_analysis_id is the canonical marker that no poll is active.
         """
-        if self._poll_timer is not None:
-            self._poll_timer.stop()
-            try:
-                self._poll_timer.deleteLater()
-            except RuntimeError:
-                # deleteLater() requires Qt C++ initialization — silently
-                # skip in unit tests that use __new__ to bypass Qt init.
-                pass
+        self._poll_timer.stop()
         self._poll_analysis_id = None
         self._poll_attempts = 0
         self._poll_fail_count = 0

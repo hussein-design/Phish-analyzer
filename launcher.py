@@ -153,6 +153,19 @@ def main() -> int:
     qt_app.setApplicationName("Phish Analyzer Desktop")
     qt_app.setOrganizationName("PhishAnalyzer")
 
+    # Install a global exception hook so unhandled exceptions that escape Qt
+    # slot invocations are written to app.log with a full traceback instead of
+    # silently printing to the console (which is invisible in a frozen build).
+    def _qt_excepthook(exc_type, exc_value, exc_tb) -> None:
+        import traceback as _tb
+        logger.error(
+            "Unhandled exception:\n%s",
+            "".join(_tb.format_exception(exc_type, exc_value, exc_tb)),
+        )
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _qt_excepthook
+
     settings_store = SettingsStore()
     theme_manager = ThemeManager(qt_app)
     theme_manager.apply_theme(settings_store.get_theme(ThemeManager.detect_system_theme()))
