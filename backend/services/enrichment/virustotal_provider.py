@@ -181,42 +181,16 @@ def _is_ip_host(url: str) -> bool:
 def _unwrap_url(u: str) -> str:
     """Return the real destination URL for known redirect wrappers.
 
-    Supported wrappers (parsing only — no network requests):
+    Delegates to ``backend.services.url_unwrap.unwrap_url`` — the single
+    source of truth for all wrapper patterns (SafeLinks, IRIS, Google /url,
+    Proofpoint URLDefense).
 
-    * **Microsoft SafeLinks** — host ends with
-      ``safelinks.protection.outlook.com``; real URL is in the ``url``
-      query parameter (percent-encoded).
-
-    * **Google redirect** — host is ``www.google.com`` or ``google.com``
-      with path ``/url``; real URL is in the ``q`` query parameter.
-
-    Returns ``u`` unchanged for any other host or if the expected parameter
-    is absent / empty / malformed.
+    Returns ``u`` unchanged when the URL is not a recognised wrapper or the
+    destination parameter is absent / malformed (preserves existing call-site
+    contract: callers can compare result == u to detect no-unwrap).
     """
-    from urllib.parse import urlparse as _up, parse_qs as _pqs, unquote as _uq
-
-    try:
-        parsed = _up(u)
-        host = (parsed.hostname or "").lower()
-        qs = _pqs(parsed.query)
-
-        if host.endswith("safelinks.protection.outlook.com"):
-            vals = qs.get("url") or qs.get("URL")
-            if vals:
-                inner = _uq(vals[0])
-                if inner.startswith(("http://", "https://")):
-                    return inner
-
-        if host in ("www.google.com", "google.com") and parsed.path.rstrip("/") == "/url":
-            vals = qs.get("q") or qs.get("Q")
-            if vals:
-                inner = _uq(vals[0])
-                if inner.startswith(("http://", "https://")):
-                    return inner
-
-    except Exception:
-        pass
-    return u
+    from backend.services.url_unwrap import unwrap_url
+    return unwrap_url(u) or u
 
 
 def select_vt_urls(

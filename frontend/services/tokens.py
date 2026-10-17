@@ -219,6 +219,16 @@ class Light:
     stage_timeout_dot  = "#D97706"   # amber-600
     stage_timeout_text = "#B45309"   # amber-700
 
+    # ── Evidence panel (EvidenceReasonsWidget) ─────────────────────────────
+    # Shown under a clicked reason row; mono-font key/value pairs.
+    evidence_panel_bg      = "#F8FAFC"   # very light surface
+    evidence_panel_border  = "#E2E8F0"   # subtle separator
+    evidence_key_color     = "#475569"   # slate-600 — de-emphasised key
+    evidence_val_color     = "#0F172A"   # text — full contrast for values
+    evidence_chevron_color = "#64748B"   # muted-text for the chevron icon
+    evidence_highlight_bg  = "#FEF9C3"   # yellow-100 — phrase highlights in body
+    evidence_note_color    = "#94A3B8"   # slate-400 — "predates feature" note
+
 
 # ── Dark theme tokens ─────────────────────────────────────────────────────────
 
@@ -387,6 +397,15 @@ class Dark:
 
     stage_timeout_dot  = "#FCD34D"   # amber-300
     stage_timeout_text = "#FDE68A"   # amber-200
+
+    # ── Evidence panel (EvidenceReasonsWidget) ─────────────────────────────
+    evidence_panel_bg      = "#162032"   # dark surface-alt
+    evidence_panel_border  = "#334155"   # dark border
+    evidence_key_color     = "#64748B"   # slate-500
+    evidence_val_color     = "#F1F5F9"   # near-white for values
+    evidence_chevron_color = "#64748B"   # slate-500
+    evidence_highlight_bg  = "#713F12"   # amber-900 — readable on dark bg
+    evidence_note_color    = "#475569"   # slate-600
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

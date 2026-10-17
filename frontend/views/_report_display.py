@@ -65,12 +65,14 @@ def _populate_overview(page, detail: EmailDetail) -> None:
         page._auth_lyt.addWidget(warn)
 
     # ── Reasons ───────────────────────────────────────────────────────────
-    if detail.reasons:
-        page._lbl_reasons.setText(
-            "\n".join(f"{i+1}.  {r}" for i, r in enumerate(detail.reasons))
-        )
-    else:
-        page._lbl_reasons.setText("No specific red flags triggered by the current rules.")
+    is_dark = getattr(page, "_is_dark", False) or (
+        getattr(getattr(page, "_theme", None), "current", "light") == "dark"
+    )
+    page._lbl_reasons.set_reasons(
+        reasons=detail.reasons or [],
+        evidence_list=detail.reason_evidence,
+        is_dark=is_dark,
+    )
 
     # ── Lure categories ───────────────────────────────────────────────────
     lures = detail.lure_categories or []
@@ -474,7 +476,21 @@ def _populate_intel(page, detail: EmailDetail) -> None:
 # ── Body tab ──────────────────────────────────────────────────────────────────
 
 def _populate_body(page, detail: EmailDetail) -> None:
-    page._lbl_body.setText(detail.body_preview or "[No body content]")
+    import html as _html
+    from PySide6.QtCore import Qt
+
+    body_plain = detail.body_preview or "[No body content]"
+    # Cache plain text so _on_show_in_body can re-escape it cleanly when
+    # building highlighted HTML without relying on .text() returning plain text
+    # (which it does not once the label is set to RichText).
+    page._body_plain_cache = body_plain
+    # Escape attacker-controlled text, then re-enable RichText so that
+    # white-space:pre-wrap can be applied to preserve newlines.  The escape
+    # call guarantees no HTML tags survive from the original content.
+    escaped = _html.escape(body_plain)
+    html_body = f'<div style="white-space:pre-wrap">{escaped}</div>'
+    page._lbl_body.setTextFormat(Qt.TextFormat.RichText)
+    page._lbl_body.setText(html_body)
 
 
 # ── Behavioral Analysis tab section (Overview) ───────────────────────────────
@@ -539,7 +555,15 @@ def _populate_behavioral(page, detail: EmailDetail) -> None:
         for i, r in enumerate(reasons, 1):
             lines.append(f"  {i}.  {r}")
 
-    page._lbl_behavioral.setText("\n".join(lines))
+    page._lbl_behavioral_info.setText("\n".join(lines))
+
+    # ── Expandable reasons with evidence panels ────────────────────────────
+    is_dark = getattr(getattr(page, "_theme", None), "current", "light") == "dark"
+    page._lbl_behavioral.set_reasons(
+        reasons=detail.behavioral_reasons or [],
+        evidence_list=detail.reason_evidence,
+        is_dark=is_dark,
+    )
 
 
 # ── BEC Detection card (Overview) ─────────────────────────────────────────────
@@ -645,7 +669,15 @@ def _populate_bec(page, detail: EmailDetail) -> None:
         "   vip_impersonation or authority_pressure_combo alongside it."
     )
 
-    page._lbl_bec.setText("\n".join(lines))
+    page._lbl_bec_info.setText("\n".join(lines))
+
+    # ── Expandable reasons with evidence panels ────────────────────────────
+    is_dark = getattr(getattr(page, "_theme", None), "current", "light") == "dark"
+    page._lbl_bec.set_reasons(
+        reasons=detail.bec_reasons or [],
+        evidence_list=detail.reason_evidence,
+        is_dark=is_dark,
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

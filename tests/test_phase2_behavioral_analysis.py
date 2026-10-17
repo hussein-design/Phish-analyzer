@@ -197,7 +197,7 @@ class TestDomainAgeAnomaly:
             "backend.services.behavioral_signals_service._lookup_domain_registration_date",
             new=AsyncMock(return_value=reg_date),
         ):
-            result = await _check_domain_age_anomaly("evil.com", email_date, threshold_days=30)
+            result, _ev = await _check_domain_age_anomaly("evil.com", email_date, threshold_days=30)
 
         assert result is True
 
@@ -213,7 +213,7 @@ class TestDomainAgeAnomaly:
             "backend.services.behavioral_signals_service._lookup_domain_registration_date",
             new=AsyncMock(return_value=reg_date),
         ):
-            result = await _check_domain_age_anomaly("legit.com", email_date, threshold_days=30)
+            result, _ev = await _check_domain_age_anomaly("legit.com", email_date, threshold_days=30)
 
         assert result is False
 
@@ -226,7 +226,7 @@ class TestDomainAgeAnomaly:
             "backend.services.behavioral_signals_service._lookup_domain_registration_date",
             new=AsyncMock(return_value=None),
         ):
-            result = await _check_domain_age_anomaly("unknown.xyz", _utc(), threshold_days=30)
+            result, _ev = await _check_domain_age_anomaly("unknown.xyz", _utc(), threshold_days=30)
 
         assert result is None
 
@@ -235,7 +235,7 @@ class TestDomainAgeAnomaly:
         """No domain provided → None (cannot check age of nothing)."""
         from backend.services.behavioral_signals_service import _check_domain_age_anomaly
 
-        result = await _check_domain_age_anomaly(None, _utc(), threshold_days=30)
+        result, _ev = await _check_domain_age_anomaly(None, _utc(), threshold_days=30)
         assert result is None
 
     @pytest.mark.asyncio
@@ -250,7 +250,7 @@ class TestDomainAgeAnomaly:
             "backend.services.behavioral_signals_service._lookup_domain_registration_date",
             new=AsyncMock(return_value=reg_date),
         ):
-            result = await _check_domain_age_anomaly("borderline.com", email_date, threshold_days=30)
+            result, _ev = await _check_domain_age_anomaly("borderline.com", email_date, threshold_days=30)
 
         # age_days = 30, which is NOT < 30, so signal should not fire
         assert result is False

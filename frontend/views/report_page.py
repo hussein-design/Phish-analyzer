@@ -53,6 +53,7 @@ from frontend.services.tokens import (
 )
 from frontend.widgets.kv_table import KeyValueTable
 from frontend.widgets.pipeline_stages_widget import PipelineStagesWidget
+from frontend.widgets.evidence_reasons_widget import EvidenceReasonsWidget
 from frontend.widgets.report_widgets import (
     Card,
     Chip,
@@ -1053,7 +1054,8 @@ class ReportPage(QWidget):
         self._card_auth.add_widget(self._auth_body)
 
         self._card_reasons   = Card("Why this verdict?")
-        self._lbl_reasons    = body_label()
+        self._lbl_reasons    = EvidenceReasonsWidget(is_dark=self._theme.current == "dark")
+        self._lbl_reasons.show_in_body.connect(self._on_show_in_body)
         self._card_reasons.add_widget(self._lbl_reasons)
 
         self._card_lures     = Card("Social Engineering Signals")
@@ -1065,11 +1067,17 @@ class ReportPage(QWidget):
         self._card_urgency.add_widget(self._lbl_urgency)
 
         self._card_behavioral = Card("Behavioral Analysis")
-        self._lbl_behavioral  = body_label()
+        self._lbl_behavioral_info = body_label()
+        self._card_behavioral.add_widget(self._lbl_behavioral_info)
+        self._lbl_behavioral  = EvidenceReasonsWidget(is_dark=self._theme.current == "dark")
+        self._lbl_behavioral.show_in_body.connect(self._on_show_in_body)
         self._card_behavioral.add_widget(self._lbl_behavioral)
 
         self._card_bec = Card("BEC Detection")
-        self._lbl_bec  = body_label()
+        self._lbl_bec_info = body_label()
+        self._card_bec.add_widget(self._lbl_bec_info)
+        self._lbl_bec  = EvidenceReasonsWidget(is_dark=self._theme.current == "dark")
+        self._lbl_bec.show_in_body.connect(self._on_show_in_body)
         self._card_bec.add_widget(self._lbl_bec)
 
         # Phase B: compact pipeline card — shown only for completed analyses
@@ -1168,6 +1176,43 @@ class ReportPage(QWidget):
     def _emit_delete(self) -> None:
         if self._analysis_id is not None:
             self.deleteRequested.emit(self._analysis_id)
+
+    def _on_show_in_body(self, phrases: list) -> None:
+        """Switch to Body tab and highlight matched phrases.
+
+        Called when the user clicks "Show in body" on a BEC financial evidence
+        panel.  Navigates to the 'body' anchor section and highlights the
+        matched phrases in the body preview label (case-insensitive).
+        """
+        self._navigate_to("body")
+        if not phrases or not hasattr(self, "_lbl_body"):
+            return
+        # _lbl_body may be RichText (set by _populate_body) — getText via .text()
+        # returns the raw HTML; we need the plain underlying text.  Store the
+        # plain body text when populating so highlight can re-escape cleanly.
+        body_text = getattr(self, "_body_plain_cache", None)
+        if not body_text:
+            return
+        # Build highlighted HTML — escape the plain text then wrap matches
+        import html as _html
+        escaped = _html.escape(body_text)
+        is_dark = self._theme.current == "dark"
+        from frontend.services.tokens import Dark as _Dark, Light as _Light
+        t = _Dark if is_dark else _Light
+        hl_bg = t.evidence_highlight_bg
+        import re as _re
+        result = escaped
+        for phrase in phrases:
+            if not phrase:
+                continue
+            pattern = _re.compile(_re.escape(_html.escape(phrase)), _re.IGNORECASE)
+            result = pattern.sub(
+                lambda m: f'<span style="background:{hl_bg};">{m.group(0)}</span>',
+                result,
+            )
+        self._lbl_body.setTextFormat(Qt.TextFormat.RichText)
+        # white-space:pre-wrap preserves newlines in the highlighted body.
+        self._lbl_body.setText(f'<div style="white-space:pre-wrap">{result}</div>')
 
     def _emit_re_enrich(self) -> None:
         if self._analysis_id is not None:

@@ -247,45 +247,104 @@ async def _fetch_with_redirects(
         result.redirect_count = hops
 
 
+_IP_HOST_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+# Common URL-shortener hostnames (mirrors DEFAULT_URL_SHORTENERS in defaults.py
+# but available as a local constant so _assess_redirect_suspicion can use it
+# without a DB round-trip).
+_SHORTENER_HOSTS: frozenset[str] = frozenset({
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd", "buff.ly",
+    "rebrand.ly", "cutt.ly", "shorturl.at", "rb.gy",
+})
+
+
+def _unwrap_known_wrapper(url: str) -> str | None:
+    """Delegate to the single-source-of-truth unwrap table in url_unwrap.
+
+    Returns the real destination URL if *url* is a known wrapper, else None.
+    """
+    from backend.services.url_unwrap import unwrap_url
+    return unwrap_url(url)
+
+
 def _assess_redirect_suspicion(result: UrlIntelligence) -> None:
-    """Flag a redirect chain as suspicious when the final domain differs
-    meaningfully from the original and a brand token is involved."""
-    original_host = _extract_host(result.original_url)
-    final_url = result.expanded_url or (result.redirect_chain[-1] if result.redirect_chain else None)
-    if not final_url:
+    """Flag a redirect chain as suspicious.
+
+    Wrapper-unwrap policy
+    ─────────────────────
+    Known link-protection wrappers (SafeLinks, iris.microsoft.com, Google
+    redirect, Proofpoint URLDefense) are *transparent hops*: we extract the
+    real destination from their query parameter and judge THAT, never the
+    wrapper hostname.  A wrapper pointing to a normal domain must not fire.
+
+    Firing conditions (after unwrapping)
+    ──────────────────────────────────────
+    The signal fires when the real destination meets at least one of:
+
+    1. Raw IP host — ``http://1.2.3.4/malware`` hidden behind a wrapper.
+    2. Known URL-shortener host — adds another layer of obfuscation.
+    3. More than 2 real hops — the wrapper hop is excluded from this count
+       so a SafeLinks → legitimate-site (1 real hop) never triggers it.
+
+    Note: anchor-text vs href mismatch is handled independently by
+    ``detect_anchor_mismatches`` in threat_signals.py; this function does
+    not duplicate that check.
+    """
+    # ── Step 1: determine the "judged" URL ──────────────────────────────────
+    # If the original URL is itself a known wrapper, extract its destination.
+    # This is the URL the analyst and scoring engine should reason about.
+    unwrapped = _unwrap_known_wrapper(result.original_url)
+    judged_url = unwrapped if unwrapped else result.original_url
+
+    # Determine the final resolved URL (end of any live redirect chain).
+    final_url = result.expanded_url or (
+        result.redirect_chain[-1] if result.redirect_chain else None
+    )
+
+    # Number of "real" hops: if the original was a wrapper, subtract 1
+    # because the first hop was just unwrapping to the real destination.
+    wrapper_hop = 1 if unwrapped else 0
+    real_hop_count = max(0, result.redirect_count - wrapper_hop)
+
+    # Use the final resolved URL when available; otherwise fall back to the
+    # unwrapped / original URL so we still judge something.
+    destination_url = final_url or judged_url
+
+    destination_host = _extract_host(destination_url) or _extract_host(judged_url)
+    if not destination_host:
         return
 
-    final_host = _extract_host(final_url)
-    if not original_host or not final_host or original_host == final_host:
-        return
+    # ── Step 2: apply firing conditions on the destination ──────────────────
 
-    # Brand token in original host but not in final host → likely spoof redirect
-    orig_compact = original_host.replace("-", "").replace(".", "")
-    final_compact = final_host.replace("-", "").replace(".", "")
-
-    for token in _BRAND_TOKENS:
-        if token in orig_compact and token not in final_compact:
-            result.is_redirect_suspicious = True
-            result.redirect_suspicious_reason = (
-                f"Original URL implies '{token}' (host={original_host}) "
-                f"but redirects to unrelated domain '{final_host}'"
-            )
-            return
-        if token in final_compact and token not in orig_compact:
-            result.is_redirect_suspicious = True
-            result.redirect_suspicious_reason = (
-                f"Redirect lands on domain suggesting '{token}' (host={final_host}) "
-                f"from unrelated origin '{original_host}'"
-            )
-            return
-
-    # Any redirect through a URL shortener to a different domain is mildly suspicious
-    if result.redirect_count >= 2 and original_host != final_host:
+    # Condition 1: destination is a raw IP address
+    if _IP_HOST_RE.match(destination_host):
         result.is_redirect_suspicious = True
         result.redirect_suspicious_reason = (
-            f"Multi-hop redirect ({result.redirect_count} hops) "
-            f"from {original_host} to {final_host}"
+            f"Link{'(via wrapper) ' if unwrapped else ' '}redirects to raw IP host: "
+            f"{destination_host}"
         )
+        return
+
+    # Condition 2: destination is a known URL shortener
+    if destination_host in _SHORTENER_HOSTS:
+        result.is_redirect_suspicious = True
+        result.redirect_suspicious_reason = (
+            f"Link{'(via wrapper) ' if unwrapped else ' '}redirects to URL shortener: "
+            f"{destination_host}"
+        )
+        return
+
+    # Condition 3: more than 2 real hops (excludes the wrapper hop itself)
+    if real_hop_count > 2:
+        result.is_redirect_suspicious = True
+        result.redirect_suspicious_reason = (
+            f"Excessive redirect chain: {real_hop_count} hops "
+            f"(excluding wrapper) to {destination_host}"
+        )
+        return
+
+    # All other cases — wrapper pointing to a normal domain, or a
+    # low-hop redirect to a non-shortener non-IP domain — are benign.
 
 
 def _extract_host(url: str) -> str | None:

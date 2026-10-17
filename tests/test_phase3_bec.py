@@ -140,11 +140,12 @@ class TestVipImpersonation:
         from backend.services.bec_signals_service import _check_vip_impersonation
 
         session = _session_with_vips([])
-        fired, reason = await _check_vip_impersonation(
+        fired, reason, evidence = await _check_vip_impersonation(
             session, "CEO <ceo@evil.com>", "evil.com"
         )
         assert fired is False
         assert reason is None
+        assert evidence is None
 
     @pytest.mark.asyncio
     async def test_legit_domain_not_flagged(self):
@@ -155,7 +156,7 @@ class TestVipImpersonation:
                         protected_email="jane.smith@corp.com")
         session = _session_with_vips([vip])
 
-        fired, reason = await _check_vip_impersonation(
+        fired, reason, evidence = await _check_vip_impersonation(
             session, "Jane Smith <jane.smith@corp.com>", "corp.com"
         )
         assert fired is False
@@ -170,7 +171,7 @@ class TestVipImpersonation:
                         protected_email="jane.smith@corp.com")
         session = _session_with_vips([vip])
 
-        fired, reason = await _check_vip_impersonation(
+        fired, reason, evidence = await _check_vip_impersonation(
             session, "Jane Smith <jane.smith@mail.corp.com>", "mail.corp.com"
         )
         assert fired is False
@@ -185,7 +186,7 @@ class TestVipImpersonation:
                         protected_email="jane.smith@corp.com", title="CFO")
         session = _session_with_vips([vip])
 
-        fired, reason = await _check_vip_impersonation(
+        fired, reason, evidence = await _check_vip_impersonation(
             session, "<jane.smith@corp.com>", "evil-corp.com"
         )
         assert fired is True
@@ -200,7 +201,7 @@ class TestVipImpersonation:
         vip = _make_vip("Jane Smith", protected_domain="corp.com", title="CFO")
         session = _session_with_vips([vip])
 
-        fired, reason = await _check_vip_impersonation(
+        fired, reason, evidence = await _check_vip_impersonation(
             session, "Jane Smith <attacker@evil.com>", "evil.com"
         )
         assert fired is True
@@ -216,7 +217,7 @@ class TestVipImpersonation:
         vip = _make_vip("Jo", protected_domain="corp.com")
         session = _session_with_vips([vip])
 
-        fired, reason = await _check_vip_impersonation(
+        fired, reason, evidence = await _check_vip_impersonation(
             session, "Jo at accounts <jo@evil.com>", "evil.com"
         )
         # name_words for "Jo" with len=2 < 3 → check b is skipped
@@ -230,7 +231,7 @@ class TestVipImpersonation:
         vip = _make_vip("JANE SMITH", protected_domain="corp.com")
         session = _session_with_vips([vip])
 
-        fired, reason = await _check_vip_impersonation(
+        fired, reason, evidence = await _check_vip_impersonation(
             session, "jane smith <attacker@evil.com>", "evil.com"
         )
         assert fired is True
@@ -243,7 +244,7 @@ class TestVipImpersonation:
         vip = _make_vip("Jane Smith", protected_domain="corp.com")
         session = _session_with_vips([vip])
 
-        fired, reason = await _check_vip_impersonation(session, None, None)
+        fired, reason, evidence = await _check_vip_impersonation(session, None, None)
         assert fired is False
         assert reason is None
 
@@ -255,7 +256,7 @@ class TestVipImpersonation:
         session = AsyncMock()
         session.execute = AsyncMock(side_effect=RuntimeError("DB down"))
 
-        fired, reason = await _check_vip_impersonation(
+        fired, reason, evidence = await _check_vip_impersonation(
             session, "Jane Smith <attacker@evil.com>", "evil.com"
         )
         assert fired is False
@@ -273,7 +274,7 @@ class TestVipImpersonation:
 
         # Simulate DB returning no rows (is_active filter excluded the row)
         session = _session_with_vips([])
-        fired, reason = await _check_vip_impersonation(
+        fired, reason, evidence = await _check_vip_impersonation(
             session, "Jane Smith <attacker@evil.com>", "evil.com"
         )
         assert fired is False
@@ -288,20 +289,20 @@ class TestFinancialRequestLanguage:
 
     def test_empty_body_returns_false(self):
         from backend.services.bec_signals_service import _check_financial_request_language
-        fired, cats, reasons = _check_financial_request_language("")
+        fired, cats, reasons, phrases = _check_financial_request_language("")
         assert fired is False
         assert cats == []
         assert reasons == []
 
     def test_none_body_returns_false(self):
         from backend.services.bec_signals_service import _check_financial_request_language
-        fired, cats, reasons = _check_financial_request_language(None)
+        fired, cats, reasons, phrases = _check_financial_request_language(None)
         assert fired is False
 
     def test_wire_transfer_category_fires(self):
         from backend.services.bec_signals_service import _check_financial_request_language
         body = "Please initiate a transfer of $50,000 to the following account."
-        fired, cats, reasons = _check_financial_request_language(body)
+        fired, cats, reasons, phrases = _check_financial_request_language(body)
         assert fired is True
         assert "wire_transfer" in cats
         assert len(reasons) >= 1
@@ -309,28 +310,28 @@ class TestFinancialRequestLanguage:
     def test_bank_detail_change_category_fires(self):
         from backend.services.bec_signals_service import _check_financial_request_language
         body = "We have updated our bank account. Please update your records with the new account number."
-        fired, cats, reasons = _check_financial_request_language(body)
+        fired, cats, reasons, phrases = _check_financial_request_language(body)
         assert fired is True
         assert "bank_detail_change" in cats
 
     def test_urgency_authority_category_fires(self):
         from backend.services.bec_signals_service import _check_financial_request_language
         body = "This is time sensitive. Keep this strictly confidential and do not discuss with anyone."
-        fired, cats, reasons = _check_financial_request_language(body)
+        fired, cats, reasons, phrases = _check_financial_request_language(body)
         assert fired is True
         assert "urgency_authority" in cats
 
     def test_gift_card_category_fires(self):
         from backend.services.bec_signals_service import _check_financial_request_language
         body = "Please buy gift cards worth $200 and send me the codes."
-        fired, cats, reasons = _check_financial_request_language(body)
+        fired, cats, reasons, phrases = _check_financial_request_language(body)
         assert fired is True
         assert "gift_card" in cats
 
     def test_invoice_redirect_category_fires(self):
         from backend.services.bec_signals_service import _check_financial_request_language
         body = "Please process this invoice and send payment to the new account effective immediately."
-        fired, cats, reasons = _check_financial_request_language(body)
+        fired, cats, reasons, phrases = _check_financial_request_language(body)
         assert fired is True
         assert "invoice_redirect" in cats
 
@@ -341,7 +342,7 @@ class TestFinancialRequestLanguage:
             "This is time sensitive. Keep this strictly confidential. "
             "Also please buy gift cards and send me the codes."
         )
-        fired, cats, reasons = _check_financial_request_language(body)
+        fired, cats, reasons, phrases = _check_financial_request_language(body)
         assert fired is True
         # At least 3 categories should fire
         assert len(cats) >= 3
@@ -360,7 +361,7 @@ class TestFinancialRequestLanguage:
             "buy gift cards and send me the codes. "        # gift_card
             "process this invoice, send payment to new account."  # invoice_redirect
         )
-        fired, cats, reasons = _check_financial_request_language(body, max_pts=BEC_FINANCIAL_MAX_PTS)
+        fired, cats, reasons, phrases = _check_financial_request_language(body, max_pts=BEC_FINANCIAL_MAX_PTS)
         # All 5 categories should fire
         assert len(cats) == 5
         # But point value is capped — compute_bec_signals enforces the cap
@@ -375,14 +376,14 @@ class TestFinancialRequestLanguage:
             "Our revenue increased by 12% this quarter. "
             "Let me know if you have questions."
         )
-        fired, cats, reasons = _check_financial_request_language(body)
+        fired, cats, reasons, phrases = _check_financial_request_language(body)
         assert fired is False
 
     def test_case_insensitive_matching(self):
         """Keyword match is case-insensitive."""
         from backend.services.bec_signals_service import _check_financial_request_language
         body = "WIRE TRANSFER of funds required TODAY."
-        fired, cats, reasons = _check_financial_request_language(body)
+        fired, cats, reasons, phrases = _check_financial_request_language(body)
         assert fired is True
         assert "wire_transfer" in cats
 
@@ -390,7 +391,7 @@ class TestFinancialRequestLanguage:
         """Reason strings must include the matched keyword."""
         from backend.services.bec_signals_service import _check_financial_request_language
         body = "Please wire transfer the funds to our new account."
-        fired, cats, reasons = _check_financial_request_language(body)
+        fired, cats, reasons, phrases = _check_financial_request_language(body)
         assert fired is True
         # At least one reason should mention 'wire transfer' (or similar keyword)
         assert any("wire" in r.lower() for r in reasons)
