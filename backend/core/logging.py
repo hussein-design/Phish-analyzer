@@ -91,3 +91,9 @@ def configure_logging(level: str = "INFO") -> None:
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(fmt)
         root.addHandler(console_handler)
+
+    # ── Suppress noisy third-party HTTP loggers ───────────────────────────────
+    # httpx and httpcore log full request URLs and response headers at DEBUG/INFO,
+    # which would expose API keys and scanned URLs in app.log.
+    for _noisy in ("httpx", "httpcore"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)

@@ -8,11 +8,20 @@ and auto-height, then re-centered on every parent Resize event so it always
 appears in the middle of the visible area above the table, never on top of it.
 
 All colors sourced from frontend.services.tokens — no inline hex values.
+
+Safety measures
+───────────────
+- Mouse events pass through the transparent outer widget to the page beneath
+  it; only the inner card absorbs events so the table remains interactive.
+- An internal QTimer auto-hides the overlay after AUTO_HIDE_S seconds as a
+  hard backstop against the overlay getting stuck (e.g. if the on_finished
+  callback is never called due to a worker crash).
+- ``stop()`` is idempotent and safe to call multiple times.
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
@@ -32,20 +41,31 @@ class ProgressOverlay(QWidget):
     UI switches to the report view).  Never shown during the analysis itself.
     """
 
-    _CARD_WIDTH = 320   # fixed card width in px
+    _CARD_WIDTH  = 320   # fixed card width in px
+    AUTO_HIDE_S  = 30    # hard backstop: auto-hide after this many seconds
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        # Transparent outer widget — only the inner card has a background.
-        # This means the overlay does NOT dim or draw over table content.
+        # Transparent outer widget — mouse events pass through to the page.
+        # Only the inner card (a child widget) blocks mouse events so the
+        # analyses table beneath the overlay stays fully interactive.
         self.setStyleSheet("background: transparent;")
+        # WA_TransparentForMouseEvents on the outer widget; the card does NOT
+        # have this attribute so it still receives events normally.
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         parent.installEventFilter(self)
+
+        # ── Auto-hide safety timer ─────────────────────────────────────────
+        self._auto_hide_timer = QTimer(self)
+        self._auto_hide_timer.setSingleShot(True)
+        self._auto_hide_timer.timeout.connect(self.stop)
 
         # ── Inner card ────────────────────────────────────────────────────
         self._card = QFrame(self)
         self._card.setObjectName("ProgressCard")
         self._card.setFixedWidth(self._CARD_WIDTH)
+        # Card absorbs mouse events (does NOT have WA_TransparentForMouseEvents)
 
         card_lyt = QVBoxLayout(self._card)
         card_lyt.setContentsMargins(24, 20, 24, 20)
@@ -143,6 +163,9 @@ class ProgressOverlay(QWidget):
         self._reposition()
         self.show()
         self.raise_()
+        # Arm the auto-hide backstop — cancelled by stop() on normal completion
+        self._auto_hide_timer.start(self.AUTO_HIDE_S * 1000)
 
     def stop(self) -> None:
+        self._auto_hide_timer.stop()
         self.hide()

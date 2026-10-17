@@ -44,7 +44,7 @@ from shared.schemas import AnalysesListResponse, AnalysisStatus, EmailDetail
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_MS  = 2000   # 2 s between status checks
-_POLL_MAX_ATTEMPTS = 90     # ~3 minutes total
+_POLL_MAX_ATTEMPTS = 360    # ~13 minutes total (must exceed the 600 s backend watchdog)
 _QUEUE_PAGE_SIZE   = 50     # summaries fetched for the left-pane queue
 
 # Number of consecutive poll-handler exceptions before we show a visible
@@ -157,17 +157,58 @@ class ReportController(BaseController):
     def _poll_tick(self) -> None:
         self._poll_attempts += 1
         if self._poll_attempts > _POLL_MAX_ATTEMPTS:
+            # Do one final fetch before giving up so that an analysis that
+            # finished right at the cap is not missed.
+            if self._poll_analysis_id is not None:
+                self.run_async(
+                    self.api_client.get_email,
+                    self._poll_analysis_id,
+                    on_success=self._on_final_poll_result,
+                )
             self._stop_polling()
-            self.notification_center.show_toast(
-                "Analysis is taking longer than expected. Refresh to check again.",
-                level="warning",
-            )
             return
         if self._poll_analysis_id is not None:
             self.run_async(
                 self.api_client.get_email,
                 self._poll_analysis_id,
                 on_success=self._on_poll_result,
+            )
+
+    def _on_final_poll_result(self, data: dict) -> None:
+        """Called for the one last fetch at the poll cap.
+
+        If the analysis is now DONE/FAILED, display it normally.
+        If it is still PENDING/RUNNING, show a 'Still running' message in the
+        loading view so the user knows they can come back — never freeze.
+        """
+        try:
+            detail = EmailDetail.model_validate(data)
+            if detail.status in (AnalysisStatus.DONE, AnalysisStatus.FAILED):
+                self.report_page.display(detail)
+                self.report_page.update_queue_item(detail)
+                if detail.status == AnalysisStatus.DONE:
+                    self.notification_center.show_toast(
+                        "Analysis complete — results loaded.", level="success"
+                    )
+                else:
+                    self.notification_center.show_toast(
+                        detail.error_message or "Analysis failed", level="error"
+                    )
+            else:
+                # Still in progress — update the loading view with a hint
+                self.report_page.update_queue_item(detail)
+                self.report_page.update_pipeline_stages(detail)
+                self.report_page.show_poll_error(
+                    "Still running — click Refresh to check again."
+                )
+                self.notification_center.show_toast(
+                    "Analysis is taking longer than expected. Click Refresh to check again.",
+                    level="warning",
+                )
+        except Exception:
+            logger.error(
+                "ReportController: final poll result handler raised:\n%s",
+                traceback.format_exc(),
             )
 
     def _on_poll_result(self, data: dict) -> None:

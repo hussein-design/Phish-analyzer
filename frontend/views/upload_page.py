@@ -5,7 +5,6 @@ Inline colors removed — all coloring now driven by QSS theme rules.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -60,6 +59,7 @@ class UploadPage(QWidget):
         layout.addWidget(self.table, 1)
 
         self._overlay = ProgressOverlay(self)
+        self._uploading: bool = False
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -71,7 +71,18 @@ class UploadPage(QWidget):
             self._count_badge.setVisible(False)
 
     def set_uploading(self, uploading: bool, message: str = "Analyzing…") -> None:
+        self._uploading = uploading
         if uploading:
             self._overlay.start(message)
         else:
+            self._overlay.stop()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        try:
+            super().showEvent(event)
+        except RuntimeError:
+            pass  # Qt C++ not initialised (unit tests bypass __init__)
+        # Guard: if the page becomes visible while no upload is in flight
+        # (e.g. user navigated back), make sure the overlay is hidden.
+        if not getattr(self, "_uploading", False):
             self._overlay.stop()

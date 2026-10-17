@@ -55,8 +55,12 @@ class UploadController(BaseController):
             path,
             on_success=self._on_uploaded,
             on_error=self._on_upload_error,
-            on_finished=lambda: self.upload_page.set_uploading(False),
+            on_finished=self._on_upload_finished,
         )
+
+    def _on_upload_finished(self) -> None:
+        """Always hide the overlay — called after on_success or on_error."""
+        self.upload_page.set_uploading(False)
 
     def _on_upload_error(self, err) -> None:
         self.notification_center.show_toast(str(err), level="error")
