@@ -94,6 +94,7 @@ class SettingsRepository:
             "suspicious_tlds",
             "url_shorteners",
             "urgency_keywords",
+            "active_url_fetch",
         ]
         if set_vt:
             cols.append("virustotal_key")

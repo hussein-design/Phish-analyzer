@@ -104,12 +104,18 @@ def _base_weights() -> dict:
 
 
 def _compute_score(bec_result=None, behavioral_result=None, spf="pass"):
-    """Thin wrapper that calls compute_score() with sensible defaults."""
+    """Thin wrapper that calls compute_score() with sensible defaults.
+
+    When spf='fail', dmarc is also set to 'fail' so SPF scoring is not
+    suppressed by the DMARC-conditional logic introduced in Task 1.
+    """
     from backend.services.scoring_service import compute_score
+    # SPF fail only scores when DMARC is not pass; keep dmarc aligned with spf.
+    dmarc = "fail" if spf == "fail" else "pass"
     return compute_score(
         from_addr="sender@example.com",
         from_domain="example.com",
-        auth={"spf": spf, "dkim": "pass", "dmarc": "pass"},
+        auth={"spf": spf, "dkim": "pass", "dmarc": dmarc},
         header_issues=[],
         urls=[],
         attachments=[],
@@ -990,10 +996,11 @@ class TestScoringServiceBecIntegration:
             sig_authority_pressure=False,
         )
         result = _compute_score(bec_result=bec, spf="fail")
-        # static_score from SPF fail = 2; bec(3)*2 = 6; combined = 8
-        assert result["static_score"] == 2
+        # static_score: spf_fail(2) + dmarc_fail(2) = 4 (dmarc set to fail alongside spf)
+        # bec(3)*2 = 6; combined = 10
+        assert result["static_score"] == 4
         assert result["bec_score"] == 3
-        assert result["score"] == 8
+        assert result["score"] == 10
 
     def test_bec_and_behavioral_combine_correctly(self):
         """BEC (2×) and behavioral (1×) both contribute to combined score."""

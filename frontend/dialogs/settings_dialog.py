@@ -13,6 +13,7 @@ Includes:
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -136,6 +137,20 @@ class SettingsDialog(QDialog):
         keys_form.addRow("AbuseIPDB API key", abuse_widget)
         keys_form.addRow("Shodan API key", shodan_widget)
 
+        # ── Privacy group ─────────────────────────────────────────────────
+        privacy_group = QGroupBox("Privacy")
+        privacy_layout = QVBoxLayout(privacy_group)
+        self.active_url_fetch_check = QCheckBox("Enable active URL fetching")
+        self.active_url_fetch_check.setChecked(bool(settings.get("active_url_fetch", False)))
+        privacy_warning = QLabel(
+            "⚠ Contacts the sender's servers from your IP address and may reveal "
+            "that the mailbox is monitored."
+        )
+        privacy_warning.setWordWrap(True)
+        privacy_warning.setStyleSheet("color: #c05000; font-size: 11px;")
+        privacy_layout.addWidget(self.active_url_fetch_check)
+        privacy_layout.addWidget(privacy_warning)
+
         # ── Sandbox group (Phase 5) ───────────────────────────────────────
         sandbox_group = QGroupBox("Sandbox Detonation (Phase 5)")
         sandbox_form = QFormLayout(sandbox_group)
@@ -217,6 +232,7 @@ class SettingsDialog(QDialog):
         brands_layout.addWidget(brands_text)
 
         layout.addWidget(keys_group)
+        layout.addWidget(privacy_group)
         layout.addWidget(sandbox_group)
         layout.addWidget(scoring_group)
         layout.addWidget(keywords_group)
@@ -287,6 +303,10 @@ class SettingsDialog(QDialog):
         if self.sandbox_key_edit.text():
             payload["sandbox_api_key"] = self.sandbox_key_edit.text()
         return payload
+
+    def active_url_fetch_payload(self) -> bool:
+        """Returns the current state of the active URL fetch checkbox."""
+        return self.active_url_fetch_check.isChecked()
 
 
 # ── Private helper ─────────────────────────────────────────────────────────────

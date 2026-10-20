@@ -121,24 +121,86 @@ def extract_urls_from_body(body_raw, body_text: str) -> list[str]:
        that eml_parser's own parser didn't recognise.
 
     Returns a deduplicated, sorted list.
+
+    Filtered out (not real link destinations):
+    - URLs inside DOCTYPE declarations (e.g. http://www.w3.org/TR/html4/loose.dtd)
+    - xmlns / schema attribute values (XML namespace URIs)
+    - URLs from <link> and <meta> tags (stylesheet/canonical refs, not content)
     """
     seen: set[str] = set()
     urls: list[str] = []
 
     parts = normalize_body(body_raw)
+
+    # Build a set of URLs to ignore from <link>/<meta> tags and DOCTYPE/xmlns
+    _ignore: set[str] = set()
     for part in parts:
         if not isinstance(part, dict):
             continue
-        # eml_parser stores pre-extracted URLs in the 'uri' key as a list
+        ct = (part.get("content_type") or part.get("mime_type") or "").lower()
+        content = part.get("content")
+        if not content or "text/html" not in ct:
+            continue
+        if isinstance(content, list):
+            content = " ".join(str(c) for c in content)
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(str(content), "html.parser")
+            # <link> tags (stylesheet, canonical, etc.)
+            for tag in soup.find_all("link"):
+                for attr in ("href", "src"):
+                    val = tag.get(attr, "")
+                    if val and val.startswith(("http://", "https://")):
+                        _ignore.add(val.strip())
+            # <meta> tags (refresh, og:url, etc.)
+            for tag in soup.find_all("meta"):
+                content_val = tag.get("content", "")
+                if content_val:
+                    for m in URL_REGEX.findall(content_val):
+                        _ignore.add(m.strip())
+        except Exception:
+            pass
+
+    # DOCTYPE and xmlns/schema: strip via regex over raw HTML content
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        ct = (part.get("content_type") or part.get("mime_type") or "").lower()
+        content = part.get("content")
+        if not content or "text/html" not in ct:
+            continue
+        if isinstance(content, list):
+            content = " ".join(str(c) for c in content)
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+        raw_html = str(content)
+        # DOCTYPE: <!DOCTYPE html PUBLIC "..." "http://www.w3.org/...">
+        for m in re.finditer(r"<!DOCTYPE[^>]*>", raw_html, re.I | re.S):
+            for url in URL_REGEX.findall(m.group(0)):
+                _ignore.add(url.strip())
+        # xmlns / xsi:schemaLocation / schema attributes
+        for m in re.finditer(
+            r'\b(?:xmlns|xmlns:\w+|xsi:schemaLocation|schemaLocation)\s*=\s*["\']([^"\']*)["\']',
+            raw_html, re.I,
+        ):
+            for url in URL_REGEX.findall(m.group(1)):
+                _ignore.add(url.strip())
+
+    # Collect URLs from eml_parser uri lists, skipping ignored ones
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
         for uri in part.get("uri", []) or []:
             uri_str = str(uri).strip()
-            if uri_str.startswith(("http://", "https://")) and uri_str not in seen:
+            if uri_str.startswith(("http://", "https://")) and uri_str not in seen and uri_str not in _ignore:
                 seen.add(uri_str)
                 urls.append(uri_str)
 
     # Also run regex over the full body text for any URLs eml_parser missed
     for match in URL_REGEX.findall(body_text):
-        if match not in seen:
+        if match not in seen and match not in _ignore:
             seen.add(match)
             urls.append(match)
 
@@ -518,12 +580,10 @@ def analyze_headers(parsed: dict) -> dict:
         issues.append(
             f"Return-Path domain ({return_domain}) differs from From domain ({from_domain})"
         )
-    if auth["spf"] == "fail":
-        issues.append("SPF failed in Authentication-Results / Received-SPF")
-    if auth["dkim"] == "fail":
-        issues.append("DKIM failed in Authentication-Results")
-    if auth["dmarc"] == "fail":
-        issues.append("DMARC failed in Authentication-Results")
+    # Note: SPF/DKIM/DMARC auth results are NOT added to `issues` here.
+    # scoring_service.compute_score() handles them directly from `auth` with
+    # DMARC-conditional logic.  Adding them here as well would cause double
+    # scoring (once from `auth` in compute_score, once per header_issue entry).
 
     return {
         "from_addr": from_addr,

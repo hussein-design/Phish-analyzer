@@ -69,6 +69,11 @@ class SettingsController(BaseController):
             payload["sandbox_api_key"] = sandbox["sandbox_api_key"]
             logger.info("Settings save: sandbox_api_key included in payload")
 
+        # Privacy: active URL fetch toggle — always include so the user can
+        # turn it off as well as on.
+        payload["active_url_fetch"] = dialog.active_url_fetch_payload()
+        logger.info("Settings save: active_url_fetch=%s", payload["active_url_fetch"])
+
         has_keys = bool(keys) or "sandbox_api_key" in sandbox
         logger.info(
             "Settings save: payload keys present=%s, has_api_keys=%s",

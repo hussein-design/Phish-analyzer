@@ -30,3 +30,7 @@ class AppSettingsRecord(Base):
     # Phase 5: sandbox provider settings
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), default=None)
     sandbox_api_key: Mapped[str | None] = mapped_column(String(255), default=None)
+    # Privacy: whether to fetch email URLs from this machine (default off).
+    # When False, url_intelligence_service skips all outbound HTTP requests
+    # to URL targets (VT/urlscan are unaffected).
+    active_url_fetch: Mapped[bool] = mapped_column(default=False)

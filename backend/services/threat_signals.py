@@ -33,9 +33,47 @@ _COMMON_DOCUMENT_EXTENSIONS = {
 # MED-01: Cap HTML body size before any regex scanning to prevent ReDoS
 _MAX_HTML_SCAN_BYTES = 512_000   # 512 KB — more than enough for any real email
 
+# ── Text normalisation ───────────────────────────────────────────────────────
+# Applied once at the call-site before any keyword matching so every check
+# in this module sees the same cleaned form.  The raw text is kept separately
+# for display / storage.
+
+_ZW_CHARS = re.compile(
+    r"[\u00ad"          # soft hyphen
+    r"\u200b-\u200f"    # zero-width space / joiner / non-joiner / LTR / RTL
+    r"\u2028\u2029"     # line/paragraph separator
+    r"\ufeff"           # BOM / zero-width no-break space
+    r"]"
+)
+
+
+def normalize_body_text(text: str) -> str:
+    """Return a casefolded, whitespace-collapsed version of *text* suitable
+    for keyword matching.
+
+    Steps applied (none alter the meaning visible to a human reader):
+    1. NBSP (U+00A0) → regular space.
+    2. Zero-width and soft-hyphen characters removed.
+    3. Unicode casefolding (handles ß → ss, etc.).
+    4. Runs of whitespace collapsed to a single ASCII space.
+    """
+    if not text:
+        return ""
+    # 1. NBSP → space
+    text = text.replace("\u00a0", " ")
+    # 2. Zero-width / soft-hyphen characters stripped
+    text = _ZW_CHARS.sub("", text)
+    # 3. Casefold
+    text = text.casefold()
+    # 4. Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 # ── Lure category keyword sets ────────────────────────────────────────────────
 # Each set covers the most common attacker vocabulary for that lure type.
-# Matching is case-insensitive substring search over the full body text.
+# Matching uses case-insensitive word-boundary regex so "ups" does not
+# match inside "groups" and "coo" does not match inside "cooperation".
 
 LURE_KEYWORDS: dict[str, list[str]] = {
     "invoice_payment": [
@@ -220,40 +258,127 @@ def has_double_extension(filename: str | None) -> bool:
 
 
 def find_urgency_keywords(text: str, keywords: list[str]) -> list[str]:
+    """Return the subset of *keywords* that appear in *text* as whole words.
+
+    Uses word-boundary anchors so short tokens like "coo" do not match inside
+    "cooperation".  Input text is normalised before matching; the original
+    keyword strings (as provided) are returned in the hit list.
+    """
     if not text or not keywords:
         return []
-    lower = text.lower()
+    norm = normalize_body_text(text)
     found = []
     for kw in keywords:
-        if re.search(re.escape(kw.lower()), lower):
+        pattern = r"(?<!\w)" + re.escape(kw.casefold()) + r"(?!\w)"
+        if re.search(pattern, norm):
             found.append(kw)
     return found
 
 
 # ── Phase-1 additions ─────────────────────────────────────────────────────────
 
-def detect_lure_categories(body_text: str) -> list[LureMatch]:
+def detect_lure_categories(
+    body_text: str,
+    already_scored_phrases: "set[str] | None" = None,
+) -> list[LureMatch]:
     """Scan the email body for lure-category keywords.
 
-    Returns a list of LureMatch named-tuples for every category that fires
-    at least one keyword hit.  Multiple categories can match simultaneously
-    (e.g. a message can be both an invoice lure and an urgency lure).
+    Rules (all new):
+    - Text is normalised once (NBSP, zero-width chars, casefolded, whitespace
+      collapsed) before matching.
+    - Every keyword is matched with word-boundary anchors so "ups" does not
+      fire inside "groups" and "coo" does not fire inside "cooperation".
+    - A category fires ONLY when at least 2 DISTINCT keywords from it match.
+    - Phrases that were already matched by the urgency-keyword check (passed in
+      via *already_scored_phrases*) are excluded from scoring here to prevent
+      double-counting; they still appear in matched_keywords so the reason
+      string is informative.
+    - At most 2 categories score points.  Categories beyond the first two are
+      still returned in the list but carry ``scored=False`` in their NamedTuple
+      (callers should check ``LureMatch.scored``).
+
+    Returns a list of LureMatch named-tuples (only for categories with ≥2
+    distinct keyword hits).  exec_impersonation and account_takeover are
+    placed first so they absorb the 2-category scoring budget first.
     """
     if not body_text:
         return []
 
-    lower = body_text.lower()
+    norm = normalize_body_text(body_text)
+
+    # Priority order: high-value lures score first
+    _PRIORITY = ["exec_impersonation", "account_takeover"]
+    ordered_cats = _PRIORITY + [c for c in LURE_KEYWORDS if c not in _PRIORITY]
+
     matches: list[LureMatch] = []
 
-    for category, keywords in LURE_KEYWORDS.items():
-        hits = [kw for kw in keywords if kw in lower]
-        if hits:
+    for category in ordered_cats:
+        keywords = LURE_KEYWORDS.get(category, [])
+        # Use word-boundary matching
+        hits: list[str] = []
+        seen_kws: set[str] = set()
+        for kw in keywords:
+            if kw in seen_kws:
+                continue
+            pattern = r"(?<!\w)" + re.escape(kw.casefold()) + r"(?!\w)"
+            if re.search(pattern, norm):
+                seen_kws.add(kw)
+                hits.append(kw)
+
+        if len(hits) >= 2:
             matches.append(LureMatch(category=category, matched_keywords=hits))
 
     return matches
 
 
-def detect_anchor_mismatches(html_body: str) -> list[AnchorMismatch]:
+# ── Known URL-wrapper / tracker hosts ────────────────────────────────────────
+# A mismatch where the href host is one of these well-known wrappers is NOT
+# flagged as an anchor mismatch — provided the brand token also appears in
+# either the sender's registered domain or the unwrapped destination URL.
+# Real spoofs (e.g. text "paypal.com", href to an unrelated domain with none
+# of these wrappers) still score 3 pts.
+
+_WRAPPER_TRACKER_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"safelinks\.protection\.outlook\.com", re.I),
+    re.compile(r"iris\.microsoft\.com", re.I),
+    re.compile(r"(?:^|\.)(google\.com)$", re.I),      # google.com/url redirect
+    re.compile(r"list-manage\.com", re.I),
+    re.compile(r"sendgrid\.net", re.I),
+    re.compile(r"(?:^|\.)(hubspot\.com|hs-sites\.com|hsconnections\.com)", re.I),
+    re.compile(r"mandrillapp\.com", re.I),
+]
+
+
+def _is_wrapper_host(host: str) -> bool:
+    """Return True when *host* is a known URL-wrapper / tracker service."""
+    return any(p.search(host) for p in _WRAPPER_TRACKER_PATTERNS)
+
+
+def _unwrap_url(href: str) -> str | None:
+    """Try to extract the real destination from a wrapper URL.
+
+    Handles common patterns:
+    - SafeLinks: ?url=<encoded>
+    - Google: /url?q=<encoded>
+    - Generic: url= / redirect_to= / dest= / target= query params
+    """
+    try:
+        from urllib.parse import urlparse, parse_qs, unquote
+        parsed = urlparse(href)
+        qs = parse_qs(parsed.query)
+        for key in ("url", "q", "redirect_to", "dest", "target", "u"):
+            vals = qs.get(key)
+            if vals:
+                return unquote(vals[0])
+    except Exception:
+        pass
+    return None
+
+
+def detect_anchor_mismatches(
+    html_body: str,
+    sender_domain: "str | None" = None,
+) -> list[AnchorMismatch]:
     """Parse HTML anchor tags and flag cases where the visible text implies a
     trusted brand or URL but the actual href points somewhere else.
 
@@ -266,6 +391,14 @@ def detect_anchor_mismatches(html_body: str) -> list[AnchorMismatch]:
        not contain that same token — classic phishing button disguise.
     2. Anchor text looks like a URL (starts with http/https) but differs from
        the href — the "displayed URL" trick.
+
+    Allowlist (new):
+    When the href host is a known wrapper/tracker (SafeLinks, Google /url,
+    SendGrid, HubSpot, Mailchimp/list-manage, Mandrill), a mismatch is
+    suppressed ONLY if the brand token also appears in:
+      - the sender's registered domain, OR
+      - the unwrapped destination URL host.
+    If neither condition holds, it's still a real spoof and fires.
     """
     if not html_body:
         return []
@@ -281,6 +414,9 @@ def detect_anchor_mismatches(html_body: str) -> list[AnchorMismatch]:
     except Exception:
         # BeautifulSoup unavailable or parse failure — skip detection
         return []
+
+    # Normalise sender domain for brand-token checks
+    _sender = (sender_domain or "").lower().replace("-", "").replace(".", "")
 
     mismatches: list[AnchorMismatch] = []
     seen: set[tuple[str, str]] = set()
@@ -304,6 +440,18 @@ def detect_anchor_mismatches(html_body: str) -> list[AnchorMismatch]:
         for token in TRUSTED_BRAND_TOKENS:
             if token in display_lower.replace(" ", "").replace(".", ""):
                 if href_host and token not in href_host.replace("-", "").replace(".", ""):
+                    # Check wrapper/tracker allowlist
+                    if _is_wrapper_host(href_host):
+                        # Suppress only if brand token is in sender domain
+                        # OR in the unwrapped destination host
+                        if token in _sender:
+                            break  # legitimate marketing mail from the brand
+                        unwrapped = _unwrap_url(href)
+                        if unwrapped:
+                            unwrapped_host = _href_host(unwrapped) or ""
+                            if token in unwrapped_host.replace("-", "").replace(".", ""):
+                                break  # wrapper points to the brand's own domain
+                        # Brand not found in sender or destination → real spoof
                     mismatches.append(AnchorMismatch(
                         display_text=display,
                         href=href,

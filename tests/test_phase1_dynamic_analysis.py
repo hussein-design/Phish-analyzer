@@ -691,8 +691,8 @@ class TestScoringServiceDynamicSignals:
         result = compute_score(
             from_addr="sender@example.com",
             from_domain="example.com",
-            auth={"spf": "fail", "dkim": "pass", "dmarc": "pass"},  # +2 SPF
-            header_issues=[],
+            auth={"spf": "pass", "dkim": "pass", "dmarc": "pass"},
+            header_issues=["Reply-To differs", "Return-Path differs"],  # 2×header_issue → +2
             urls=[],
             attachments=[],
             abuse_result={},
@@ -707,7 +707,7 @@ class TestScoringServiceDynamicSignals:
             url_detonation_result=urlscan,
         )
 
-        assert result["static_score"] == 2   # SPF fail
+        assert result["static_score"] == 2   # 2×header_issue
         assert result["dynamic_score"] == 4  # urlscan malicious
         assert result["score"] == 6          # 2 + 4
         assert result["verdict"] == "suspicious"  # 6 >= 5
@@ -958,3 +958,251 @@ class TestTimeoutGuard:
         assert "_run_urlscan" in src or "urlscan_result" in src, (
             "urlscan result not found in analysis_service.py"
         )
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# urlscan visibility + wrapper-unwrap tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestUrlscanVisibility:
+    """Verify private-first, unlisted-fallback, never public submission."""
+
+    def _make_clients(self, first_status: int, second_status: int = 200):
+        """Return a client factory that returns different responses per call."""
+        submit_resp_1 = _mock_httpx_response(first_status, {"message": "rejected"})
+        submit_resp_2 = _mock_httpx_response(second_status, {"uuid": "test-uuid-123"})
+
+        call_count = 0
+
+        class _FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                pass
+
+            async def post(self, *a, **kw):
+                nonlocal call_count
+                call_count += 1
+                return submit_resp_1 if call_count == 1 else submit_resp_2
+
+            async def get(self, *a, **kw):
+                # Return a 200 with a minimal result so polling terminates
+                return _mock_httpx_response(200, {
+                    "verdicts": {"overall": {"malicious": False, "score": 0, "tags": []}},
+                    "data": {"requests": []},
+                    "page": {"url": "https://evil.example.com/", "title": "Test"},
+                })
+
+        return _FakeClient, lambda: call_count
+
+    @pytest.mark.asyncio
+    async def test_submits_private_first(self):
+        """detonate_url must use visibility='private' on the first attempt."""
+        from backend.services.enrichment import urlscan_provider
+
+        submitted_payloads: list[dict] = []
+
+        async def fake_post(url, **kwargs):
+            submitted_payloads.append(kwargs.get("json", {}))
+            return _mock_httpx_response(200, {"uuid": "uuid-private-ok"})
+
+        async def fake_get(url, **kwargs):
+            return _mock_httpx_response(200, {
+                "verdicts": {"overall": {"malicious": False, "score": 0, "tags": []}},
+                "data": {"requests": []},
+                "page": {"url": "https://evil.example.com/", "title": ""},
+            })
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(side_effect=fake_post)
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                await urlscan_provider.detonate_url("https://evil.example.com/", "key")
+
+        assert submitted_payloads, "Expected at least one POST"
+        assert submitted_payloads[0].get("visibility") == "private", (
+            f"First submission must use 'private'; got {submitted_payloads[0].get('visibility')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_unlisted_on_400(self):
+        """A 400 on the private attempt must retry with 'unlisted'."""
+        from backend.services.enrichment import urlscan_provider
+
+        submitted_payloads: list[dict] = []
+        call_count = 0
+
+        async def fake_post(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            submitted_payloads.append(kwargs.get("json", {}))
+            # First call (private) → 400; second call (unlisted) → 200
+            status = 400 if call_count == 1 else 200
+            body = {"message": "private not supported"} if call_count == 1 else {"uuid": "uuid-unlisted"}
+            return _mock_httpx_response(status, body)
+
+        async def fake_get(url, **kwargs):
+            return _mock_httpx_response(200, {
+                "verdicts": {"overall": {"malicious": False, "score": 0, "tags": []}},
+                "data": {"requests": []},
+                "page": {"url": "https://evil.example.com/", "title": ""},
+            })
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(side_effect=fake_post)
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with patch.object(urlscan_provider.enrichment_cache, "get",
+                                  new_callable=AsyncMock, return_value=None):
+                    with patch.object(urlscan_provider.enrichment_cache, "set",
+                                      new_callable=AsyncMock):
+                        result = await urlscan_provider.detonate_url(
+                            "https://evil.example.com/", "key"
+                        )
+
+        assert len(submitted_payloads) == 2, (
+            f"Expected 2 submissions (private then unlisted); got {len(submitted_payloads)}"
+        )
+        assert submitted_payloads[0].get("visibility") == "private"
+        assert submitted_payloads[1].get("visibility") == "unlisted"
+        assert result["status"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_unlisted_on_403(self):
+        """A 403 on the private attempt must also retry with 'unlisted'."""
+        from backend.services.enrichment import urlscan_provider
+
+        submitted_payloads: list[dict] = []
+        call_count = 0
+
+        async def fake_post(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            submitted_payloads.append(kwargs.get("json", {}))
+            status = 403 if call_count == 1 else 200
+            body = {} if call_count == 1 else {"uuid": "uuid-unlisted-403"}
+            return _mock_httpx_response(status, body)
+
+        async def fake_get(url, **kwargs):
+            return _mock_httpx_response(200, {
+                "verdicts": {"overall": {"malicious": False, "score": 0, "tags": []}},
+                "data": {"requests": []},
+                "page": {"url": "https://evil.example.com/", "title": ""},
+            })
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(side_effect=fake_post)
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with patch.object(urlscan_provider.enrichment_cache, "get",
+                                  new_callable=AsyncMock, return_value=None):
+                    with patch.object(urlscan_provider.enrichment_cache, "set",
+                                      new_callable=AsyncMock):
+                        result = await urlscan_provider.detonate_url(
+                            "https://evil.example.com/", "key"
+                        )
+
+        assert submitted_payloads[1].get("visibility") == "unlisted"
+        assert result["status"] == "done"
+
+    def test_public_never_in_visibility_constants(self):
+        """Neither _SCAN_VISIBILITY_PRIMARY nor _SCAN_VISIBILITY_FALLBACK may be 'public'."""
+        from backend.services.enrichment import urlscan_provider
+        assert urlscan_provider._SCAN_VISIBILITY_PRIMARY != "public", (
+            "_SCAN_VISIBILITY_PRIMARY must not be 'public'"
+        )
+        assert urlscan_provider._SCAN_VISIBILITY_FALLBACK != "public", (
+            "_SCAN_VISIBILITY_FALLBACK must not be 'public'"
+        )
+
+
+class TestUrlscanUrlUnwrap:
+    """Verify the urlscan URL selection unwraps known wrappers before submission."""
+
+    def _safelinks(self, dest: str) -> str:
+        from urllib.parse import urlencode
+        return (
+            "https://nam02.safelinks.protection.outlook.com/?"
+            + urlencode({"url": dest, "data": "02|01|alice@corp.com|abc"})
+        )
+
+    def test_unwrap_url_module_used(self):
+        """url_unwrap.unwrap_url must be importable from url_unwrap."""
+        from backend.services.url_unwrap import unwrap_url
+        dest = "https://evil.example.com/phish"
+        sl = self._safelinks(dest)
+        assert unwrap_url(sl) == dest
+
+    def test_safelinks_destination_submitted_not_wrapper(self):
+        """When only a SafeLinks URL is in the email, the unwrapped destination
+        must be what gets submitted to urlscan, not the SafeLinks wrapper."""
+        from backend.services.url_unwrap import unwrap_url
+
+        dest = "https://evil-phishing.example.com/login"
+        sl = self._safelinks(dest)
+
+        # Simulate the selection logic from analysis_service
+        urls = [sl]
+        _urlscan_url = None
+        for _candidate in urls:
+            _submit = unwrap_url(_candidate) or _candidate
+            # SSRF guard simulation: all public URLs pass
+            _urlscan_url = _submit
+            break
+
+        assert _urlscan_url == dest, (
+            f"Expected unwrapped destination {dest!r}; got {_urlscan_url!r}"
+        )
+        assert "safelinks" not in (_urlscan_url or ""), (
+            "SafeLinks wrapper query string must not be submitted to urlscan"
+        )
+
+    def test_non_wrapper_url_submitted_unchanged(self):
+        """A plain URL that is not a wrapper must be submitted unchanged."""
+        from backend.services.url_unwrap import unwrap_url
+
+        plain = "https://attacker-phishing.example.com/evil"
+        urls = [plain]
+        _urlscan_url = None
+        for _candidate in urls:
+            _submit = unwrap_url(_candidate) or _candidate
+            _urlscan_url = _submit
+            break
+
+        assert _urlscan_url == plain
+
+    def test_recipient_address_not_in_submitted_url(self):
+        """SafeLinks embeds the recipient address in the wrapper query string.
+        After unwrapping, the submitted URL must not contain 'alice@corp.com'."""
+        from backend.services.url_unwrap import unwrap_url
+        from urllib.parse import urlencode
+
+        dest = "https://malicious.example.com/"
+        sl = (
+            "https://nam02.safelinks.protection.outlook.com/?"
+            + urlencode({
+                "url": dest,
+                "data": "02|01|alice@corp.com|abc|def|1|0|",
+                "sdata": "xyz",
+                "reserved": "0",
+            })
+        )
+        submitted = unwrap_url(sl) or sl
+        assert "alice@corp.com" not in submitted, (
+            "Recipient address from SafeLinks wrapper must not appear in the submitted URL"
+        )
+        assert submitted == dest

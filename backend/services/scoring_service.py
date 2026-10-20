@@ -143,15 +143,46 @@ def compute_score(
         reasons.append(f"Sender domain '{from_domain}' uses a commonly abused TLD")
 
     # Auth failures
-    if auth.get("spf") == "fail":
-        score += pts_spf_fail
-        reasons.append("SPF failed for this message")
-    if auth.get("dkim") == "fail":
-        score += pts_dkim_fail
-        reasons.append("DKIM failed for this message")
+    # DMARC is scored independently of SPF/DKIM — it is the authoritative
+    # aggregate verdict and is never suppressed.
     if auth.get("dmarc") == "fail":
         score += pts_dmarc_fail
         reasons.append("DMARC failed for this message")
+
+    # SPF and DKIM are only scored when DMARC did NOT pass.
+    # Rationale: DMARC pass means the receiving MTA has already verified the
+    # message is aligned with the sender's policy, so individual SPF/DKIM
+    # failures are either expected (DKIM re-sign by a mailing-list forwarder)
+    # or informational (body hash changed in transit).  Scoring them on top of
+    # a DMARC pass would double-penalise legitimate forwarded mail.
+    #
+    # dkim="none" means the message was not signed — treated as unsigned, not
+    # as a cryptographic failure.  No points are added.
+    dmarc_passed = auth.get("dmarc") == "pass"
+
+    if auth.get("spf") == "fail":
+        if dmarc_passed:
+            # Informational only — record evidence but do not add points
+            reasons.append(
+                "SPF failed but DMARC passed; message alignment verified by DMARC"
+            )
+        else:
+            score += pts_spf_fail
+            reasons.append("SPF failed for this message")
+
+    dkim_val = auth.get("dkim")
+    if dkim_val == "fail":
+        if dmarc_passed:
+            # DKIM body-hash failure after DMARC pass is almost always a
+            # forwarding / mailing-list modification, not an attack.
+            reasons.append(
+                "DKIM failed (body hash did not verify) but DMARC passed; "
+                "likely modified in transit"
+            )
+        else:
+            score += pts_dkim_fail
+            reasons.append("DKIM failed for this message")
+    # dkim="none" → message unsigned; no points, no reason string
 
     # Header issues
     for issue in header_issues:
@@ -296,19 +327,39 @@ def compute_score(
         score += pts_urgency
         reasons.append(f"Body contains urgency/pressure language: {', '.join(urgency_found)}")
 
-    # Phase 1: Lure-category scoring — each unique category fires once.
-    # High-confidence categories (exec impersonation) score more.
+    # Phase 1: Lure-category scoring.
+    # Rules (matching detect_lure_categories contract):
+    #   - At most 2 categories add points (exec_impersonation and account_takeover
+    #     are already prioritised first by detect_lure_categories).
+    #   - Categories beyond the first two are recorded as informational reasons
+    #     with 0 points added.
+    #   - A keyword that already scored under the urgency check must not also
+    #     score under a lure category (no double-count); those keywords are still
+    #     shown in the reason string for transparency.
     _HIGH_VALUE_LURES = {"exec_impersonation", "account_takeover"}
+    _urgency_phrases = {kw.lower() for kw in urgency_found}
     if lure_categories:
+        scored_count = 0
         for lure in lure_categories:
             cat = lure.get("category", "")
             kws = lure.get("matched_keywords", [])
-            pts = pts_lure_category + (1 if cat in _HIGH_VALUE_LURES else 0)
-            score += pts
-            reasons.append(
-                f"Lure category '{cat}' detected — keywords: {', '.join(kws[:4])}"
-                + (" …" if len(kws) > 4 else "")
-            )
+            # Keywords not already counted under urgency
+            new_kws = [kw for kw in kws if kw.lower() not in _urgency_phrases]
+            if scored_count < 2 and new_kws:
+                pts = pts_lure_category + (1 if cat in _HIGH_VALUE_LURES else 0)
+                score += pts
+                scored_count += 1
+                reasons.append(
+                    f"Lure category '{cat}' detected — keywords: {', '.join(kws[:4])}"
+                    + (" …" if len(kws) > 4 else "")
+                )
+            else:
+                # Informational only — no points
+                reasons.append(
+                    f"Lure category '{cat}' detected (informational, no additional points)"
+                    f" — keywords: {', '.join(kws[:4])}"
+                    + (" …" if len(kws) > 4 else "")
+                )
 
     # Phase 1: Anchor text vs href mismatch — score once regardless of count.
     if anchor_mismatches:

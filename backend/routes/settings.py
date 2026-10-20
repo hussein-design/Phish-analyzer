@@ -28,6 +28,7 @@ def _to_read(record: AppSettingsRecord) -> SettingsRead:
         sandbox_provider=getattr(record, "sandbox_provider", None),
         sandbox_key_configured=bool(getattr(record, "sandbox_api_key", None)),
         urlscan_key_configured=bool(getattr(record, "urlscan_key", None)),
+        active_url_fetch=bool(getattr(record, "active_url_fetch", False)),
     )
 
 
@@ -133,6 +134,10 @@ async def update_settings_endpoint(
         record.sandbox_api_key = payload.sandbox_api_key.strip() or None
         set_sandbox = True
         logger.info("Settings PUT: updating sandbox settings, provider=%s", record.sandbox_provider)
+
+    if getattr(payload, "active_url_fetch", None) is not None:
+        record.active_url_fetch = bool(payload.active_url_fetch)
+        logger.info("Settings PUT: active_url_fetch=%s", record.active_url_fetch)
 
     # Single atomic write
     from sqlalchemy.orm.attributes import flag_modified

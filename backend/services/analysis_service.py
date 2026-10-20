@@ -693,6 +693,7 @@ class AnalysisService:
                 suspicious_tlds = list(settings.suspicious_tlds)
                 url_shorteners = list(settings.url_shorteners)
                 urgency_keywords = list(settings.urgency_keywords)
+                _active_url_fetch = bool(getattr(settings, "active_url_fetch", False))
 
             # ── Phase B: static stage done; mark enrichment stages ────
             # Determine up-front whether urlscan and sandbox will run so
@@ -720,15 +721,19 @@ class AnalysisService:
             # urlscan scan cannot block the pipeline even when a key IS set.
             _urlscan_url: str | None = None
             if urlscan_key and urls:
-                # Prefer a URL that already looks suspicious from static analysis
-                # (we don't have url_rows yet, so use a heuristic on raw strings).
+                # Unwrap known link-protection wrappers (SafeLinks, IRIS,
+                # Google /url, Proofpoint URLDefense) before submission so
+                # that wrapper query strings containing recipient addresses
+                # are never sent to urlscan.io's cloud service.
                 # SSRF guard: only submit URLs that resolve to public addresses.
                 # An attacker can embed http://192.168.1.1/ in an email body and
                 # trick the tool into submitting internal addresses to urlscan.io,
                 # leaking network topology to a third-party cloud service.
+                from backend.services.url_unwrap import unwrap_url as _unwrap_url
                 for _candidate in urls:
-                    if _is_safe_for_external_submission(_candidate):
-                        _urlscan_url = _candidate
+                    _submit = _unwrap_url(_candidate) or _candidate
+                    if _is_safe_for_external_submission(_submit):
+                        _urlscan_url = _submit
                         break
                 # If no URL passes the guard, _urlscan_url remains None and
                 # _run_urlscan() returns status="no_key" (intentional no-op).
@@ -815,7 +820,7 @@ class AnalysisService:
             ))
             _ab_task   = asyncio.ensure_future(abuseipdb_provider.enrich_ip(header_info["sender_ip"], abuse_key))
             _sh_task   = asyncio.ensure_future(shodan_provider.enrich_ip(header_info["sender_ip"], shodan_key))
-            _ui_task   = asyncio.ensure_future(url_intel.expand_urls(urls))
+            _ui_task   = asyncio.ensure_future(url_intel.expand_urls(urls, active_url_fetch=_active_url_fetch))
             _us_task   = asyncio.ensure_future(_run_urlscan())
 
             _all_tasks = {_vt_task, _ab_task, _sh_task, _ui_task, _us_task}

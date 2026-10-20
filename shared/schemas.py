@@ -266,6 +266,8 @@ class SettingsRead(BaseModel):
     sandbox_key_configured: bool = False
     # Phase 1 dynamic analysis
     urlscan_key_configured: bool = False
+    # Privacy: whether active URL fetching is enabled (default off)
+    active_url_fetch: bool = False
 
 
 class SettingsUpdate(BaseModel):
@@ -295,6 +297,8 @@ class SettingsUpdate(BaseModel):
     # Phase 5: sandbox
     sandbox_provider: str | None = Field(default=None, max_length=64)
     sandbox_api_key: str | None = Field(default=None, max_length=255)
+    # Privacy: active URL fetch toggle
+    active_url_fetch: bool | None = None
 
 
 class ApiKeysUpdate(BaseModel):

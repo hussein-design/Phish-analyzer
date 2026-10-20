@@ -1013,12 +1013,12 @@ class TestScoringServiceBehavioralIntegration:
             sig_send_time_anomaly=False,
         )
 
-        # Static signal: SPF fail (2 pts)
+        # Static signal: 2×header_issue (+2 pts) — avoids DMARC-conditional SPF logic
         result = compute_score(
             from_addr="sender@example.com",
             from_domain="example.com",
-            auth={"spf": "fail", "dkim": "pass", "dmarc": "pass"},
-            header_issues=[],
+            auth={"spf": "pass", "dkim": "pass", "dmarc": "pass"},
+            header_issues=["Reply-To differs", "Return-Path differs"],
             urls=[],
             attachments=[],
             abuse_result={},

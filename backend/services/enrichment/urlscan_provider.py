@@ -54,10 +54,13 @@ _SCREENSHOT   = "https://urlscan.io/screenshots/{uuid}.png"
 _POLL_INTERVAL = 10   # seconds between polls
 _MAX_WAIT      = 120  # total seconds before returning "timeout"
 
-# Visibility for submitted scans.  "public" is the free-tier default and is
-# fine for phishing detection.  A future enhancement could expose this as a
-# setting so enterprise users can submit unlisted scans.
-_SCAN_VISIBILITY = "public"
+# Preferred scan visibility.  "private" keeps results off the public index and
+# prevents recipient email addresses (which may appear in SafeLinks / tracker
+# wrapper query strings) from being indexed.  "unlisted" is the fallback when
+# the account tier does not support private scans (HTTP 400/403 on submission).
+# "public" is never used by this service.
+_SCAN_VISIBILITY_PRIMARY  = "private"
+_SCAN_VISIBILITY_FALLBACK = "unlisted"
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -105,28 +108,41 @@ async def detonate_url(url: str, api_key: str | None) -> dict:
         return cached  # type: ignore[return-value]
 
     # ── Step 1: submit ────────────────────────────────────────────────────────
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                _SUBMIT_URL,
-                headers={
-                    "API-Key": api_key,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "url": url,
-                    "visibility": _SCAN_VISIBILITY,
-                    # Tags help correlate scans in the urlscan UI
-                    "tags": ["phish-analyzer"],
-                },
+    # Try "private" first; fall back to "unlisted" on 400/403 (free-tier
+    # accounts do not support private scans).  "public" is never submitted.
+    for _visibility in (_SCAN_VISIBILITY_PRIMARY, _SCAN_VISIBILITY_FALLBACK):
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    _SUBMIT_URL,
+                    headers={
+                        "API-Key": api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "url": url,
+                        "visibility": _visibility,
+                        # Tags help correlate scans in the urlscan UI
+                        "tags": ["phish-analyzer"],
+                    },
+                )
+        except httpx.TimeoutException:
+            return {**_empty, "status": "error", "error": "urlscan.io: submission timed out"}
+        except Exception as exc:
+            logger.exception("urlscan.io submission failed for %s", url)
+            return {**_empty, "status": "error",
+                    "error": f"urlscan.io submission failed: {type(exc).__name__}"}
+
+        # If the account doesn't support this visibility level, retry with fallback
+        if resp.status_code in (400, 403) and _visibility == _SCAN_VISIBILITY_PRIMARY:
+            logger.info(
+                "urlscan.io: visibility=%r rejected (HTTP %d) — retrying with %r",
+                _visibility, resp.status_code, _SCAN_VISIBILITY_FALLBACK,
             )
-    except httpx.TimeoutException:
-        return {**_empty, "status": "error", "error": "urlscan.io: submission timed out"}
-    except Exception as exc:
-        # MED-02 pattern: log full exception internally, surface only type name
-        logger.exception("urlscan.io submission failed for %s", url)
-        return {**_empty, "status": "error",
-                "error": f"urlscan.io submission failed: {type(exc).__name__}"}
+            continue
+
+        # Any other response: break out and handle normally
+        break
 
     if resp.status_code == 400:
         # urlscan returns 400 with a message field for domain/path issues

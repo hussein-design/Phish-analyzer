@@ -95,23 +95,69 @@ class UrlIntelligence:
     error: str | None = None
 
 
+# Tracking-pixel / beacon path patterns — typically 1×1 images embedded in
+# email bodies to confirm delivery.  Fetching them reveals to the sender that
+# the mailbox was opened and the email was analysed.
+_TRACKING_PIXEL_RE = re.compile(
+    r"(?:/(?:pixel|beacon|track|open|click|img|image|t)\b"
+    r"|[?&](?:utm_|pixel|open|track|beacon))",
+    re.IGNORECASE,
+)
+
+
+def _is_tracking_pixel(url: str) -> bool:
+    """Heuristic: return True if the URL looks like a tracking pixel or beacon.
+
+    Matches paths containing /pixel/, /beacon/, /track/, /open/, or query
+    params starting with utm_/pixel/open/track.  False positives are
+    possible but the consequence is just skipping a redirect follow — the
+    URL is still returned in the result for manual inspection.
+    """
+    return bool(_TRACKING_PIXEL_RE.search(url))
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 async def expand_urls(
     urls: list[str],
     *,
+    active_url_fetch: bool = False,
+    vt_malicious_map: dict[str, int] | None = None,
     max_redirects: int = _MAX_REDIRECTS,
     timeout_connect: float = _CONNECT_TIMEOUT,
     timeout_read: float = _READ_TIMEOUT,
 ) -> list[UrlIntelligence]:
     """Expand and inspect a list of URLs concurrently.
 
+    When *active_url_fetch* is False (the default) no outbound HTTP requests
+    are made to the URL targets.  Each result is returned with empty
+    redirect/title/status fields and ``is_redirect_suspicious=False``.
+    VT and urlscan providers are unaffected — they run independently.
+
+    When *active_url_fetch* is True, URLs with tracking-pixel path signatures
+    are silently skipped (no fetch, but result still returned) to avoid
+    confirming to senders that the email was opened and analysed.
+
+    *vt_malicious_map* is an optional {url: vt_malicious_count} dict.  When
+    provided and active_url_fetch is True, any URL whose vt_malicious count is
+    greater than zero is skipped (not fetched) — following a URL already known
+    to be malicious serves no analytical purpose and risks interaction with a
+    live attack infrastructure.  The guard is safe to pass as an empty dict
+    (the default) when VT results are not yet available (e.g. concurrent run).
+
     Returns a list of UrlIntelligence objects in the same order as the
     input list.  Never raises — per-URL errors are stored in the object.
     """
+    _vt_map = vt_malicious_map or {}
     tasks = [
-        _expand_one(url, max_redirects=max_redirects,
-                    timeout_connect=timeout_connect, timeout_read=timeout_read)
+        _expand_one(
+            url,
+            active_url_fetch=active_url_fetch,
+            vt_malicious=_vt_map.get(url, 0),
+            max_redirects=max_redirects,
+            timeout_connect=timeout_connect,
+            timeout_read=timeout_read,
+        )
         for url in urls
     ]
     return list(await asyncio.gather(*tasks))
@@ -122,6 +168,8 @@ async def expand_urls(
 async def _expand_one(
     url: str,
     *,
+    active_url_fetch: bool = False,
+    vt_malicious: int = 0,
     max_redirects: int,
     timeout_connect: float,
     timeout_read: float,
@@ -130,6 +178,25 @@ async def _expand_one(
 
     if not url.startswith(("http://", "https://")):
         result.error = "Non-HTTP scheme — skipped"
+        return result
+
+    # Privacy gate: skip all outbound fetches unless the user has explicitly
+    # opted in via Settings → Privacy → "Enable active URL fetching".
+    if not active_url_fetch:
+        result.error = "Active URL fetching disabled — skipped"
+        return result
+
+    # VT guard: never fetch a URL already known to be malicious.
+    # Following known-malicious URLs serves no analytical purpose and risks
+    # interacting with live attack infrastructure from the analyst's IP.
+    if vt_malicious > 0:
+        result.error = f"Skipped — VirusTotal flagged malicious ({vt_malicious} engines)"
+        return result
+
+    # Even when active_url_fetch is True, skip tracking pixels so we do not
+    # confirm to the sender that the mailbox is being monitored.
+    if _is_tracking_pixel(url):
+        result.error = "Tracking pixel / beacon — skipped"
         return result
 
     async with _CONCURRENT_LIMIT:
